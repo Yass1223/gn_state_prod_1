@@ -1,0 +1,64 @@
+# BoT-SORT · SOF driven by the SoccerNet sports-OSNet ReID (fetched from Hugging Face).
+# Hyperparameters mirror the validated CMC-ablation notebook (yolov11-bot-sort-cmc.ipynb
+# §2 BOT_SORT_BASE / §11d). SOF (sparse optical flow) won the CMC ablation on the GSR test
+# split: HOTA 0.6687 raw / 0.6947 with GTA-Link, vs 0.6643/0.6924 for ECC and 0.6315/0.6579
+# with CMC off.
+#
+# _target_ = sn_gamestate.track.bot_sort_notebook.NotebookBotSORT — a thin subclass of
+# tracklab's BotSORT wrapper that restores the notebook's (= boxmot's = original BoT-SORT
+# paper's) behaviour, because tracklab's bundled `bot_sort` fork silently differs from it:
+#   * First association in the fork is the JDE/FairMOT recipe
+#     `fuse_motion(kf, cosine, lambda_=0.985)` (0.985·cosine + 0.015·Mahalanobis, chi2-gated);
+#     the paper's `min(gated IoU, gated appearance)` block is commented out, so proximity_thresh
+#     and appearance_thresh are inert. The subclass restores `min(gated IoU, gated appearance)`.
+#   * The fork hard-codes the BYTE low gate at 0.1; `track_low_thresh` below is now honoured
+#     (the notebook configured 0.05, which is inert at this detector floor — see the
+#     comment on the value).
+#   * The fork feeds centre-xywh into an STrack that expects top-left-xywh; the subclass feeds
+#     true top-left tlwh, so GMC/Kalman operate on true centres and ReID crops are cut from the
+#     true box (clamped to the frame like the notebook injector).
+#   * Detections are pre-filtered with `>=` min_confidence (not `>`), keeping boxes at exactly
+#     the floor, matching the notebook's det files.
+# frame_rate=25 matches SoccerNet GS clips (buffer_size = frame_rate/30 * track_buffer -> 50).
+# min_hits / max_age are not BoT-SORT parameters (they belong to other trackers) and were
+# inert in the fork; track lifetime is governed by track_buffer.
+#
+# ReID weights: the third resolver arg materialises the checkpoint as `osnet_x1_0_sports.pt`
+# so ReIDDetectMultiBackend builds osnet_x1_0 and torchreid loads it correctly.
+#
+# TensorRT: with use_tensorrt=true and a built engine at trt_engine, the ReID backend runs on
+# TensorRT (tracklab's ReIDDetectMultiBackend routes on the `.engine` suffix). Missing engine
+# -> warn + PyTorch fallback. Keep use_tensorrt=false for exact HOTA reproduction (FP16 is not
+# bit-identical).
+_target_: sn_gamestate.track.bot_sort_notebook.NotebookBotSORT
+cfg:
+  model_weights: ${hf:${hf_weights_repo},sports_model.pth.tar-60,osnet_x1_0_sports.pt}
+  fp16: true
+  min_confidence: 0.1
+  use_tensorrt: ${use_tensorrt}
+  trt_engine: ${trt_dir}/osnet_x1_0_sports.engine
+  hyperparams:
+    track_high_thresh: 0.3
+    # BYTE low gate: the second association considers track_low_thresh < conf <
+    # track_high_thresh. 0.05 was inert — the detector emits nothing below 0.1
+    # (ultralytics conf=0.1, strict >) and min_confidence re-floors at 0.1, so the
+    # band below 0.1 is always empty. Set to the real floor so the knob states the
+    # truth. Genuinely widening the band means lowering BOTH floors together
+    # (bbox_detector min_confidence AND this one) — a Kaggle A/B on YOLO11L, not a
+    # code change.
+    track_low_thresh: 0.1
+    new_track_thresh: 0.4
+    track_buffer: 60
+    match_thresh: 0.85
+    proximity_thresh: 0.5
+    appearance_thresh: 0.30
+    # SOF = the notebook's cmc_method="sof" (boxmot name). tracklab's BoT-SORT fork calls
+    # the same sparse-optical-flow GMC (goodFeaturesToTrack + pyramidal LK + partial affine)
+    # "sparseOptFlow".
+    cmc_method: sparseOptFlow
+    # Replace the fork's sparseOptFlow with sn_gamestate.track.masked_sof.MaskedSOF
+    # (boxmot 19 behaviour: detections masked out of the keypoint search, RANSAC
+    # inlier-count and inlier-ratio gates, H-is-None guard, per-clip CMC health
+    # counter). false = today's baseline; the A/B runs on Kaggle (YOLO11L).
+    masked_sof: false
+    frame_rate: 25

@@ -1,0 +1,62 @@
+# BroadTrack (EVS, WACV'25) camera tracking + image-to-pitch projection.
+#
+# Replaces BOTH the `pitch` (NBJW_Calib_Keypoints) and `calibration` (NBJW_Calib) stages:
+# BroadTrack runs its own keypoint (NBJW) and line (TVCalib) detectors internally, so no
+# separate pitch stage is needed. Use with `soccernet_broadtrack.yaml`, which removes
+# `pitch` from both `defaults:` and `pipeline:`.
+#
+# Reported on the sn-gamestate test split (paper Table 1, HD frames):
+#   NBJW        JaC5 37.14  JaC10 68.24  MRE 10.28  completeness 93.67
+#   BroadTrack  JaC5 56.88  JaC10 79.79  MRE  5.02  completeness 100
+#
+# The binary is NOT vendored here (EVS licence: noncommercial research, no redistribution).
+# Build it once with `bash scripts/setup_broadtrack.sh`, which clones the upstream repo with
+# git-lfs (weights), installs the Dockerfile's apt dependencies natively, fetches libtorch
+# and runs cmake -- no Docker required, so it works on Kaggle and Lightning.ai.
+_target_: sn_gamestate.calibration.broadtrack_api.BroadTrackCalibration
+cfg:
+  # --- provisioning (paths produced by scripts/setup_broadtrack.sh) ---
+  binary: ${model_dir}/broadtrack/bin/broadtrack
+  keypoint_model: ${model_dir}/broadtrack/models/nbjw_keypoint_model.pt
+  line_model: ${model_dir}/broadtrack/models/tvcalib_model.pt
+  libtorch_lib: ${model_dir}/broadtrack/libtorch/lib   # prepended to LD_LIBRARY_PATH
+  compute_tripod_script: ${model_dir}/broadtrack/src/scripts/compute_tripod.py
+
+  # --- calibration cache: calibrate once, reuse for every later pipeline run ---
+  # This is what makes sharded 2xT4 / 4xT4 runs cheap; same idea as state.save_file.
+  calib_dir: ${project_dir}/broadtrack_calib
+  use_cached_json: true
+  timeout: 7200          # seconds per sequence
+
+  # --- camera position prior (metres, sn-calibration world frame) ---
+  # SoccerNet main camera. NOTE: the binary's built-in defaults are 0/90/-18 (Bundesliga),
+  # so these are always passed explicitly. README priors: cam1 (0,55,-12),
+  # 16mr (36,55,-12), 16ml (-36,55,-12), hbg (-65,0,-15).
+  prior_xyz: [0.0, 55.0, -12.0]
+
+  # --- tripod constraint (two-pass: free run -> compute_tripod.py -> soft run) ---
+  # none | per_sequence | per_game. Prefer per_game when several clips share a game
+  # (the GSR test split comes from 3 games); provide the mapping via game_of.
+  tripod_mode: none
+  tripod_dir: ${project_dir}/broadtrack_calib/tripod
+  game_of: {}            # e.g. {SNGS-116: game1, SNGS-117: game1}
+
+  # --- optical-flow player masking ---
+  # Writes <frames_dir>/human-bboxes/%06d.json from our own detections (the binary's -b flag
+  # is inert; the path is hardcoded). If the dataset is read-only (Kaggle), set staging_dir
+  # to a writable path and the module symlinks the frames there instead.
+  write_human_bboxes: true
+  staging_dir: ${project_dir}/broadtrack_staging
+  # Set true for CUSTOM/UNLABELED video (no Labels-GameState.json). The masks then
+  # go to staging_dir instead of leaving a human-bboxes/ subdirectory inside img1/,
+  # which the unlabeled dataset loader would miscount as an extra frame.
+  # Harmless but unnecessary for SoccerNet sequences, which take nframes from
+  # Labels-GameState.json rather than listing the directory.
+  always_stage: false
+
+  # --- robustness ---
+  # The binary's loop is `for (i = 1; i < frames_number; i++)`, so the LAST frame of each
+  # sequence is never calibrated; carry-forward keeps bbox_pitch populated (same role as
+  # NBJW's use_prev_homography). min_score=0 keeps every frame (completeness is 100%).
+  use_prev_parameters: true
+  min_score: 0.0

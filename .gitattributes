@@ -1,0 +1,23 @@
+# LFS is OFF, deliberately and unambiguously.
+#
+# This file used to carry BOTH `*.zip filter=lfs diff=lfs merge=lfs -text` and
+# `*.zip !text !filter !merge !diff` (same for *.gif). Attributes resolve
+# last-match-wins per attribute, so the second pair already cleared filter,
+# merge and diff -- LFS was inert while the file read as if it were enabled.
+# The enabling lines are removed rather than the clearing ones, so the file now
+# says what git was already doing.
+#
+# Why off rather than on: no .zip or .gif is tracked in this repository, and an
+# LFS-enabled repo hands plain-git clones pointer stubs instead of content --
+# a failure preflight_cpu.sh has to check for by name ("truncated or an LFS
+# pointer stub"). Nothing here is worth that.
+#
+# The consequence to keep in mind: with LFS off, any large binary that escapes
+# .gitignore enters git as a plain blob, permanently. The PARSeq checkpoint is
+# ~286 MB and lives in plugins/jn_gsr/models/, which .gitignore excludes. Do
+# not add checkpoints anywhere else, and do not un-ignore that directory.
+*.zip !text !filter !merge !diff
+*.gif !text !filter !merge !diff
+
+# Shell scripts run on Linux (Lightning AI) — always store/check out with LF endings
+*.sh text eol=lf

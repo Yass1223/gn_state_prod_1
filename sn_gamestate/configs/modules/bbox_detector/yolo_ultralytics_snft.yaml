@@ -1,0 +1,28 @@
+# YOLO11-L SoccerNet fine-tune (single-class person), weights fetched from Hugging Face.
+#
+# _target_ = sn_gamestate.bbox_detector.yolo_snft_api.YOLOUltralyticsSNFT — a subclass of
+# tracklab's YOLOUltralytics that fixes three silent mismatches with the notebook (§11c),
+# which the stock wrapper would introduce because it calls `model(images, verbose=False)`
+# with ultralytics defaults:
+#   * imgsz: stock 640 -> 1280 (notebook INFER_IMGSZ). Materially different on small players.
+#   * conf floor: stock 0.25 -> min_confidence 0.1 (notebook fed the tracker at a low floor,
+#     so BoT-SORT's BYTE low band reaches the tracker). Filtered with `>=` (keep the floor).
+#   * colour: tracklab passes RGB numpy arrays but ultralytics assumes BGR for numpy input;
+#     the subclass converts RGB->BGR before predict (the notebook passed file paths, so
+#     ultralytics loaded BGR itself).
+# iou 0.7 = notebook INFER_IOU; max_det 300 = ultralytics default (the notebook never
+# overrode it).
+#
+# TensorRT: with use_tensorrt=true and a built engine at engine_path, the detector runs on
+# TensorRT (ultralytics loads `.engine` via the same YOLO() API). Missing engine -> warn +
+# PyTorch fallback. Keep use_tensorrt=false for exact HOTA reproduction.
+_target_: sn_gamestate.bbox_detector.yolo_snft_api.YOLOUltralyticsSNFT
+batch_size: 4
+cfg:
+  path_to_checkpoint: ${hf:${hf_weights_repo},yolov11_sn_best.pt}
+  min_confidence: 0.1
+  imgsz: 1280
+  iou: 0.7
+  max_det: 300
+  use_tensorrt: ${use_tensorrt}
+  engine_path: ${trt_dir}/yolov11_sn_best.engine

@@ -1,0 +1,45 @@
+# GTA-Link offline tracklet stitching (notebook §11d.5), run as its own pipeline stage
+# right after `track`. Uses its own sports-OSNet (fetched from Hugging Face), independent of
+# the prtreid `reid` module so the GSR downstream (team/role/jersey) is unaffected.
+#
+# Hyperparameters = the per-tracker tuned optima for the BoT-SORT · SOF variant
+# (gta_per_tracker_optima.json["bot_sort_sof"], tuned on the valid split in the oracle
+# notebook and applied on the test pass in yolov11-bot-sort-cmc.ipynb §11d.5):
+#   {appearance_thresh: 0.25, spatial_thresh: 150, min_tracklet_len: 20,
+#    ema_alpha: 0.9, linkage: average}
+# With these, BoT-SORT · SOF improved from HOTA 0.6687 (raw) to 0.6947 (GTA) on GSR test.
+#
+# TensorRT: with use_tensorrt=true and a built engine at trt_engine, GTA-Link's OSNet forward
+# runs on TensorRT (same 256x128 preprocessing; only the network moves to TRT). This is the
+# SAME engine the BoT-SORT ReID backend uses. Missing engine/tensorrt -> warn + PyTorch
+# fallback. Keep use_tensorrt=false for exact HOTA reproduction.
+_target_: sn_gamestate.track.gta_link_api.GTALink
+cfg:
+  osnet_weights: ${hf:${hf_weights_repo},sports_model.pth.tar-60,osnet_x1_0_sports.pt}
+  fp16: true
+  use_tensorrt: ${use_tensorrt}
+  trt_engine: ${trt_dir}/osnet_x1_0_sports.engine
+  appearance_thresh: 0.25   # agglomerative merge cutoff on cosine distance
+  spatial_thresh: 150       # px centre-gap gate, scaled by sqrt(frame gap)  (tuned; default was 60)
+  min_tracklet_len: 20      # tracklets shorter than this are not merged     (tuned; default was 5)
+  ema_alpha: 0.9            # appearance EMA over a tracklet's detections
+  linkage: average          # agglomerative mode only
+  batch_size: 64
+  # Connect algorithm. `agglomerative` = one shot of AgglomerativeClustering on the
+  # gated matrix (today's baseline). `iterative` = the sjc042/gta-link reference:
+  # greedy global-minimum merge, per-pair gate, row/col recompute after each merge —
+  # structurally free of the transitive per-frame collisions average linkage can
+  # create. A/B on Kaggle (YOLO11L).
+  connect_mode: agglomerative
+
+  # Split (reference GTA-Link is Split + Connect; this module had only Connect).
+  # Tracklets of >= split_len_thres detections are DBSCAN-clustered on their
+  # per-detection embeddings before Connect; >1 cluster means the tracker glued two
+  # identities together, and the tracklet is broken up so Connect can re-stitch it.
+  # ALL FOUR VALUES BELOW ARE UNTUNED starting points — the Kaggle sweep on YOLO11L
+  # sets them jointly with the Connect parameters.
+  use_split: false
+  split_eps: 0.6          # DBSCAN eps on cosine distance
+  split_min_samples: 4    # DBSCAN min_samples
+  split_max_k: 3          # cap on fragments per tracklet (closest centres merged)
+  split_len_thres: 30     # only tracklets with >= this many detections are examined

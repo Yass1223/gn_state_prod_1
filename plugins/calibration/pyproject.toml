@@ -1,0 +1,21 @@
+[project]
+name = "tracklab-calibration"
+version = "2.0.0"
+description = "sn-calibration baseline geometry (Camera / SoccerPitch) used by the BroadTrack stage and the reference-metrics harness"
+authors = [
+    {name="Victor Joos", email="victor.joos@uclouvain.be"}
+]
+requires-python = ">=3.9,<3.10"
+# kornia/lsq-ellipse were required by the discarded TVCalib and segmentation-baseline
+# packages. What remains (sn_calibration_baseline: camera.py, soccerpitch.py,
+# evaluate_camera.py, evaluate_extremities.py) needs only numpy + opencv, both of which
+# arrive through tracklab.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sn_calibration_baseline"]

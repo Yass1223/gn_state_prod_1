@@ -1,0 +1,35 @@
+defaults:
+  - colors_gs # For more specific color tuning
+
+_target_: tracklab.visualization.VisualizationEngine
+save_videos: True
+
+# Professional inference display: predictions only.
+#   * one bounding box per player, team color, single-line tag "JN | ID" above the box
+#   * ONE radar (minimap) panel, bottom-centre, low transparency — no ground-truth twin
+# The old Pitch visualizer (predicted line overlay) is removed: BroadTrack emits camera
+# parameters directly and produces no `lines` image column, so it drew nothing here.
+visualizers:
+  players:
+    _target_: sn_gamestate.visualization.CompletePlayerBBox
+    display_track_id: true
+    display_jersey: true
+    display_role: false
+    display_team: false
+  radar:
+    _target_: sn_gamestate.visualization.Radar
+    scale: 4            # px per metre on the minimap
+    alpha: 0.8          # panel opacity (old twin-panel display used 0.3)
+    margin_bottom: 12
+
+# Color settings for visualization.
+colors:
+  # Choose the color to display:
+  # - null: No display.
+  # - RGB code: A color in [R, G, B] format.
+  # - team: A color based on the assigned team (left or right - can be modified in colors_gs file).
+  # - track_id: A color based on the tracking ID (for prediction or ground_truth only).
+  default:
+    no_id: null         # objects without a track id are not drawn
+    prediction: "team"  # tracked predictions colored by team
+    ground_truth: null  # ground truth NEVER drawn in inference videos

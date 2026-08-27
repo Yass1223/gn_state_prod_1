@@ -1,0 +1,69 @@
+# jn_pipeline_gsr as the jersey-number stage (replaces MMOCR).
+#
+# Tracklet-level recognition:
+# legibility > 0.72 -> DBNet++ ROI > 0.52 -> PARSeq parseq_gsr_ft_s1.ckpt AND
+# SATRN recog2/best_recog_word_acc_epoch_10.pth on the same surviving crops ->
+# vote_pool consolidation (majority vote over the pooled per-frame decodes of
+# both models; fuse_jn.py), stride 5.
+#
+# vote_pool is the ONLY rule of this build. There is no `rule` key; setting one
+# makes the stage refuse to construct.
+#
+# Measured on GT-box tracklets (fusion run of 2026-08-17, both audits 0 fail),
+# trk_acc / numbered / -1 F1:
+#   GSR-2024 test (1038 trk)    vote_pool 87.86 / 91.34 / 0.82
+#                               PARSeq maxconf alone 87.48 / 90.83 / 0.82
+#   SN jersey-2023 test (1211)  vote_pool 85.30 / 84.58 / 0.81
+#                               PARSeq maxconf alone 84.72 / 83.76 / 0.81
+# No row exists yet for PREDICTED tracklets through this stage; produce it with
+# scripts/reference_metrics.py on a saved state (numbers differ with track
+# purity).
+#
+# Runs INSIDE the package's own python 3.10 venv as subprocess workers, one per
+# available GPU (auto-detected via nvidia-smi: 2 on Kaggle 2xT4, 4 on Lightning
+# 4xT4, 1 otherwise). Provision once with:  bash scripts/setup_jn_gsr.sh
+#
+# Output contract is identical to the MMOCR stage (per-detection
+# jersey_number_detection + jersey_number_confidence), so tracklet_agg / team /
+# eval need no changes. jersey_number_confidence is the winner's share of the
+# pooled frame votes: (n_A + n_B) / (2 * frames in the vote).
+_target_: sn_gamestate.jersey.jn_gsr_api.JNGsrTrackletRecognizer
+cfg:
+  # --- package location (vendored copy; see scripts/setup_jn_gsr.sh) ---
+  pipeline_dir: ${project_dir}/plugins/jn_gsr
+  venv_python: ${project_dir}/plugins/jn_gsr/.venv_jn/bin/python
+  models_dir: ${project_dir}/plugins/jn_gsr/models
+  # worker: <pipeline_dir>/predict_tracklets.py   (default; override if moved)
+
+  # --- caching: keyed on a sha256 of the manifest CONTENT (track ids + boxes +
+  # rule + stride + legibility_thr + the sha256 of BOTH recogniser checkpoints),
+  # so retuning tracking/GTA-Link, moving the gate, or staging a different
+  # checkpoint under the same filename all invalidate it automatically.
+  cache_dir: ${project_dir}/jn_cache
+  use_cache: true
+
+  # --- operating point ---
+  stride: 5
+  fp16: true
+  # Strictly-greater cut on p_legible, applied before either recogniser reads.
+  # Passed to the worker as --legibility-thr AND folded into the cache key, so
+  # changing it here really does re-run rather than serve the previous numbers.
+  legibility_thr: 0.72
+  # The two staged recogniser checkpoints, relative to models_dir. Passed to
+  # the worker as --parseq-ckpt / --satrn-ckpt and hashed (content) into the
+  # cache key. Both are fetched by scripts/setup_jn_gsr.sh:
+  #   PARSeq  stage_weights.py  (Ynniss/final_parseq_jn, strhub load-gated)
+  #   SATRN   fetch_weights.py  (Ynniss/satrn_small; the .zip IS the torch
+  #           checkpoint, staged as .pth with its config recovered beside it)
+  parseq_ckpt: parseq_gsr_ft_s1.ckpt
+  satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
+
+  # --- scope: recognize tracklets whose majority prtreid role_detection is here ---
+  roles: [player, goalkeeper]
+
+  # --- GPU sharding: auto = one worker per nvidia-smi GPU (1 if none) ---
+  gpus: auto             # auto | <int> | [0, 1, ...]
+  timeout: 10800         # seconds per video, all workers
+
+  # test hook / escape hatch: extra CLI args appended to every worker
+  worker_extra_args: []

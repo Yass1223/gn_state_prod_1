@@ -1,0 +1,68 @@
+[project]
+name = "sn-gamestate"
+version = "1.0.0"
+description = "SoccerNet Game State Reconstruction — clean pipeline (BoT-SORT·SOF + GTA-Link + BroadTrack + jn_pipeline_gsr)"
+readme = "README.md"
+requires-python = ">=3.9,<3.10"
+
+# Dependencies of the ACTIVE pipeline only.
+#   Removed vs. the upstream baseline, together with the stages they served:
+#     easyocr, mmocr, mmdet, openmim  -> the MMOCR/EasyOCR jersey stages (replaced by
+#                                        jn_pipeline_gsr, which runs in its own python
+#                                        3.10 venv as subprocess workers and therefore
+#                                        contributes NO dependency to this environment);
+#     transformers, tokenizers        -> pulled in only by the mmocr stack;
+#     lightning                       -> only used by the discarded TVCalib module.
+#   BroadTrack likewise adds nothing here: it is a native C++ binary built by
+#   scripts/setup_broadtrack.sh and invoked as a subprocess.
+dependencies = [
+    "tracklab==1.3.24",
+    "soccernet==0.1.55",
+    "torch==1.13.1",
+    "prtreid @ git+https://github.com/VlSomers/prtreid",
+    "torchreid @ git+https://github.com/VlSomers/bpbreid",
+    "tracklab_calibration",
+    "numpy==1.26.4",
+    # setuptools 82.0.0 (Feb 2026) removed pkg_resources, which torchmetrics
+    # 0.10.3 still imports (torchmetrics/utilities/imports.py). torchmetrics is
+    # held at 0.10.3 by tracklab for torch 1.13.1 compatibility, so pin the
+    # other side instead. Without this, tracklab.wrappers fails to import.
+    "setuptools<81",
+    # albumentations 2.0 dropped the top-level `functional` export, but prtreid's
+    # data_augmentation/random_occlusion.py does `from albumentations import
+    # (DualTransform, functional)` and prtreid pins albumentations unpinned in
+    # its own requirements.txt. Verified working on 1.3.1 and 1.4.24.
+    "albumentations<2",
+    # Used directly by the pipeline: KMeans (team clustering) and
+    # AgglomerativeClustering (gta_link). Never listed as a dependency and not
+    # pulled in transitively, so 4 of the 9 stages fail to import without it.
+    # Python 3.9 caps this at 1.6.1 (scikit-learn 1.7 requires >=3.10); the
+    # bound is explicit so relaxing requires-python can't silently jump versions.
+    # Both call sites are version-agnostic: gta_link already falls back from
+    # metric= to affinity=, and KMeans does not pass n_init.
+    "scikit-learn<1.7",
+    # huggingface_hub 1.0 removed HfFolder, which a transitive dependency in the
+    # 3.9 resolution still imports. Without this bound, 5 of the 14 stages fail
+    # to import (detector, reid, track, MajorityVoteTracklet, TrackEvalEvaluator)
+    # with "cannot import name 'HfFolder'". Kaggle 2026-08-07 resolved 1.8.0.
+    "huggingface_hub>=0.23,<1.0",
+]
+
+[project.entry-points.tracklab_plugin]
+sn_gamestate = "sn_gamestate.config_finder:ConfigFinder"
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sn_gamestate*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.txt", "*.rst", "*.yaml", "*.png"]
+
+[project.optional-dependencies]
+dev = ["ipykernel==6.29.4"]
+
+[tool.uv.sources]
+tracklab-calibration = { path = "plugins/calibration", editable = true }

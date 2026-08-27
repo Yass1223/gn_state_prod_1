@@ -1,0 +1,17 @@
+defaults:
+  - colors # For more specific color tuning
+
+colors:
+  # Estimated number of objects to track to generate colors that are visually
+  # distinct from one another when using "track_id" or colormap name.
+  cmap: 22
+  team:  # colors can be selected by RGB or null
+    no_team: null
+    prediction:
+      left: [ 0, 0, 255 ]
+      right: [ 255, 0, 0 ]
+      referee: [ 238, 210, 2 ]
+    ground_truth:
+      left: [ 0, 255, 0 ]
+      right: [ 0, 255, 0 ]
+      referee: [ 255, 255, 0 ]

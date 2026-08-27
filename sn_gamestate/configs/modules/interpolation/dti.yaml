@@ -1,0 +1,17 @@
+# Linear interpolation of tracklet gaps (DTI), the offline step official BoT-SORT
+# ships as tools/interpolation.py and GTA-Link (sjc042) does not have. Runs directly
+# after `gta_link`, on final track ids.
+#
+# enabled: false is today's baseline and a true no-op. Turning it on is safe for
+# tracking-only states (the reference_metrics.py tracking block needs only
+# track_id / bbox_ltwh / image_id); the FULL pipeline additionally needs the `team`
+# stage to tolerate rows without `embeddings` — see the audit in
+# sn_gamestate/track/interpolation.py.
+#
+# n_dti / n_min are UNTUNED (the values below are the brief's starting points, not
+# measured optima). The Kaggle sweep on YOLO11L sets them.
+_target_: sn_gamestate.track.interpolation.LinearInterpolation
+cfg:
+  enabled: false
+  n_dti: 25   # fill a gap only when 1 < dt < n_dti frames
+  n_min: 5    # only tracklets with >= n_min real detections are interpolated
