@@ -30,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CALIB_DIR = ROOT / "broadtrack_calib"
 JN_CACHE = ROOT / "jn_cache"
+AUDIT_DIR = ROOT / "audit"
 PROVENANCE = ROOT / "plugins" / "jn_gsr" / "models" / "weights_provenance.json"
 
 RED, GREEN, YELLOW, BOLD, RESET = (
@@ -138,6 +139,36 @@ def main(argv=None) -> int:
             notes.append(f"could not read {PROVENANCE.name}: {exc}")
     else:
         notes.append("no weights_provenance.json - PARSeq checkpoint origin unverified")
+
+    # Audit stage verdicts (sn_gamestate.audit.RunAudit, the last pipeline stage):
+    # one JSON per sequence with a PASS/WARN/FAIL per component. Any FAIL is a
+    # silent degradation that the run survived; it is not a reportable run.
+    audits = sorted(AUDIT_DIR.glob("*.json")) if AUDIT_DIR.is_dir() else []
+    if not audits:
+        notes.append(f"no audit verdicts in {AUDIT_DIR} - the audit stage did not run "
+                     "(is `audit` in the pipeline?)")
+    else:
+        n_fail = n_warn = 0
+        for a in audits:
+            try:
+                rep = json.loads(a.read_text())
+            except Exception as exc:
+                problems.append(f"audit file unreadable: {a.name} ({exc})")
+                continue
+            for c in rep.get("checks", []):
+                if c.get("verdict") == "FAIL":
+                    n_fail += 1
+                    problems.append(f"audit {rep.get('sequence', a.stem)}: "
+                                    f"{c.get('component')} FAIL - {c.get('note')}")
+                elif c.get("verdict") == "WARN":
+                    n_warn += 1
+                    notes.append(f"audit {rep.get('sequence', a.stem)}: "
+                                 f"{c.get('component')} WARN - {c.get('note')}")
+        print(f"{BOLD}audit:{RESET} {len(audits)} sequence(s), "
+              f"{n_fail} FAIL, {n_warn} WARN")
+        if args.expect_sequences and len(audits) < args.expect_sequences:
+            problems.append(f"audit covers {len(audits)} sequence(s), "
+                            f"expected {args.expect_sequences}")
 
     print()
     for n in notes:

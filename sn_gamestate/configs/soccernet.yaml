@@ -8,10 +8,11 @@
 #   gta_link       offline tracklet stitching (own OSNet)     -> track_id (merged)
 #   interpolation  linear gap fill on final track ids (DTI)   -> synthesized rows (off)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
-#   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq), multi-GPU
+#   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU
 #   tracklet_agg   majority vote over [jersey_number, role]
 #   team           k-means on prtreid embeddings
 #   team_side      mean pitch position
+#   audit          per-component PASS/WARN/FAIL verdicts -> audit/<seq>.json (read-only)
 #
 # There is NO `pitch` stage: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 # detectors internally and emits camera parameters directly.
@@ -26,6 +27,8 @@
 # Reference metrics (saved separately from the pipeline eval):
 #   python scripts/reference_metrics.py --state states/sn-gamestate.pklz \
 #       --dataset-path data/SoccerNetGS --eval-set test --out reference_metrics
+# Before reporting any metric, refuse a run with a silent stage failure:
+#   python scripts/verify_run_integrity.py     (reads the audit stage's JSON verdicts)
 hf_weights_repo: "Ynniss/sn-gamestate-weights"
 
 defaults:
@@ -43,12 +46,14 @@ defaults:
   - modules/tracklet_agg: voting_role_jn
   - modules/team: kmeans_embeddings
   - modules/team_side: mean_position
+  - modules/audit: run_audit
   - _self_
 
 # Pipeline definition. Order is load-bearing:
 #   * gta_link right after track and BEFORE everything that depends on final track ids
 #     (jersey recognition is tracklet-level; tracklet_agg and team vote per track_id);
-#   * calibration before team_side (it consumes bbox_pitch).
+#   * calibration before team_side (it consumes bbox_pitch);
+#   * audit LAST: it reads every column the other stages produce and writes none.
 pipeline:
   - bbox_detector
   - reid
@@ -60,6 +65,7 @@ pipeline:
   - tracklet_agg
   - team
   - team_side
+  - audit
 
 experiment_name: "sn-gamestate"
 

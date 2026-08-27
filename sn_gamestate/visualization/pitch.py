@@ -10,6 +10,23 @@ Coordinate mapping is unchanged from the validated original: ``bbox_pitch`` is i
 SoccerNet pitch frame (metres, origin at the pitch centre), drawn at ``scale`` px/m on a
 105x68 template with 10 m / 5 m margins.
 
+What is drawn, and what is not
+------------------------------
+The radar draws exactly the rows the bounding-box layer draws: TRACKED detections
+(``track_id`` set) that have a defined colour -- ``team`` left/right, or role
+``referee``. Everything else is skipped, never painted in a neutral colour:
+
+* untracked detections (``track_id`` NaN) never receive ``team_cluster``/``team``/an
+  aggregated ``jersey_number`` (every downstream stage groups by ``track_id``), so
+  they were the white discs of the previous build;
+* tracked rows whose team is undefined (role voted ``other``/NaN, or a player
+  tracklet the k-means/side labelling did not reach) are a pipeline degradation --
+  the audit stage (``sn_gamestate.audit``) counts them via ``radar_color`` below;
+  painting them white would only hide it.
+
+The number label is drawn for players with an aggregated ``jersey_number`` and as
+``GK`` for goalkeepers, exactly as before.
+
 Config (all optional, see configs/visualization/gamestate.yaml)::
 
     radar:
@@ -23,6 +40,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pandas as pd
 
 from tracklab.utils.cv2 import draw_text
 from tracklab.visualization import ImageVisualizer
@@ -35,12 +53,49 @@ pitch_file = Path(__file__).parent / "Radar.png"
 PITCH_LENGTH, PITCH_WIDTH = 105, 68
 MARGIN_X, MARGIN_Y = 10, 5
 
-# Team palette (RGB, tracklab frames are RGB): left=blue, right=red, referee=yellow —
-# consistent with configs/visualization/colors_gs.yaml.
+# Team palette (RGB, tracklab frames are RGB): left=blue, right=red, referee=yellow --
+# consistent with configs/visualization/colors_gs.yaml. There is NO neutral colour: a
+# row without a defined colour is not drawn (see module docstring).
 COLOR_LEFT = (0, 0, 255)
 COLOR_RIGHT = (255, 0, 0)
 COLOR_REFEREE = (238, 210, 2)
-COLOR_NEUTRAL = (230, 230, 230)
+
+
+def _is_nan(v):
+    """True for None/NaN scalars only; arrays, dicts and strings are values."""
+    if v is None:
+        return True
+    if isinstance(v, (np.ndarray, list, tuple, dict, str)):
+        return False
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def radar_color(det):
+    """The disc colour for one detection row (Series or dict), or None when the
+    row must not be drawn. The single predicate shared by the radar and the audit
+    stage, so the two cannot disagree about what is visible.
+
+    None when: no track_id; role ball; no bbox_pitch dict; not a referee and
+    team not in {left, right}."""
+    get = det.get if isinstance(det, dict) else (lambda k, d=None: det[k] if k in det.index else d)
+    if _is_nan(get("track_id")):
+        return None
+    role = get("role")
+    if role == "ball":
+        return None
+    if not isinstance(get("bbox_pitch"), dict):
+        return None
+    if role == "referee":
+        return COLOR_REFEREE
+    team = get("team")
+    if team == "left":
+        return COLOR_LEFT
+    if team == "right":
+        return COLOR_RIGHT
+    return None
 
 
 class Radar(ImageVisualizer):
@@ -94,12 +149,11 @@ class Radar(ImageVisualizer):
 
         r = max(4, int(round(2.2 * self.scale)))
         for _, det in detections_pred.iterrows():
-            role = det.role if "role" in det else None
-            if role == "ball":
+            color = radar_color(det)
+            if color is None:       # untracked, ball, no pitch position, or no team
                 continue
+            role = det["role"] if "role" in det.index else None
             bp = det["bbox_pitch"]
-            if not isinstance(bp, dict):
-                continue
             x = float(np.clip(bp["x_bottom_middle"], -(PITCH_LENGTH / 2 + MARGIN_X),
                               PITCH_LENGTH / 2 + MARGIN_X))
             y = float(np.clip(bp["y_bottom_middle"], -(PITCH_WIDTH / 2 + MARGIN_Y),
@@ -107,26 +161,14 @@ class Radar(ImageVisualizer):
             px = cx + int(round(x * self.scale))
             py = cy + int(round(y * self.scale))
 
-            team = det.team if "team" in det else None
-            if role == "referee":
-                color = COLOR_REFEREE
-            elif team == "left":
-                color = COLOR_LEFT
-            elif team == "right":
-                color = COLOR_RIGHT
-            else:
-                color = COLOR_NEUTRAL
-
             cv2.circle(image, (px, py), r, color, -1, cv2.LINE_AA)
             cv2.circle(image, (px, py), r, (255, 255, 255), 1, cv2.LINE_AA)
 
             label = None
-            jn = det.jersey_number if "jersey_number" in det else None
+            jn = det["jersey_number"] if "jersey_number" in det.index else None
             if role == "goalkeeper":
                 label = "GK"
-            elif role == "player" and jn is not None and not (
-                isinstance(jn, float) and np.isnan(jn)
-            ):
+            elif role == "player" and not _is_nan(jn):
                 label = f"{int(jn)}"
             if label:
                 draw_text(

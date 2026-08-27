@@ -1,0 +1,471 @@
+"""Run audit: turns every silent degradation of this pipeline into a verdict.
+
+Neither BroadTrack nor the jersey stage aborts the run when it fails: each logs
+an ERROR and returns, and the pipeline runs to completion with empty columns.
+Team clustering only reaches ``player`` tracklets; the radar only draws rows
+with a defined team. A run can therefore finish, evaluate and render while a
+component silently did nothing. This module is the LAST stage of the pipeline
+and, per sequence, states for each component what it was supposed to do, what
+was observed, and a verdict:
+
+    PASS   observed what the component is supposed to produce
+    WARN   produced, but degraded beyond the configured threshold
+    FAIL   absent, empty, inconsistent, or a recorded failure
+    INFO   observation only (no independent expectation can be checked here)
+
+It never modifies detections. Per sequence it writes ``<out_dir>/<seq>.json``
+and logs a table. ``scripts/verify_run_integrity.py`` reads those files and
+refuses the run's metrics on any FAIL.
+
+Thresholds live in the module config (``modules/audit/run_audit.yaml``) with
+the reason for each; the JSON keeps the raw counts so they can be revisited.
+
+The jersey-number component (the stage most recently changed) is checked in
+the most detail: the per-sequence cache blob written by ``jn_gsr_api`` must
+exist, carry ``rule == vote_pool`` and the real sha256 of BOTH staged
+checkpoints, answer every eligible tracklet, and agree with the detection
+columns; the two provenance files written at provisioning must record a
+SATRN download that is a torch container with a recovered config and a
+matching hash, and a PARSeq checkpoint that matches upstream.
+"""
+import glob
+import hashlib
+import json
+import logging
+import os
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from tracklab.pipeline.videolevel_module import VideoLevelModule
+
+from sn_gamestate.visualization.pitch import radar_color
+
+log = logging.getLogger(__name__)
+
+RULE = "vote_pool"
+PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _is_nan(v):
+    """True for None/NaN scalars only; arrays, dicts and strings are values."""
+    if v is None:
+        return True
+    if isinstance(v, (np.ndarray, list, tuple, dict, str)):
+        return False
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _tid(v):
+    """Canonical tracklet id string: jn_gsr_api keys its manifest/blob with
+    str(track_id), which is '3.0' for a float column and '3' for an int one."""
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else str(v)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _share(num, den):
+    return float(num) / float(den) if den else 0.0
+
+
+def _sha256(path, chunk=1 << 22):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+class Check:
+    def __init__(self, component, expected):
+        self.component, self.expected = component, expected
+        self.observed, self.verdict, self.note = {}, PASS, ""
+
+    def set(self, verdict, note=""):
+        order = {INFO: 0, PASS: 1, WARN: 2, FAIL: 3}
+        if order[verdict] > order[self.verdict]:
+            self.verdict = verdict
+        if note:
+            self.note = (self.note + "; " if self.note else "") + note
+        return self
+
+    def to_dict(self):
+        return {"component": self.component, "expected": self.expected,
+                "observed": self.observed, "verdict": self.verdict,
+                "note": self.note}
+
+
+class RunAudit(VideoLevelModule):
+    """Final stage: per-sequence verdict for every component. Read-only."""
+
+    input_columns = []       # column presence is itself a finding, checked at runtime
+    output_columns = []
+
+    def __init__(self, cfg, device=None, tracking_dataset=None, **kwargs):
+        super().__init__()
+        self.cfg = cfg
+        self.out_dir = Path(str(cfg.out_dir))
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.jn_cache_dir = Path(str(cfg.jn_cache_dir))
+        self.calib_dir = Path(str(cfg.calib_dir))
+        self.models_dir = Path(str(cfg.models_dir))
+        self.parseq_ckpt = str(getattr(cfg, "parseq_ckpt", "parseq_gsr_ft_s1.ckpt"))
+        self.satrn_ckpt = str(getattr(cfg, "satrn_ckpt",
+                                      "recog2/best_recog_word_acc_epoch_10.pth"))
+        self.jn_roles = set(getattr(cfg, "jn_roles", ["player", "goalkeeper"]))
+        thr = getattr(cfg, "thresholds", None) or {}
+        g = lambda k, d: float(thr[k]) if k in thr else d  # noqa: E731
+        self.thr = {
+            "empty_frames_warn": g("empty_frames_warn", 0.20),
+            "reid_null_warn": g("reid_null_warn", 0.01),
+            "tracked_warn": g("tracked_warn", 0.50),
+            "pitch_missing_warn": g("pitch_missing_warn", 0.05),
+            "jn_min_eligible_for_zero_fail": g("jn_min_eligible_for_zero_fail", 10),
+            "team_missing_warn": g("team_missing_warn", 0.05),
+            "radar_skipped_tracked_warn": g("radar_skipped_tracked_warn", 0.05),
+        }
+        self._ckpt_sha = {}
+
+    # ------------------------------------------------------------ helpers --
+    def _ckpt_id(self, rel):
+        if rel not in self._ckpt_sha:
+            p = self.models_dir / rel
+            try:
+                self._ckpt_sha[rel] = _sha256(p)
+            except OSError:
+                self._ckpt_sha[rel] = None
+        return self._ckpt_sha[rel]
+
+    @staticmethod
+    def _seq_name(metadatas):
+        if len(metadatas) and "file_path" in metadatas.columns:
+            return Path(str(metadatas["file_path"].iloc[0])).parent.parent.name
+        if len(metadatas) and "video_id" in metadatas.columns:
+            return str(metadatas["video_id"].iloc[0])
+        return "unknown"
+
+    @staticmethod
+    def _per_track_constant(tracked, col):
+        """[track ids] whose `col` takes more than one distinct non-null value."""
+        if col not in tracked.columns:
+            return None
+        bad = []
+        for tid, grp in tracked.groupby("track_id"):
+            vals = {str(v) for v in grp[col] if not _is_nan(v)}
+            if len(vals) > 1:
+                bad.append(str(tid))
+        return bad
+
+    # ------------------------------------------------------------- checks --
+    def _check_detector(self, det, meta):
+        c = Check("bbox_detector", "at least one detection on (nearly) every frame")
+        n_frames = len(meta)
+        frames_with = det["image_id"].nunique() if "image_id" in det.columns else 0
+        c.observed = {"frames": n_frames, "frames_with_detections": frames_with,
+                      "detections": len(det)}
+        if len(det) == 0 or frames_with == 0:
+            return c.set(FAIL, "no detections at all")
+        empty = _share(n_frames - frames_with, n_frames)
+        c.observed["empty_frame_share"] = round(empty, 4)
+        if empty > self.thr["empty_frames_warn"]:
+            c.set(WARN, f"{empty:.1%} frames without detections")
+        return c
+
+    def _check_reid(self, det):
+        c = Check("reid", "embeddings + role_detection on every detection")
+        for col in ("embeddings", "role_detection"):
+            if col not in det.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+                continue
+            null = int(det[col].apply(_is_nan).sum())
+            c.observed[f"{col}_null"] = null
+            if len(det) and null == len(det):
+                c.set(FAIL, f"{col} all null")
+            elif _share(null, len(det)) > self.thr["reid_null_warn"]:
+                c.set(WARN, f"{col} null on {_share(null, len(det)):.1%}")
+        return c
+
+    def _check_track(self, det, tracked):
+        c = Check("track + gta_link", "most detections carry a track_id; "
+                                      "tracklets are non-trivial")
+        if "track_id" not in det.columns:
+            c.observed["track_id"] = "column missing"
+            return c.set(FAIL, "track_id column missing")
+        share = _share(len(tracked), len(det))
+        lens = tracked.groupby("track_id").size() if len(tracked) else pd.Series(dtype=int)
+        c.observed = {"tracked_share": round(share, 4), "tracklets": int(len(lens)),
+                      "tracklet_len_median": float(lens.median()) if len(lens) else 0.0,
+                      "tracklet_len_min": int(lens.min()) if len(lens) else 0}
+        if len(det) and len(tracked) == 0:
+            return c.set(FAIL, "no detection has a track_id")
+        if share < self.thr["tracked_warn"]:
+            c.set(WARN, f"only {share:.1%} of detections tracked")
+        return c
+
+    def _check_calibration(self, seq, tracked):
+        c = Check("calibration", "bbox_pitch on every tracked detection; "
+                                 "non-empty camera JSON for the sequence")
+        if "bbox_pitch" not in tracked.columns:
+            c.observed["bbox_pitch"] = "column missing"
+            c.set(FAIL, "bbox_pitch column missing")
+        else:
+            has = int(tracked["bbox_pitch"].apply(lambda b: isinstance(b, dict)).sum())
+            miss = _share(len(tracked) - has, len(tracked))
+            c.observed.update({"tracked_with_bbox_pitch": has,
+                               "missing_share": round(miss, 4)})
+            if len(tracked) and has == 0:
+                c.set(FAIL, "no tracked detection has bbox_pitch")
+            elif miss > self.thr["pitch_missing_warn"]:
+                c.set(WARN, f"{miss:.1%} tracked detections without bbox_pitch")
+        cj = self.calib_dir / f"{seq}.json"
+        c.observed["camera_json"] = str(cj)
+        if not cj.is_file():
+            c.set(FAIL, "camera JSON absent")
+        else:
+            try:
+                data = json.loads(cj.read_text())
+                c.observed["camera_json_frames"] = len(data) if hasattr(data, "__len__") else None
+                if not data:
+                    c.set(FAIL, "camera JSON empty")
+            except (OSError, json.JSONDecodeError) as e:
+                c.set(FAIL, f"camera JSON unreadable: {e}")
+        return c
+
+    def _eligible_tids(self, tracked):
+        """Tracklets the jersey stage recognises: majority role in jn_roles."""
+        if "role_detection" not in tracked.columns:
+            return set()
+        out = set()
+        for tid, grp in tracked.groupby("track_id"):
+            mode = grp["role_detection"].mode()
+            if len(mode) and mode.iloc[0] in self.jn_roles:
+                out.add(_tid(tid))
+        return out
+
+    def _check_jersey(self, seq, tracked):
+        c = Check("jersey_number_detect",
+                  f"per-sequence cache blob with rule={RULE}, real sha256 of both "
+                  f"checkpoints, an answer for every eligible tracklet, per-track "
+                  f"constant jersey_number_detection consistent with the blob")
+        eligible = self._eligible_tids(tracked)
+        c.observed["eligible_tracklets"] = len(eligible)
+
+        for col in ("jersey_number_detection", "jersey_number_confidence"):
+            if col not in tracked.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+        if c.verdict == FAIL:
+            return c
+
+        # per-track constancy + coverage from the detection columns
+        bad = self._per_track_constant(tracked, "jersey_number_detection")
+        c.observed["tracks_with_inconsistent_number"] = len(bad)
+        if bad:
+            c.set(FAIL, f"{len(bad)} tracks with >1 jersey_number_detection value")
+        numbered = set()
+        for tid, grp in tracked.groupby("track_id"):
+            vals = [v for v in grp["jersey_number_detection"] if not _is_nan(v)]
+            if vals:
+                numbered.add(_tid(tid))
+        c.observed["eligible_numbered"] = len(numbered & eligible)
+        c.observed["numbered_outside_eligible"] = len(numbered - eligible)
+        if numbered - eligible:
+            c.set(WARN, "numbers on tracklets outside the role filter")
+        if (len(eligible) >= self.thr["jn_min_eligible_for_zero_fail"]
+                and not (numbered & eligible)):
+            c.set(FAIL, f"0 of {len(eligible)} eligible tracklets numbered")
+
+        # the cache blob jn_gsr_api wrote for this sequence
+        blobs = sorted(glob.glob(str(self.jn_cache_dir / f"{seq}.*.json")),
+                       key=os.path.getmtime)
+        c.observed["cache_blobs"] = len(blobs)
+        if not blobs:
+            return c.set(FAIL, "no jersey cache blob for this sequence "
+                               "(stage did not run, or its workers failed)")
+        try:
+            blob = json.loads(open(blobs[-1]).read())
+        except (OSError, json.JSONDecodeError) as e:
+            return c.set(FAIL, f"cache blob unreadable: {e}")
+        c.observed["cache_blob"] = os.path.basename(blobs[-1])
+        c.observed["rule"] = blob.get("rule")
+        if blob.get("rule") != RULE:
+            c.set(FAIL, f"blob rule {blob.get('rule')!r} != {RULE!r}")
+        for key, rel in (("parseq_sha256", self.parseq_ckpt),
+                         ("satrn_sha256", self.satrn_ckpt)):
+            v = str(blob.get(key, ""))
+            ok_hex = bool(_HEX64.match(v))
+            c.observed[key] = v[:16] + ("..." if ok_hex else "")
+            if not ok_hex:
+                c.set(FAIL, f"{key} is not a real digest ({v[:24]!r})")
+                continue
+            disk = self._ckpt_id(rel)
+            if disk is None:
+                c.set(WARN, f"{rel} not readable now; cannot compare {key}")
+            elif disk != v:
+                c.set(FAIL, f"{key} in blob != staged file {rel}")
+        results = {_tid(k): v for k, v in (blob.get("results", {}) or {}).items()}
+        missing = eligible - set(results)
+        c.observed["eligible_missing_from_blob"] = len(missing)
+        if missing:
+            c.set(FAIL, f"{len(missing)} eligible tracklets absent from the blob")
+        n_used0 = sum(1 for r in results.values() if int(r.get("n_used", 0)) == 0)
+        minus1 = sum(1 for r in results.values() if str(r.get("number")) == "-1")
+        c.observed.update({"blob_tracklets": len(results), "blob_minus1": minus1,
+                           "blob_n_used_zero": n_used0})
+        # detection columns agree with the blob
+        disagree = 0
+        for tid, grp in tracked.groupby("track_id"):
+            r = results.get(_tid(tid))
+            if r is None:
+                continue
+            vals = {str(int(float(v))) for v in grp["jersey_number_detection"]
+                    if not _is_nan(v)}
+            want = str(r.get("number"))
+            want = str(int(want)) if want.isdigit() else None
+            if want is None and vals:
+                disagree += 1
+            elif want is not None and vals != {want}:
+                disagree += 1
+        c.observed["tracks_disagreeing_with_blob"] = disagree
+        if disagree:
+            c.set(FAIL, f"{disagree} tracks whose column differs from the blob")
+
+        # provisioning provenance (written once by fetch_weights / stage_weights)
+        fp = self.models_dir / "fetch_weights_provenance.json"
+        if not fp.is_file():
+            c.set(WARN, "fetch_weights_provenance.json absent")
+        else:
+            try:
+                recs = {r["key"]: r for r in json.loads(fp.read_text())["weights"]}
+                s = recs.get("satrn")
+                if s is None:
+                    c.set(FAIL, "SATRN not in fetch_weights provenance")
+                else:
+                    c.observed["satrn_provenance"] = {
+                        "sha256_matches": s.get("sha256_matches"),
+                        "container": s.get("container"),
+                        "config_from_checkpoint": bool(s.get("config_from_checkpoint"))}
+                    if s.get("sha256_matches") is False:
+                        c.set(WARN, "SATRN download hash differs from the recorded prefix")
+                    if s.get("container") == "archive":
+                        c.set(FAIL, "SATRN download is a file archive, not a checkpoint")
+                    if not s.get("config_from_checkpoint"):
+                        c.set(WARN, "no config recovered from the SATRN checkpoint")
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+                c.set(WARN, f"fetch_weights_provenance.json unreadable: {e}")
+        wp = self.models_dir / "weights_provenance.json"
+        if not wp.is_file():
+            c.set(WARN, "weights_provenance.json (PARSeq) absent")
+        else:
+            try:
+                prov = json.loads(wp.read_text())
+                c.observed["parseq_matches_upstream"] = prov.get("matches_upstream")
+                if prov.get("matches_upstream") is not True:
+                    c.set(FAIL, "PARSeq checkpoint does not match upstream")
+            except (OSError, json.JSONDecodeError) as e:
+                c.set(WARN, f"weights_provenance.json unreadable: {e}")
+        return c
+
+    def _check_tracklet_agg(self, tracked):
+        c = Check("tracklet_agg", "jersey_number and role constant per track; "
+                                  "jersey_number equals the per-track detection")
+        for col in ("jersey_number", "role"):
+            if col not in tracked.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+                continue
+            bad = self._per_track_constant(tracked, col)
+            c.observed[f"{col}_inconsistent_tracks"] = len(bad)
+            if bad:
+                c.set(FAIL, f"{col} varies within {len(bad)} tracks")
+        if {"jersey_number", "jersey_number_detection"} <= set(tracked.columns):
+            mism = 0
+            for tid, grp in tracked.groupby("track_id"):
+                a = {str(int(float(v))) for v in grp["jersey_number_detection"] if not _is_nan(v)}
+                b = {str(int(float(v))) for v in grp["jersey_number"] if not _is_nan(v)}
+                if a != b:
+                    mism += 1
+            c.observed["tracks_jn_vs_detection_mismatch"] = mism
+            if mism:
+                c.set(FAIL, f"{mism} tracks where jersey_number != detection")
+        return c
+
+    def _check_team(self, tracked):
+        c = Check("team + team_side", "every tracked player/goalkeeper has team in "
+                                      "{left, right}; both teams present; referees none")
+        if "team" not in tracked.columns:
+            c.observed["team"] = "column missing"
+            return c.set(FAIL, "team column missing")
+        role = tracked["role"] if "role" in tracked.columns else pd.Series(index=tracked.index, dtype=object)
+        pg = tracked[role.isin(["player", "goalkeeper"])]
+        has = pg["team"].isin(["left", "right"])
+        miss = _share(int((~has).sum()), len(pg))
+        c.observed = {"player_gk_rows": int(len(pg)),
+                      "team_missing_share": round(miss, 4),
+                      "left_tracklets": int(pg[pg["team"] == "left"]["track_id"].nunique()),
+                      "right_tracklets": int(pg[pg["team"] == "right"]["track_id"].nunique())}
+        if "team_cluster" in tracked.columns:
+            c.observed["clusters"] = sorted({int(v) for v in tracked["team_cluster"] if not _is_nan(v)})
+        if len(pg) and int(has.sum()) == 0:
+            c.set(FAIL, "no player/goalkeeper has a team")
+        elif miss > self.thr["team_missing_warn"]:
+            c.set(WARN, f"{miss:.1%} player/GK rows without team")
+        if len(pg) and (c.observed["left_tracklets"] == 0 or c.observed["right_tracklets"] == 0):
+            c.set(WARN, "only one team present")
+        return c
+
+    def _check_visualization(self, det, tracked):
+        c = Check("visualization (radar)", "every tracked row with a pitch position "
+                                            "is drawn with a team/referee colour")
+        drawable = tracked[tracked["bbox_pitch"].apply(lambda b: isinstance(b, dict))] \
+            if "bbox_pitch" in tracked.columns else tracked.iloc[0:0]
+        skipped = int(sum(1 for _, r in drawable.iterrows() if radar_color(r) is None))
+        c.observed = {"untracked_rows_not_drawn": int(len(det) - len(tracked)),
+                      "tracked_rows_with_pitch": int(len(drawable)),
+                      "tracked_rows_skipped_no_colour": skipped}
+        share = _share(skipped, len(drawable))
+        c.observed["skipped_share"] = round(share, 4)
+        if share > self.thr["radar_skipped_tracked_warn"]:
+            c.set(WARN, f"{share:.1%} tracked rows have no team/referee colour")
+        return c
+
+    # ---------------------------------------------------------------- main --
+    def process(self, detections: pd.DataFrame, metadatas: pd.DataFrame):
+        seq = self._seq_name(metadatas)
+        det = detections
+        tracked = det.dropna(subset=["track_id"]) if "track_id" in det.columns else det.iloc[0:0]
+        checks = [
+            self._check_detector(det, metadatas),
+            self._check_reid(det),
+            self._check_track(det, tracked),
+            self._check_calibration(seq, tracked),
+            self._check_jersey(seq, tracked),
+            self._check_tracklet_agg(tracked),
+            self._check_team(tracked),
+            self._check_visualization(det, tracked),
+        ]
+        report = {"sequence": seq, "detections": int(len(det)),
+                  "tracked": int(len(tracked)), "rule": RULE,
+                  "checks": [c.to_dict() for c in checks],
+                  "summary": {v: sum(1 for c in checks if c.verdict == v)
+                              for v in (PASS, WARN, FAIL, INFO)}}
+        out = self.out_dir / f"{seq}.json"
+        out.write_text(json.dumps(report, indent=2, default=str))
+
+        width = max(len(c.component) for c in checks)
+        lines = [f"[audit] {seq}: " + ", ".join(f"{k}={v}" for k, v in report["summary"].items())]
+        for c in checks:
+            lines.append(f"[audit]   {c.verdict:4} {c.component:<{width}}  {c.note or 'ok'}")
+        msg = "\n".join(lines)
+        (log.error if report["summary"][FAIL] else
+         log.warning if report["summary"][WARN] else log.info)(msg)
+        return detections

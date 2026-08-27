@@ -5,7 +5,7 @@ backends: every file in this repository belongs to the active pipeline.
 
 ```
 bbox_detector -> reid -> track -> gta_link -> interpolation -> calibration
-              -> jersey_number_detect -> tracklet_agg -> team -> team_side
+              -> jersey_number_detect -> tracklet_agg -> team -> team_side -> audit
 ```
 
 | Stage | Implementation | Notes |
@@ -19,6 +19,7 @@ bbox_detector -> reid -> track -> gta_link -> interpolation -> calibration
 | `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level: legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
 | `tracklet_agg` | majority vote | `[jersey_number, role]` |
 | `team` / `team_side` | k-means on prtreid embeddings / mean pitch position | |
+| `audit` | per-component verdicts | read-only last stage: PASS/WARN/FAIL per component per sequence → `audit/<seq>.json`; `scripts/verify_run_integrity.py` refuses the run on any FAIL |
 
 There is **no `pitch` stage**: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 detectors internally and emits camera parameters directly.
@@ -123,6 +124,24 @@ non-zero against any other detector. `test` is reserved for the frozen productio
 
 ## Verify before you measure
 
+Every run ends with the `audit` stage (`sn_gamestate/audit/run_audit_api.py`): for each
+sequence and each component it records what the component was supposed to produce, what
+was observed, and a verdict. Neither BroadTrack nor the jersey stage aborts on failure,
+so without this a run can finish with empty pitch coordinates or empty jersey numbers and
+still print plausible metrics. The jersey check is the strictest: the per-sequence cache
+blob must carry `rule = vote_pool` and the sha256 of both staged checkpoints, answer every
+player/goalkeeper tracklet, agree with the detection columns, and the provisioning
+provenance of SATRN and PARSeq must be on record. Thresholds are in
+`configs/modules/audit/run_audit.yaml`.
+
+```bash
+python scripts/verify_run_integrity.py --expect-sequences 49   # exits non-zero on any FAIL
+```
+
+The radar (minimap) draws only tracked rows with a team or referee colour. Untracked
+detections and tracklets without a team are not painted in a neutral colour; the audit
+reports how many rows were skipped for that reason (`visualization (radar)` check).
+
 The BroadTrack → sn-calibration parameter conversion includes a distortion rescale derived
 from the C++ source. Confirm it on real output before trusting any metric:
 
@@ -162,6 +181,7 @@ sn_gamestate/
   track/bot_sort_notebook.py, gta_link_api.py, hf_resolver.py
   calibration/broadtrack_api.py          # calibration + image-to-pitch
   jersey/jn_gsr_api.py                   # multi-GPU tracklet recognition
+  audit/run_audit_api.py                 # per-component verdicts (last stage)
   team/, visualization/, configs/
 plugins/calibration/sn_calibration_baseline/   # Camera + SoccerPitch geometry
 plugins/jn_gsr/                                # vendored jersey package (+ its own venv)

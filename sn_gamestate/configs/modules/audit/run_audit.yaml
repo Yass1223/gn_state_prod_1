@@ -1,0 +1,36 @@
+# Run audit -- the LAST pipeline stage. Read-only: it never changes detections.
+#
+# Per sequence, one check per component with what the component was supposed to
+# produce, what was observed, and a verdict (PASS / WARN / FAIL / INFO), written to
+# <out_dir>/<seq>.json and logged as a table. scripts/verify_run_integrity.py reads
+# those files and exits non-zero on any FAIL, so metrics from a run in which a
+# stage silently produced nothing cannot be reported.
+#
+# Components checked: bbox_detector, reid, track+gta_link, calibration (bbox_pitch +
+# camera JSON), jersey_number_detect (cache blob: rule vote_pool, sha256 of BOTH
+# checkpoints vs the staged files, every eligible tracklet answered, detection
+# columns consistent with the blob, provisioning provenance of SATRN and PARSeq),
+# tracklet_agg, team+team_side, and the radar (rows that would have no colour).
+_target_: sn_gamestate.audit.RunAudit
+cfg:
+  out_dir: ${project_dir}/audit
+  # Must match the other stages' configs -- same values as jn_gsr.yaml / broadtrack.yaml.
+  jn_cache_dir: ${project_dir}/jn_cache
+  calib_dir: ${project_dir}/broadtrack_calib
+  models_dir: ${project_dir}/plugins/jn_gsr/models
+  parseq_ckpt: parseq_gsr_ft_s1.ckpt
+  satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
+  # Roles the jersey stage recognises (jn_gsr.yaml `roles`); tracklets whose majority
+  # role_detection is elsewhere are not expected to carry a number.
+  jn_roles: [player, goalkeeper]
+
+  # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
+  # inconsistent) and not tunable. Raw counts are always in the JSON.
+  thresholds:
+    empty_frames_warn: 0.20            # frames without any detection
+    reid_null_warn: 0.01               # detections lacking embeddings / role_detection
+    tracked_warn: 0.50                 # detections without track_id
+    pitch_missing_warn: 0.05           # tracked detections without bbox_pitch
+    jn_min_eligible_for_zero_fail: 10  # FAIL "0 numbered" only with >= this many eligible tracklets
+    team_missing_warn: 0.05            # player/GK rows without team left/right
+    radar_skipped_tracked_warn: 0.05   # tracked rows with a pitch position but no colour
