@@ -4,8 +4,8 @@
 #
 #   bbox_detector  YOLO11-L SoccerNet fine-tune (HF)          -> bbox_ltwh, bbox_conf
 #   reid           prtreid (bpbreid/HRNet32, 256-d)           -> embeddings, role_detection
-#   track          BoT-SORT · SOF + sports-OSNet (boxmot parity) -> track_id
-#   gta_link       offline tracklet stitching (own OSNet)     -> track_id (merged)
+#   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
+#   gta_link       offline tracklet stitching (same OSNet-AIN) -> track_id (merged)
 #   interpolation  linear gap fill on final track ids (DTI)   -> synthesized rows (off)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
 #   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU
@@ -38,7 +38,7 @@ defaults:
   - visualization: gamestate
   - modules/bbox_detector: yolo_ultralytics_snft
   - modules/reid: prtreid
-  - modules/track: botsort_osnet
+  - modules/track: botsort_ain
   - modules/gta_link: gta_link
   - modules/interpolation: dti
   - modules/calibration: broadtrack
@@ -74,10 +74,22 @@ home_dir: "${oc.env:HOME}"
 data_dir: "${project_dir}/data"
 model_dir: "${project_dir}/pretrained_models"
 
-# TensorRT for the detector / tracker ReID / GTA-Link OSNet. Keep false for exact
-# reproduction (FP16 engines are not bit-identical); build with scripts/build_trt_engines.py.
+# TensorRT for the detector only (the OSNet-AIN appearance model has no TensorRT
+# path). Keep false for exact reproduction (FP16 engines are not bit-identical);
+# build with scripts/build_trt_engines.py.
 use_tensorrt: false
 trt_dir: "${model_dir}/trt"
+
+# Numerical precision for the stages this environment controls: the YOLO11 detector,
+# the OSNet-AIN embedder in `track` and `gta_link` (torch autocast on CUDA), and the
+# prtreid `reid` stage. fp16 is the default; set precision=fp32 (here or on the CLI)
+# for exact parity with the fp32-validated reference numbers. After any integration
+# change, run fp32 once so a precision effect is never mistaken for an integration
+# bug; if fp16 measurably degrades a stage on Kaggle, pin that stage back by
+# overriding its module cfg (each stage reads ${precision} individually).
+# Out of reach by construction: BroadTrack (a C++ subprocess), the jersey stage (its
+# own python 3.10 venv), and SOF camera motion (OpenCV on CPU, no fp16 exists).
+precision: fp16
 
 # Machine configuration
 num_cores: 4

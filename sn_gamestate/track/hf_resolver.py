@@ -4,16 +4,16 @@ Registers a `${hf:<repo_id>,<filename>[,<local_name>]}` resolver so model checkp
 are pulled from the Hub at config-resolution time (cached on disk by huggingface_hub) and
 the resolved value is the local path that the module loaders expect.
 
-Why the optional third argument matters
----------------------------------------
-tracklab's BoT-SORT ReID backend (`ReIDDetectMultiBackend`) infers the network
-architecture from the weights *filename* (`get_model_name`) and only loads weights when
-the suffix is `.pt`. Our SoccerNet sports ReID checkpoint is a torchreid `osnet_x1_0`
-saved as `sports_model.pth.tar-60` — that name matches no architecture and the suffix
-isn't `.pt`, so feeding it raw would silently leave the ReID model randomly initialised.
-Passing a third argument materialises a copy named e.g. `osnet_x1_0_sports.pt`, so the
-backend builds `osnet_x1_0` and torchreid's `load_pretrained_weights` (which strips
-`module.` and shape-filters the classifier) loads it correctly — identical to the notebook.
+Why the optional third argument exists
+--------------------------------------
+Some loaders infer the network architecture from the weights *filename* and only load
+weights for particular suffixes (tracklab's ``ReIDDetectMultiBackend`` is one: it calls
+``get_model_name`` on the filename and requires ``.pt``). The third argument
+materialises a copy under a loader-friendly name without mutating the immutable
+huggingface_hub cache entry. Nothing in the current pipeline uses it — the detector's
+``${hf:...}`` call is the 2-argument form, and the OSNet-AIN checkpoint is fetched and
+digest-verified by ``sn_gamestate.reid.osnet_ain`` itself — but the capability is kept
+because it is cheap and self-contained.
 
 This module is imported from `config_finder.py` (loaded at plugin discovery), guaranteeing
 the resolver exists before any config interpolation is evaluated.

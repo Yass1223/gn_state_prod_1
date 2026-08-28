@@ -6,7 +6,10 @@
 # those files and exits non-zero on any FAIL, so metrics from a run in which a
 # stage silently produced nothing cannot be reported.
 #
-# Components checked: bbox_detector, reid, track+gta_link, calibration (bbox_pitch +
+# Components checked: bbox_detector, reid, track+gta_link, track internals (BoT-SORT
+# sidecar: frame coverage, camera-motion identity rate, clipped crops, zero
+# embeddings, ran-vs-declared settings/checkpoint/precision, and track==gta_link
+# checkpoint+precision pin equality), calibration (bbox_pitch +
 # camera JSON), jersey_number_detect (cache blob: rule vote_pool, sha256 of BOTH
 # checkpoints vs the staged files, every eligible tracklet answered, detection
 # columns consistent with the blob, provisioning provenance of SATRN and PARSeq),
@@ -24,6 +27,25 @@ cfg:
   # role_detection is elsewhere are not expected to carry a number.
   jn_roles: [player, goalkeeper]
 
+  # Tracker diagnostics sidecars written by the track stage (must equal the track
+  # module's audit_dir), and the declared tracker/embedder configuration to hold the
+  # run against. Everything below resolves through OmegaConf interpolation from the
+  # track and gta_link module configs, so the audit compares what RAN (the sidecar)
+  # against what the composed config DECLARES, and fails on any disagreement —
+  # including the two stages pinning different weights or precisions.
+  track_sidecar_dir: ${modules.track.cfg.audit_dir}
+  expected_tracker:
+    ain_sha256_track: ${modules.track.cfg.ain_sha256}
+    ain_sha256_gta: ${modules.gta_link.cfg.ain_sha256}
+    ain_file_track: ${modules.track.cfg.ain_file}
+    ain_file_gta: ${modules.gta_link.cfg.ain_file}
+    ain_revision_track: ${modules.track.cfg.ain_revision}
+    ain_revision_gta: ${modules.gta_link.cfg.ain_revision}
+    precision_track: ${modules.track.cfg.precision}
+    precision_gta: ${modules.gta_link.cfg.precision}
+    appearance_thresh: ${modules.track.cfg.hyperparams.appearance_thresh}
+    sof_scale: ${modules.track.cfg.sof_scale}
+
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.
   thresholds:
@@ -34,3 +56,6 @@ cfg:
     jn_min_eligible_for_zero_fail: 10  # FAIL "0 numbered" only with >= this many eligible tracklets
     team_missing_warn: 0.05            # player/GK rows without team left/right
     radar_skipped_tracked_warn: 0.05   # tracked rows with a pitch position but no colour
+    cmc_identity_warn: 0.02            # frames falling back to an identity warp (ref notebook)
+    crop_clipped_warn: 0.001           # high-conf crops clipping to nothing (ref notebook)
+    zero_emb_warn: 0.01                # high-conf detections with an all-zero embedding

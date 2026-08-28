@@ -46,7 +46,33 @@ dependencies = [
     # to import (detector, reid, track, MajorityVoteTracklet, TrackEvalEvaluator)
     # with "cannot import name 'HfFolder'". Kaggle 2026-08-07 resolved 1.8.0.
     "huggingface_hub>=0.23,<1.0",
+    # Runtime imports of boxmot's BoT-SORT and SOF path, declared here because
+    # boxmot itself is installed with --no-deps (see the note below) and so brings
+    # nothing with it. `lap` is the module name lapx installs under.
+    "lapx",
+    "rich",
 ]
+
+# boxmot is a dependency of the `track` stage but is deliberately NOT listed above.
+#
+# boxmot 19.0.0's metadata requires torch>=2.2.1, huggingface-hub>=1.7.1 and
+# pandas>=2.0.0; the first two contradict the pins in this file, so a resolver
+# would either fail or drag torch 2.x in and break tracklab, torchmetrics 0.10.3
+# and the bpbreid torchreid fork. Its actual import chain needs none of that:
+# `boxmot.trackers.botsort.botsort` reaches only numpy, cv2, lap, scipy and rich,
+# plus torch via boxmot/utils/ops.py, which imports it solely for
+# `isinstance(x, torch.Tensor)` dispatch and uses no version-gated API.
+# Requires-Python is >=3.9,<3.13, so python 3.9 is supported.
+#
+# It is therefore installed alongside this project rather than by it:
+#
+#     uv pip install --python .venv --no-deps boxmot==19.0.0
+#
+# scripts/lightning_eval.sh does this immediately after `uv pip install -e .`,
+# and scripts/preflight_imports.py verifies the import in seconds.
+# Pin the version: 19.x exposes BotSort at boxmot.trackers.botsort.botsort, while
+# 20+ moved it to boxmot.trackers.bbox.botsort, and `boxmot.__version__` cannot
+# tell them apart - the 19.0.0 wheel reports "18.0.0".
 
 [project.entry-points.tracklab_plugin]
 sn_gamestate = "sn_gamestate.config_finder:ConfigFinder"

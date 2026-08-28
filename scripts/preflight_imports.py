@@ -57,9 +57,21 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print the full traceback for each failure")
+    ap.add_argument("--skip-backbone", action="store_true",
+                    help="skip building the osnet_ain_x1_0 backbone (torch import, "
+                         "a few seconds; no download)")
     args = ap.parse_args(argv)
 
     targets = discover_targets()
+    # Two runtime dependencies of the `track` stage live OUTSIDE the config graph
+    # and deserve the same seconds-not-minutes failure: boxmot (installed with
+    # --no-deps, so nothing else vouches for it - see pyproject.toml) and the
+    # shared OSNet-AIN embedder module both `track` and `gta_link` import.
+    targets += [
+        "boxmot.trackers.botsort.botsort.BotSort",
+        "boxmot.motion.cmc.get_cmc_method",
+        "sn_gamestate.reid.osnet_ain.from_config",
+    ]
     print(f"Importing {len(targets)} pipeline stages "
           f"(python {sys.version.split()[0]})\n")
 
@@ -72,6 +84,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {RED}FAIL{RESET} {dotted}")
             print(f"       {DIM}{reason}{RESET}")
             failures.append((dotted, reason, tb))
+
+    # The osnet_ain_x1_0 backbone must be BUILDABLE, not just importable: the
+    # torchreid in this environment is the VlSomers/bpbreid fork, and whether its
+    # model factory carries osnet_ain decides whether the appearance model can
+    # exist at all. No network, no GPU - the factory builds from code alone.
+    if not args.skip_backbone and not any(
+            d.startswith("sn_gamestate.reid.osnet_ain") for d, _, _ in failures):
+        try:
+            from sn_gamestate.reid.osnet_ain import build_backbone
+            _, factory = build_backbone("osnet_ain_x1_0")
+            print(f"  {GREEN}OK  {RESET} osnet_ain_x1_0 buildable via {factory}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {RED}FAIL{RESET} osnet_ain_x1_0 backbone build")
+            print(f"       {DIM}{type(exc).__name__}: {exc}{RESET}")
+            failures.append(("osnet_ain_x1_0 backbone", str(exc),
+                             traceback.format_exc()))
 
     print()
     if not failures:

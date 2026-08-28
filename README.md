@@ -12,8 +12,8 @@ bbox_detector -> reid -> track -> gta_link -> interpolation -> calibration
 |---|---|---|
 | `bbox_detector` | YOLO11-L SoccerNet fine-tune | imgsz 1280, conf floor 0.1 (`>=`), RGB→BGR fix |
 | `reid` | prtreid (bpbreid / HRNet32, 256-d) | feeds team clustering + role; **not** used by the tracker |
-| `track` | BoT-SORT · SOF + sports-OSNet | boxmot-parity subclass (restores `min(gated IoU, gated appearance)`, honours `track_low_thresh`, true top-left boxes) |
-| `gta_link` | offline tracklet stitching (Split + Connect) | own OSNet; symmetric merge gate; per-frame collision guard |
+| `track` | BoT-SORT · SOF + OSNet-AIN (boxmot) | calls boxmot's `BotSort` directly with injected embeddings and external SOF camera motion; per-frame diagnostics sidecar for the audit |
+| `gta_link` | offline tracklet stitching (Split + Connect) | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); symmetric merge gate; per-frame collision guard |
 | `interpolation` | linear tracklet-gap fill (DTI) | **off by default**; see the tuning-flags table |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
 | `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level: legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
@@ -46,8 +46,10 @@ bash scripts/setup_broadtrack.sh   # C++ binary + LFS weights, built natively
 JN_SRC=/path/to/jn_pipeline_gsr bash scripts/setup_jn_gsr.sh   # python 3.10 venv + weights
 ```
 
-Everything else downloads at runtime: detector and tracker/GTA-Link ReID from Hugging Face
-(`${hf:...}` resolver; export `HF_TOKEN` if the repo is private), prtreid + HRNet from Zenodo.
+Everything else downloads at runtime: the detector from Hugging Face (`${hf:...}`
+resolver), the tracker/GTA-Link OSNet-AIN checkpoint from Hugging Face with an enforced
+sha256 pin (`sn_gamestate/reid/osnet_ain.py`; export `HF_TOKEN` if a repo is private),
+prtreid + HRNet from Zenodo.
 
 ### Python version on Kaggle / Lightning
 
@@ -77,8 +79,17 @@ running on whatever the image provides, which would change the numbers.
 ```bash
 tracklab -cn soccernet                     # 1 clip by default (dataset.nvid)
 tracklab -cn soccernet dataset.nvid=-1     # full split
+tracklab -cn soccernet precision=fp32      # exact parity with the fp32-validated numbers
 bash scripts/lightning_eval.sh             # end-to-end runner (download + setup + eval)
 ```
+
+Numerical precision: `precision: fp16` (the default, set in `soccernet.yaml`) runs the
+detector, the OSNet-AIN embedder in `track` + `gta_link`, and prtreid in half precision
+(torch autocast); `precision=fp32` reproduces the reference arithmetic exactly. After any
+integration change, run fp32 once so a precision effect is never mistaken for an
+integration bug; if fp16 measurably degrades one stage, pin that stage back via its
+module cfg (each reads `${precision}` individually). The audit fails any run in which
+`track` and `gta_link` disagree on checkpoint or precision.
 
 GPU use: the jersey stage auto-detects GPUs via `nvidia-smi` and shards tracklets across
 all of them (2 workers on Kaggle 2×T4, 4 on Lightning 4×T4, 1 otherwise). BroadTrack and
@@ -91,14 +102,13 @@ The jersey consolidation rule is fixed to `vote_pool` (see
 
 ## Tuning flags (TEMPORARY — removed at productionization)
 
-Five switches exist only so the Kaggle sweeps can A/B them without code edits. **Every
+Four switches exist only so the Kaggle sweeps can A/B them without code edits. **Every
 default below reproduces today's baseline**, so a plain `tracklab -cn soccernet` is
 unaffected by their presence. They are deleted once the winners are baked in, together
 with `scripts/tune_gta_kaggle.py`; where a winner is "off", the feature's code goes too.
 
 | Flag | Default | On means | Where |
 |---|---|---|---|
-| `modules.track.cfg.hyperparams.masked_sof` | `false` | repo-local `MaskedSOF` CMC (detections masked out of the keypoints, RANSAC inlier gates, `H is None` guard) instead of the fork's `sparseOptFlow` | `configs/modules/track/botsort_osnet.yaml` |
 | `modules.gta_link.cfg.connect_mode` | `agglomerative` | `iterative` = the sjc042/gta-link greedy merge with per-pair gate and row/col recompute | `configs/modules/gta_link/gta_link.yaml` |
 | `modules.gta_link.cfg.use_split` | `false` | DBSCAN Split before Connect, breaking tracklets that hold an id switch (`split_eps`, `split_min_samples`, `split_max_k`, `split_len_thres` — all untuned) | `configs/modules/gta_link/gta_link.yaml` |
 | `modules.interpolation.cfg.enabled` | `false` | fill tracklet gaps of `1 < dt < n_dti` frames by linear interpolation (`n_dti`, `n_min` — untuned) | `configs/modules/interpolation/dti.yaml` |
@@ -178,7 +188,7 @@ per-stage contributions (e.g. with/without `gta_link`) are attributed.
 sn_gamestate/
   bbox_detector/yolo_snft_api.py
   reid/prtreid_api.py, prtreid_dataset.py
-  track/bot_sort_notebook.py, gta_link_api.py, hf_resolver.py
+  track/bot_sort.py, gta_link_api.py, hf_resolver.py
   calibration/broadtrack_api.py          # calibration + image-to-pitch
   jersey/jn_gsr_api.py                   # multi-GPU tracklet recognition
   audit/run_audit_api.py                 # per-component verdicts (last stage)

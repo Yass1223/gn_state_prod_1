@@ -1,3 +1,5 @@
+import contextlib
+
 import numpy as np
 import pandas as pd
 import torch
@@ -53,10 +55,15 @@ class PRTReId(DetectionLevelModule):
         use_keypoints_visibility_scores_for_reid,
         training_enabled,
         batch_size,
+        precision="fp32",
     ):
         super().__init__(batch_size)
         self.cfg = cfg
         self.device = device
+        # fp16 = torch autocast around the feature extractor on CUDA; outputs are
+        # cast back to fp32 before leaving this stage, so downstream consumers
+        # (team k-means, tracklet aggregation) always see float32 arrays.
+        self.precision = str(precision).lower()
         tracking_dataset.name = dataset.name
         tracking_dataset.nickname = dataset.nickname
         self.dataset_cfg = dataset
@@ -137,9 +144,13 @@ class PRTReId(DetectionLevelModule):
                 model=self.model,
                 verbose=False,  # FIXME @Vladimir
             )
-        reid_result = self.feature_extractor(
-            im_crops, external_parts_masks=external_parts_masks
-        )
+        amp = (torch.autocast(device_type="cuda")
+               if self.precision == "fp16" and torch.cuda.is_available()
+               else contextlib.nullcontext())
+        with amp:
+            reid_result = self.feature_extractor(
+                im_crops, external_parts_masks=external_parts_masks
+            )
         embeddings, visibility_scores, body_masks, _, role_cls_scores = extract_test_embeddings(
             reid_result, self.test_embeddings
         )
@@ -151,9 +162,11 @@ class PRTReId(DetectionLevelModule):
         roles = [self.inverse_role_mapping[index] for index in roles]
         role_confidence = [torch.max(i).item() for i in role_scores_]
 
-        embeddings = embeddings.cpu().detach().numpy()
-        visibility_scores = visibility_scores.cpu().detach().numpy()
-        body_masks = body_masks.cpu().detach().numpy()
+        # .float() first: under autocast these can be fp16 tensors, and every
+        # consumer of these columns expects float32 numpy arrays.
+        embeddings = embeddings.float().cpu().detach().numpy()
+        visibility_scores = visibility_scores.float().cpu().detach().numpy()
+        body_masks = body_masks.float().cpu().detach().numpy()
 
         if self.use_keypoints_visibility_scores_for_reid:
             kp_visibility_scores = batch["visibility_scores"].numpy()

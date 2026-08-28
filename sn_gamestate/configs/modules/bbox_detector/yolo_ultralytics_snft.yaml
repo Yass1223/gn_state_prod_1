@@ -26,3 +26,6 @@ cfg:
   max_det: 300
   use_tensorrt: ${use_tensorrt}
   engine_path: ${trt_dir}/yolov11_sn_best.engine
+  # Forward-pass arithmetic on the PyTorch path (ultralytics `half=`). Engines carry
+  # their own precision baked in at build time, so this is ignored when an engine runs.
+  precision: ${precision}

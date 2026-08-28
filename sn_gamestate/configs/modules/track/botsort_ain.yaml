@@ -1,0 +1,72 @@
+# BoT-SORT with sparse-optical-flow camera motion and OSNet-AIN appearance.
+#
+# Settings are the reference notebook's (9-production-final): appearance_thresh 0.35
+# from an eleven-point sweep on this pipeline and split, proximity_thresh 0.5,
+# match_thresh 0.85, SOF scale 0.15.
+#
+# _target_ is sn_gamestate.track.bot_sort.BotSortSOF, which calls boxmot directly
+# rather than subclassing tracklab's bundled `bot_sort` fork. The fork's first
+# association is the JDE/FairMOT recipe `fuse_motion(kf, cosine, lambda_=0.985)` with
+# the paper's `min(gated IoU, gated appearance)` block commented out, so
+# proximity_thresh and appearance_thresh are inert there and no amount of tuning them
+# would reproduce the reference numbers.
+#
+# min_hits / max_age / max_obs were inert in the fork, but they are live `BaseTracker`
+# parameters in boxmot, so they are real settings here and carry the notebook's values.
+#
+# track_low_thresh 0.05 sits below the detector's 0.1 floor, so the BYTE band is
+# effectively [0.1, track_high_thresh). Widening it for real means lowering the
+# detector's `conf` as well, which is a Kaggle A/B rather than a config change.
+#
+# frame_rate 25 matches SoccerNet GS clips; boxmot derives buffer_size =
+# frame_rate / 30 * track_buffer, so 25/30 * 60 = 50 frames of track lifetime.
+#
+# Precision: the OSNet-AIN embedder reads the pipeline's `${precision}` flag (fp16
+# autocast on CUDA by default; fp32 selectable for exact parity with the fp32-validated
+# reference numbers). GTA-Link reads the SAME flag and the SAME checkpoint pin; the
+# run audit fails the run if the two module configs disagree, so tracker and stitcher
+# can never silently embed the same crop differently. There is no TensorRT path for
+# the appearance model.
+_target_: sn_gamestate.track.bot_sort.BotSortSOF
+cfg:
+  # OSNet-AIN checkpoint: the packed single-file artefact. `best_ain_full.zip` is
+  # itself a torch.save archive (verified against the reference run), fetched with
+  # hf_hub_download and digest-verified — no snapshot, no rezip. Proven bitwise
+  # tensor-identical to the exploded `Ynniss/osnet_ain_ckp` copy (560/560 ema
+  # tensors equal). Clearing ain_file falls back to the exploded-snapshot path.
+  ain_repo: Ynniss/osnet_ain
+  ain_file: best_ain_full.zip
+  ain_revision: d78f65ded828f0cbd8dff2a06dcbff4fc6835dfe
+  ain_sha256: a0a7e42676edad0cbc3a4ba0f7d0f8ded75612443ef7a9eabb57cb9e5e245293
+  # Skip the Hub entirely and read the checkpoint from disk (a packed file or an
+  # exploded directory). Point this at a mounted Kaggle dataset to avoid the
+  # download per session; the sha256 pin above is enforced either way.
+  ain_local_path: null
+  # Forward-pass arithmetic for the embedder; keep identical to gta_link's.
+  precision: ${precision}
+  # Crops per appearance forward pass. Distinct from the `batch_size` soccernet.yaml
+  # sets on this module, which is the pipeline's frame batch size.
+  embed_batch_size: 64
+  # boxmot's SOF downsamples the frame to this fraction before estimating the affine
+  # and divides the translation back up. Note this is not the same convention as the
+  # `downscale` used by tracklab's fork.
+  sof_scale: 0.15
+  # Where the tracker writes its per-frame record: identity-warp fallbacks, clipped
+  # crops, zero embeddings, whether every frame reached it, plus the settings and
+  # checkpoint digest/precision that actually ran. The in-pipeline `audit` stage
+  # reads these sidecars and turns them into PASS/WARN/FAIL verdicts; without them
+  # the tracker's internals are unauditable, which the audit reports as a failure.
+  audit_dir: ${project_dir}/audit/track
+  hyperparams:
+    min_hits: 1
+    max_age: 50
+    max_obs: 60
+    track_high_thresh: 0.3
+    track_low_thresh: 0.05
+    new_track_thresh: 0.4
+    track_buffer: 60
+    match_thresh: 0.85
+    proximity_thresh: 0.5
+    appearance_thresh: 0.35
+    cmc_method: sof
+    frame_rate: 25

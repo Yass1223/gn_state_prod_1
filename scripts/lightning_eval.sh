@@ -6,7 +6,8 @@
 # the cuDNN/torch_shm_manager issue on the Studio.
 #
 # This repo has a SINGLE entry config (`soccernet`): YOLO11-SNFT -> prtreid ->
-# BoT-SORT·SOF -> GTA-Link -> BroadTrack -> jn_pipeline_gsr -> voting -> team.
+# BoT-SORT·SOF (boxmot + OSNet-AIN) -> GTA-Link (same OSNet-AIN) -> BroadTrack ->
+# jn_pipeline_gsr -> voting -> team.
 #
 # BroadTrack and the jersey stage each need a one-off provisioning step (both are
 # Docker-free). Run them before the first evaluation:
@@ -34,6 +35,15 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 uv venv --clear --python 3.9 "${VENV}"
 uv pip install --python "${VENV}" -e .
+
+# boxmot: installed OUTSIDE the project's dependency list, with --no-deps. Its
+# 19.0.0 metadata requires torch>=2.2.1 and huggingface-hub>=1.7.1, which
+# contradict this project's pins (torch 1.13.1, hub <1.0) - a resolver would
+# either fail or wreck the environment. Its import chain only needs numpy, cv2,
+# lap, scipy and rich, all of which the project already installs (see the boxmot
+# note in pyproject.toml). Version pinned: 19.x has boxmot.trackers.botsort,
+# 20+ moved it, and __version__ cannot tell them apart.
+uv pip install --python "${VENV}" --no-deps boxmot==19.0.0
 
 # Everything below invokes the venv's interpreter DIRECTLY rather than through
 # `uv run`. There is no uv.lock, so `uv run` performs its own fresh resolution

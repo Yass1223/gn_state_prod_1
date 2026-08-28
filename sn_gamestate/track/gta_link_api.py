@@ -2,7 +2,7 @@
 
 Faithful port of the validated notebook (§11d.5). For one video it:
 
-1. Re-extracts a sports-OSNet appearance feature for every detection crop.
+1. Re-extracts an OSNet-AIN appearance feature for every detection crop.
 2. Optionally SPLITS tracklets that contain an id switch (``use_split``), then builds
    one EMA-averaged, L2-normalised embedding per tracklet.
 3. Computes pairwise cosine distance, then *forbids* merging any pair that overlaps in
@@ -47,112 +47,31 @@ the colliding row's ``track_id`` to NaN (equivalent to the notebook's row drop).
 track_ids are handled downstream (the team visualiser skips them, pandas ``groupby``
 drops them, and the SoccerNet eval encoding drops them), so this stays coherent.
 
-Design choice: this runs as its own pipeline stage placed right after ``track`` and uses its
-own OSNet (Option B), leaving the prtreid ``reid`` module — consumed by team/role/jersey —
-completely untouched.
-
-TensorRT
---------
-If ``use_tensorrt`` is set and ``trt_engine`` points at a built ``.engine`` file, the OSNet
-forward pass runs through a TensorRT engine (same 256×128 preprocessing; only the network
-matmuls move to TRT). If the engine is missing or TensorRT can't be imported, it logs a
-warning and falls back to the PyTorch OSNet, so the pipeline never hard-fails.
+Appearance model
+----------------
+The same OSNet-AIN used by the tracker, built from the same shared module
+(``sn_gamestate.reid.osnet_ain``) so a detection's embedding here is identical to the one
+the tracker saw for it: same checkpoint, same letterbox geometry, same precision flag.
+This runs as its own pipeline stage right after ``track`` and leaves the prtreid ``reid``
+module — consumed by team, role and jersey — completely untouched.
 """
 import logging
 from collections import OrderedDict
-from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torchvision.transforms as T
 from sklearn.cluster import AgglomerativeClustering, DBSCAN
 from sklearn.preprocessing import StandardScaler
 
 from tracklab.pipeline.videolevel_module import VideoLevelModule
 from tracklab.utils.cv2 import cv2_load_image
 
-# These ship with tracklab: its pyproject packages plugins/track as top-level packages
-# (`bot_sort`, `strong_sort`, ...). Using the same loader as the BoT-SORT ReID backend
-# keeps GTA-Link's appearance model byte-identical to the tracker's.
-from strong_sort.deep.models import build_model
-from strong_sort.deep.reid_model_factory import load_pretrained_weights
+# The tracker's appearance model, reused here so both stages embed a crop identically.
+from sn_gamestate.reid import osnet_ain
 
 log = logging.getLogger(__name__)
-
-
-class _TRTReID:
-    """Minimal TensorRT runner for the sports-OSNet ReID engine.
-
-    Consumes the *already preprocessed* [B, 3, 256, 128] tensor that GTA-Link builds
-    (so preprocessing is identical to the PyTorch path) and returns [B, feat] features.
-    Mirrors the TRT-8.x bindings API used by tracklab's ReIDDetectMultiBackend
-    (``num_bindings`` / ``get_binding_*`` / ``set_binding_shape`` / ``execute_v2``),
-    chunking to the engine's max profile batch so any GTA batch size stays valid.
-    """
-
-    def __init__(self, engine_path: str, device):
-        import tensorrt as trt  # lazy import; absence handled by try_load
-
-        self._np2torch = {np.float16: torch.float16, np.float32: torch.float32}
-        self.device = (
-            device if str(device) != "cpu" else torch.device("cuda:0")
-        )
-        logger = trt.Logger(trt.Logger.WARNING)
-        with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
-
-        self.in_idx = self.engine.get_binding_index("images")
-        self.out_idx = self.engine.get_binding_index("output")
-        self.in_np = trt.nptype(self.engine.get_binding_dtype(self.in_idx))
-        self.out_np = trt.nptype(self.engine.get_binding_dtype(self.out_idx))
-        # profile: (min, opt, max) shapes for the dynamic input; take max batch.
-        self.max_batch = int(self.engine.get_profile_shape(0, self.in_idx)[2][0])
-        self.n_bindings = self.engine.num_bindings
-
-    @classmethod
-    def try_load(cls, engine_path, device):
-        p = Path(str(engine_path or ""))
-        if p.suffix != ".engine" or not p.is_file():
-            log.warning(
-                f"[GTA-Link] use_tensorrt=true but engine not found at '{p}'. "
-                f"Using PyTorch OSNet. Build it with scripts/build_trt_engines.py."
-            )
-            return None
-        try:
-            runner = cls(str(p), device)
-            log.info(f"[GTA-Link] ReID via TensorRT engine: {p}")
-            return runner
-        except Exception as e:  # missing tensorrt, version mismatch, bad engine, ...
-            log.warning(
-                f"[GTA-Link] failed to load TensorRT engine ({e}); "
-                f"using PyTorch OSNet."
-            )
-            return None
-
-    @torch.no_grad()
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.contiguous().to(self.device)
-        x = x.half() if self.in_np == np.float16 else x.float()
-        out_torch_dtype = self._np2torch.get(self.out_np, torch.float32)
-        outs = []
-        for s in range(0, x.shape[0], self.max_batch):
-            chunk = x[s:s + self.max_batch].contiguous()
-            b = chunk.shape[0]
-            self.context.set_binding_shape(
-                self.in_idx, (b, chunk.shape[1], chunk.shape[2], chunk.shape[3])
-            )
-            out_shape = tuple(self.context.get_binding_shape(self.out_idx))
-            out = torch.empty(out_shape, dtype=out_torch_dtype, device=self.device)
-            bindings = [0] * self.n_bindings
-            bindings[self.in_idx] = int(chunk.data_ptr())
-            bindings[self.out_idx] = int(out.data_ptr())
-            self.context.execute_v2(bindings)
-            outs.append(out.float())
-        return torch.cat(outs, dim=0)
 
 
 def _closest_frames(fa: np.ndarray, fb: np.ndarray):
@@ -232,32 +151,14 @@ class GTALink(VideoLevelModule):
     def __init__(self, cfg, device, tracking_dataset=None):
         self.cfg = cfg
         self.device = device
-        self.fp16 = bool(getattr(cfg, "fp16", False)) and (str(device) != "cpu")
 
-        # Build osnet_x1_0 and load the sports checkpoint the torchreid way:
-        # load_pretrained_weights strips 'module.' and shape-filters the classifier,
-        # matching the notebook's manual loader exactly.
-        self.model = build_model(
-            "osnet_x1_0", num_classes=1, pretrained=False,
-            use_gpu=(str(device) != "cpu"),
+        # The tracker's appearance model: same checkpoint, same letterbox
+        # preprocessing, and the same `precision` flag, so a crop embeds to the same
+        # vector in both stages. A precision or checkpoint mismatch between the two
+        # module configs is a run-audit FAIL, not a silent divergence.
+        self.embedder = osnet_ain.from_config(
+            cfg, device, batch_size=int(getattr(cfg, "batch_size", 64))
         )
-        load_pretrained_weights(self.model, cfg.osnet_weights)
-        self.model.classifier = nn.Identity()
-        self.model.to(device).eval()
-        if self.fp16:
-            self.model.half()
-
-        # Optional TensorRT OSNet (falls back to the PyTorch model above on any failure).
-        self._trt = None
-        if bool(getattr(cfg, "use_tensorrt", False)):
-            self._trt = _TRTReID.try_load(getattr(cfg, "trt_engine", None), device)
-
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((256, 128)),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
 
         self.appearance_thresh = float(cfg.appearance_thresh)
         self.spatial_thresh = float(cfg.spatial_thresh)
@@ -282,8 +183,8 @@ class GTALink(VideoLevelModule):
     # ------------------------------------------------------------------ features
     @torch.no_grad()
     def _extract_features(self, dets: pd.DataFrame, metadatas: pd.DataFrame) -> np.ndarray:
-        """OSNet feature per detection row, aligned to ``dets.index`` (zeros on failure)."""
-        feats = np.zeros((len(dets), 512), dtype=np.float32)
+        """Appearance feature per row, aligned to ``dets.index`` (zeros on failure)."""
+        feats = np.zeros((len(dets), self.embedder.dim), dtype=np.float32)
         id2path = (metadatas["file_path"].to_dict()
                    if "file_path" in metadatas.columns else {})
         pos = {idx: i for i, idx in enumerate(dets.index)}
@@ -298,40 +199,22 @@ class GTALink(VideoLevelModule):
             if img is None:
                 n_unreadable += 1
                 continue
-            h_img, w_img = img.shape[:2]
-            batch, rows = [], []
+            # cv2_load_image returns RGB; the OSNet-AIN preprocessing does BGR2RGB
+            # itself, so it must be handed BGR or every channel arrives swapped.
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-            def _flush():
-                if not batch:
-                    return
-                x = torch.stack(batch).to(self.device)
-                if self._trt is not None:
-                    raw = self._trt(x)                     # TRT handles dtype/dynamic shape
-                else:
-                    xx = x.half() if self.fp16 else x
-                    raw = self.model(xx)
-                out = raw.detach().cpu().float().numpy()
-                out = out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-6)
-                for r, f in zip(rows, out):
-                    feats[pos[r]] = f
-                batch.clear()
-                rows.clear()
-
+            crops, rows = [], []
             for idx, det in group.iterrows():
                 l, t, w, h = [float(v) for v in det["bbox_ltwh"]]
-                x1, y1 = max(0, int(l)), max(0, int(t))
-                x2, y2 = min(w_img, int(l + w)), min(h_img, int(t + h))
-                if x2 <= x1 or y2 <= y1:
-                    continue  # leave zeros for degenerate boxes
-                # cv2_load_image already returns RGB, and both the torchvision
-                # transform and OSNet expect RGB — so crop the RGB image directly
-                # (an extra BGR2RGB here would feed the model swapped channels).
-                crop = img[y1:y2, x1:x2]
-                batch.append(self.transform(crop))
+                patch = osnet_ain.crop_ltrb(img, (l, t, l + w, t + h))
+                if patch is None:
+                    continue  # degenerate box: leave a zero feature so it never merges
+                crops.append(patch)
                 rows.append(idx)
-                if len(batch) >= self.batch_size:
-                    _flush()
-            _flush()
+            if crops:
+                # Already L2-normalised by the embedder, which also does the batching.
+                for r, f in zip(rows, self.embedder.embed(crops)):
+                    feats[pos[r]] = f
 
         if n_missing_path or n_unreadable:
             log.warning(

@@ -3,7 +3,7 @@
 
 Why two stages
 --------------
-Tracker-level flags (``masked_sof``, the detector confidence floor) change the
+Tracker-level settings (the detector confidence floor, tracker thresholds) change the
 detections and the association, so they can only be swept by re-running
 ``bbox_detector -> reid -> track``. Everything downstream of ``track`` is a pure
 function of the saved state, so the whole post-processing grid can be swept by
@@ -65,13 +65,13 @@ RESULTS = REPO / "tuning_results"
 # grid by its irrelevant parameters.
 STAGE1_VARIANTS = [
     # name              overrides applied to the full run
-    ("sof_fork",        {"modules.track.cfg.hyperparams.masked_sof": "false"}),
-    ("sof_masked",      {"modules.track.cfg.hyperparams.masked_sof": "true"}),
+    # The tracker is boxmot's BoT-SORT · SOF with OSNet-AIN appearance
+    # (modules/track/botsort_ain.yaml); it has no masked-SOF variant, so Stage 1
+    # is a single baseline unless a floor A/B below is enabled.
+    ("baseline",        {}),
     # T5 option (a): lower BOTH confidence floors together so the BYTE low band is
     # non-empty. Documented as an A/B, not a code change. Enable by uncommenting.
-    # ("sof_fork_c005", {"modules.track.cfg.hyperparams.masked_sof": "false",
-    #                    "modules.track.cfg.hyperparams.track_low_thresh": "0.05",
-    #                    "modules.track.cfg.min_confidence": "0.05",
+    # ("baseline_c005", {"modules.track.cfg.hyperparams.track_low_thresh": "0.05",
     #                    "modules.bbox_detector.cfg.min_confidence": "0.05"}),
 ]
 

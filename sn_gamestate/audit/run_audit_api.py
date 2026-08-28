@@ -131,7 +131,19 @@ class RunAudit(VideoLevelModule):
             "jn_min_eligible_for_zero_fail": g("jn_min_eligible_for_zero_fail", 10),
             "team_missing_warn": g("team_missing_warn", 0.05),
             "radar_skipped_tracked_warn": g("radar_skipped_tracked_warn", 0.05),
+            "cmc_identity_warn": g("cmc_identity_warn", 0.02),
+            "crop_clipped_warn": g("crop_clipped_warn", 0.001),
+            "zero_emb_warn": g("zero_emb_warn", 0.01),
         }
+        # Tracker diagnostics sidecars (written by sn_gamestate.track.bot_sort) and
+        # the declared tracker/embedder configuration to hold the run against. The
+        # expected values arrive resolved by OmegaConf interpolation from the track
+        # and gta_link module configs (see modules/audit/run_audit.yaml), so a
+        # mismatch between what RAN and what the configs DECLARE is detectable.
+        sidecar = getattr(cfg, "track_sidecar_dir", None)
+        self.track_sidecar_dir = Path(str(sidecar)) if sidecar else None
+        self.expected_tracker = {str(k): v for k, v in
+                                 (getattr(cfg, "expected_tracker", {}) or {}).items()}
         self._ckpt_sha = {}
 
     # ------------------------------------------------------------ helpers --
@@ -209,6 +221,130 @@ class RunAudit(VideoLevelModule):
             return c.set(FAIL, "no detection has a track_id")
         if share < self.thr["tracked_warn"]:
             c.set(WARN, f"only {share:.1%} of detections tracked")
+        return c
+
+    # ------------------------------------------------ tracker internals --
+    def _find_track_sidecar(self, seq, metadatas):
+        """(path, parsed json) of this sequence's tracker sidecar, else (None, None).
+
+        The sidecar is named after the tracker's `video_id`, which may differ from
+        the audit's path-derived sequence name, so the match is by exact filename
+        first, then by the json's own `video_id` against the sequence name or any
+        video_id present in `metadatas`.
+        """
+        d = self.track_sidecar_dir
+        if d is None or not d.is_dir():
+            return None, None
+        vids = ({str(v) for v in metadatas["video_id"].unique()}
+                if "video_id" in metadatas.columns else set())
+        exact = d / f"{seq}.json"
+        paths = ([exact] if exact.is_file() else []) + sorted(
+            p for p in d.glob("*.json") if p != exact)
+        for p in paths:
+            try:
+                data = json.loads(p.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            vid = str(data.get("video_id"))
+            if p == exact or vid == seq or vid in vids:
+                return p, data
+        return None, None
+
+    def _check_tracker_internals(self, seq, metadatas):
+        c = Check(
+            "track internals (BoT-SORT \u00b7 SOF + OSNet-AIN)",
+            "track and gta_link configs pin the same OSNet-AIN weights and precision; "
+            "a diagnostics sidecar covers every frame; the settings, checkpoint digest "
+            "and precision that RAN equal the ones the configs declare; camera motion "
+            "mostly non-identity; no clipped crops, zero embeddings or dropped rows")
+        exp = self.expected_tracker
+
+        # Config-level identity between the two embedding stages first: each stage
+        # sha-verifies its own load at runtime, so equal pins guarantee equal weights
+        # even before the sidecar is opened.
+        for a, b, what in (("ain_sha256_track", "ain_sha256_gta", "ain_sha256"),
+                           ("ain_file_track", "ain_file_gta", "ain_file"),
+                           ("ain_revision_track", "ain_revision_gta", "ain_revision"),
+                           ("precision_track", "precision_gta", "precision")):
+            va, vb = exp.get(a), exp.get(b)
+            c.observed[what] = {"track": va, "gta_link": vb}
+            if va in (None, "", "None") or vb in (None, "", "None"):
+                c.set(FAIL, f"{what} not pinned in both track and gta_link configs")
+            elif str(va) != str(vb):
+                c.set(FAIL, f"track and gta_link disagree on {what}")
+
+        path, data = self._find_track_sidecar(seq, metadatas)
+        c.observed["sidecar"] = str(path) if path else None
+        if data is None:
+            return c.set(FAIL, "no tracker sidecar for this sequence - the tracker's "
+                               "internals ran unobserved (audit_dir unset, unwritable, "
+                               "or the track stage did not run)")
+
+        frames = data.get("frames") or []
+        n = len(frames)
+        n_meta = int(len(metadatas))
+        c.observed.update({"frames_recorded": n, "frames_in_sequence": n_meta})
+        if n < n_meta:
+            c.set(FAIL, f"sidecar covers {n} of {n_meta} frames - "
+                        f"{n_meta - n} frame(s) never reached the tracker")
+
+        st = data.get("settings") or {}
+        hp = st.get("hyperparams") or {}
+        emb = st.get("embedder") or {}
+        ran_app = hp.get("appearance_thresh")
+        want_app = exp.get("appearance_thresh")
+        c.observed["ran_appearance_thresh"] = ran_app
+        if want_app is not None and ran_app is not None \
+                and abs(float(ran_app) - float(want_app)) > 1e-9:
+            c.set(FAIL, f"appearance_thresh that ran ({ran_app}) "
+                        f"!= configured ({want_app})")
+        ran_scale = st.get("sof_scale")
+        want_scale = exp.get("sof_scale")
+        c.observed["ran_sof_scale"] = ran_scale
+        if want_scale is not None and ran_scale is not None \
+                and abs(float(ran_scale) - float(want_scale)) > 1e-9:
+            c.set(FAIL, f"sof_scale that ran ({ran_scale}) != configured ({want_scale})")
+        for key, want in (("sha256", exp.get("ain_sha256_track")),
+                          ("precision", exp.get("precision_track"))):
+            got = emb.get(key)
+            c.observed[f"ran_embedder_{key}"] = got
+            if want not in (None, "", "None") and got is not None \
+                    and str(got) != str(want):
+                c.set(FAIL, f"embedder {key} that ran ({got}) != configured ({want})")
+
+        if n:
+            ident = sum(1 for f in frames[1:] if f.get("identity"))
+            att = max(1, n - 1)   # frame 1 is identity by construction; not counted
+            share = ident / att
+            c.observed.update({"identity_warps": int(ident),
+                               "identity_share": round(share, 4)})
+            if n > 1 and ident == att:
+                c.set(FAIL, "camera motion NEVER produced a warp (all identity)")
+            elif share > self.thr["cmc_identity_warn"]:
+                c.set(WARN, f"{share:.1%} frames fell back to an identity warp")
+
+            n_high = sum(int(f.get("n_high", 0)) for f in frames)
+            clipped = sum(int(f.get("clipped", 0)) for f in frames)
+            zero = sum(int(f.get("zero_emb", 0)) for f in frames)
+            dropped = sum(int(f.get("dropped", 0)) for f in frames)
+            corners = sum(int(f.get("corners", 0)) for f in frames)
+            c.observed.update({"high_conf_detections": n_high,
+                               "clipped_crops": clipped, "zero_embeddings": zero,
+                               "dropped_rows": dropped})
+            if n_high:
+                if zero == n_high:
+                    c.set(FAIL, "every high-confidence detection embedded to zero")
+                elif _share(zero, n_high) > self.thr["zero_emb_warn"]:
+                    c.set(WARN, f"{_share(zero, n_high):.1%} zero embeddings "
+                                f"among high-confidence detections")
+                if _share(clipped, n_high) > self.thr["crop_clipped_warn"]:
+                    c.set(WARN, f"{_share(clipped, n_high):.1%} crops "
+                                f"clipped to nothing")
+            if dropped:
+                c.set(WARN, f"{dropped} tracker output row(s) dropped "
+                            f"(detection index outside the frame)")
+            if n > 1 and corners == 0:
+                c.set(WARN, "the motion estimator never found a keypoint")
         return c
 
     def _check_calibration(self, seq, tracked):
@@ -447,6 +583,7 @@ class RunAudit(VideoLevelModule):
             self._check_detector(det, metadatas),
             self._check_reid(det),
             self._check_track(det, tracked),
+            self._check_tracker_internals(seq, metadatas),
             self._check_calibration(seq, tracked),
             self._check_jersey(seq, tracked),
             self._check_tracklet_agg(tracked),
