@@ -108,8 +108,12 @@ class _Diagnostics:
     Most of what can go quietly wrong here leaves no trace in the saved state: how often
     camera-motion estimation fell back to identity, how many crops clipped to nothing,
     whether every frame actually reached the tracker. Without a record, an audit can only
-    report those as unresolved, so they are written to a sidecar as the run proceeds and
-    the in-pipeline `audit` stage reads them back.
+    report those as unresolved, so they are written through to a sidecar on every frame
+    and the in-pipeline `audit` stage reads them back. Write-through, not end-of-video:
+    each video passes through every stage - the audit included - before the tracker
+    sees the next video, so anything buffered until the next video (or process exit)
+    would reach disk only after the audit that needs it (observed on Kaggle: 5/5
+    sequences failed with "no tracker sidecar" while tracking itself was healthy).
 
     Writing is best-effort: a failure here degrades the audit, and must never take down
     a tracking run.
@@ -131,12 +135,14 @@ class _Diagnostics:
         self.video = video_id
 
     def record(self, **row):
-        if self.dir is not None:
-            self.frames.append(row)
-
-    def flush(self):
-        if self.dir is None or self.video is None or not self.frames:
+        if self.dir is None:
             return
+        self.frames.append(row)
+        # Write-through (see the class docstring): the sidecar must already be on
+        # disk when this video's audit runs, which is before the next begin().
+        self._write()
+
+    def _write(self):
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             (self.dir / f"{self.video}.json").write_text(json.dumps({
@@ -147,6 +153,11 @@ class _Diagnostics:
             }))
         except Exception as exc:                       # never break a run over telemetry
             log.warning(f"[BoT-SORT] could not write the audit sidecar: {exc}")
+
+    def flush(self):
+        if self.dir is None or self.video is None or not self.frames:
+            return
+        self._write()
         self.frames = []
         self.video = None
 
