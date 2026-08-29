@@ -9,10 +9,11 @@
 # previous sports-OSNet embedding, so they are a starting point rather than a settled
 # optimum now that the appearance model has changed, and should be re-checked on Kaggle.
 #
-# Precision: reads the pipeline's `${precision}` flag, which MUST match the track
-# module's — a crop must embed to the same vector in the tracking pass and here. The
-# run audit fails the run on any checkpoint or precision mismatch between the two
-# configs. There is no TensorRT path for the appearance model.
+# Precision: fp16 (torch autocast on CUDA, fp32 outputs), baked in - this stage
+# builds the same embedder module as the tracker, so a crop embeds to the same
+# vector in the tracking pass and here. The run audit fails the run on any
+# checkpoint-pin mismatch between the two configs. There is no TensorRT path for
+# the appearance model.
 _target_: sn_gamestate.track.gta_link_api.GTALink
 cfg:
   # OSNet-AIN checkpoint — SAME coordinates and digest as modules/track/botsort_ain.yaml.
@@ -24,7 +25,6 @@ cfg:
   # Hub. Keep it in step with the tracker's value, or the two stages embed the same
   # crop with two different models.
   ain_local_path: null
-  precision: ${precision}
   appearance_thresh: 0.25   # agglomerative merge cutoff on cosine distance
   spatial_thresh: 150       # px centre-gap gate, scaled by sqrt(frame gap)
   min_tracklet_len: 20      # tracklets shorter than this are not merged

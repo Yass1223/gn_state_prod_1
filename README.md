@@ -79,17 +79,15 @@ running on whatever the image provides, which would change the numbers.
 ```bash
 tracklab -cn soccernet                     # 1 clip by default (dataset.nvid)
 tracklab -cn soccernet dataset.nvid=-1     # full split
-tracklab -cn soccernet precision=fp32      # exact parity with the fp32-validated numbers
 bash scripts/lightning_eval.sh             # end-to-end runner (download + setup + eval)
 ```
 
-Numerical precision: `precision: fp16` (the default, set in `soccernet.yaml`) runs the
-detector, the OSNet-AIN embedder in `track` + `gta_link`, and prtreid in half precision
-(torch autocast); `precision=fp32` reproduces the reference arithmetic exactly. After any
-integration change, run fp32 once so a precision effect is never mistaken for an
-integration bug; if fp16 measurably degrades one stage, pin that stage back via its
-module cfg (each reads `${precision}` individually). The audit fails any run in which
-`track` and `gta_link` disagree on checkpoint or precision.
+Numerical precision: fp16, baked in (no switch). The detector runs ultralytics `half`,
+and the OSNet-AIN embedder in `track` + `gta_link` and the prtreid `reid` stage run
+under torch autocast on CUDA with fp32 outputs. Validated against fp32 on the Kaggle
+5-sequence test run: tracking HOTA 71.61 (fp16) vs 71.08 (fp32), GS-HOTA 64.98 vs
+64.70, calibration bit-identical - deltas inside the observed run-to-run noise. The
+audit fails any run in which `track` and `gta_link` pin different checkpoints.
 
 GPU use: the jersey stage auto-detects GPUs via `nvidia-smi` and shards tracklets across
 all of them (2 workers on Kaggle 2×T4, 4 on Lightning 4×T4, 1 otherwise). BroadTrack and

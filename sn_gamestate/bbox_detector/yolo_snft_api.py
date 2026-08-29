@@ -59,11 +59,10 @@ class YOLOUltralyticsSNFT(YOLOUltralytics):
         self.iou = float(getattr(cfg, "iou", 0.7))             # notebook INFER_IOU
         self.max_det = int(getattr(cfg, "max_det", 300))       # ultralytics default,
         # also what the notebook ran with (it never overrode max_det).
-        # fp16 inference on the PyTorch path (ultralytics `half=`), governed by the
-        # pipeline's `precision` flag. Effective only on CUDA; a TensorRT engine has
-        # its precision baked in at build time, so `half` is not passed on that path.
-        self.half = (str(getattr(cfg, "precision", "fp32")).lower() == "fp16"
-                     and torch.cuda.is_available())
+        # fp16 inference on the PyTorch path (ultralytics `half=`), baked in after
+        # the Kaggle fp16/fp32 validation. Effective only on CUDA; a TensorRT engine
+        # has its precision baked in at build time, so `half` is not passed there.
+        self.half = torch.cuda.is_available()
 
         weights = str(cfg.path_to_checkpoint)
         self._is_engine = False

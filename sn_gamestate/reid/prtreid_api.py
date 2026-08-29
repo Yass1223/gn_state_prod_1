@@ -55,15 +55,10 @@ class PRTReId(DetectionLevelModule):
         use_keypoints_visibility_scores_for_reid,
         training_enabled,
         batch_size,
-        precision="fp32",
     ):
         super().__init__(batch_size)
         self.cfg = cfg
         self.device = device
-        # fp16 = torch autocast around the feature extractor on CUDA; outputs are
-        # cast back to fp32 before leaving this stage, so downstream consumers
-        # (team k-means, tracklet aggregation) always see float32 arrays.
-        self.precision = str(precision).lower()
         tracking_dataset.name = dataset.name
         tracking_dataset.nickname = dataset.nickname
         self.dataset_cfg = dataset
@@ -144,8 +139,10 @@ class PRTReId(DetectionLevelModule):
                 model=self.model,
                 verbose=False,  # FIXME @Vladimir
             )
-        amp = (torch.autocast(device_type="cuda")
-               if self.precision == "fp16" and torch.cuda.is_available()
+        # fp16 autocast on CUDA, baked in after the Kaggle fp16/fp32 validation;
+        # outputs are cast back to fp32 below, so downstream consumers (team
+        # k-means, tracklet aggregation) always see float32 arrays.
+        amp = (torch.autocast(device_type="cuda") if torch.cuda.is_available()
                else contextlib.nullcontext())
         with amp:
             reid_result = self.feature_extractor(

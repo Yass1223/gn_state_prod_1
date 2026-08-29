@@ -447,17 +447,19 @@ def _tensor_shape(state: dict, key: str):
 class OsnetAin:
     """BGR crops in, L2-normalised float32 embeddings out.
 
-    `precision` selects the forward-pass arithmetic: "fp32" (the setting the reference
-    numbers were validated on) or "fp16", which runs the backbone under torch autocast
-    on CUDA (batch norms stay fp32, matmuls/convs run half) and casts back to fp32
-    before the L2 normalisation, so the output dtype never changes. What must never
-    differ is the setting BETWEEN the tracking pass and the GTA-Link pass: both read
-    the same `${precision}` flag, both record the effective value in `info`, and the
-    run audit fails the run if their configs disagree.
+    Arithmetic is fp16 by construction: the backbone runs under torch autocast on CUDA
+    (batch norms stay fp32, matmuls/convs run half) and casts back to fp32 before the
+    L2 normalisation, so the output dtype never changes. Baked in after the Kaggle
+    validation run (fp16 vs fp32 on the 5-sequence test set: tracking HOTA 71.61 vs
+    71.08, GS-HOTA 64.98 vs 64.70, calibration bit-identical - deltas inside the
+    observed run-to-run noise), so there is no precision switch. On CPU, autocast is
+    unavailable and the forward runs fp32; `info` records the effective arithmetic.
+    The tracking pass and the GTA-Link pass build this same module, so both embed a
+    crop identically by construction.
     """
 
     def __init__(self, checkpoint: dict, device, batch_size: int = 64,
-                 precision: str = "fp32", provenance: dict = None):
+                 provenance: dict = None):
         cfg = checkpoint["cfg"]
         state = checkpoint["ema"]
         if not isinstance(cfg, dict):
@@ -484,10 +486,9 @@ class OsnetAin:
         self.dim = int(feat_dim)
         self.height, self.width = (int(v) for v in cfg["INPUT_HW"])
         self.batch_size = int(batch_size)
-        # fp16 is autocast on CUDA; on CPU the request quietly resolves to fp32,
-        # and `info` records the EFFECTIVE precision so the audit sees the truth.
-        self.use_fp16 = (str(precision).lower() == "fp16"
-                         and getattr(device, "type", str(device)) == "cuda")
+        # fp16 autocast on CUDA, baked in; on CPU autocast is unavailable and the
+        # forward runs fp32. `info` records the EFFECTIVE arithmetic for the audit.
+        self.use_fp16 = getattr(device, "type", str(device)) == "cuda"
         self.info = dict(backbone=str(cfg["BACKBONE"]), factory=factory,
                          input_hw=[self.height, self.width], embedding_dim=self.dim,
                          train_identities=len(checkpoint["pid2idx"]),
@@ -554,6 +555,4 @@ def from_config(cfg, device, batch_size: int = 64) -> OsnetAin:
                 else f"{repo_id}/{filename}@{revision[:12]}" if filename
                 else f"{repo_id}@{revision[:12]} (rezipped snapshot)"),
     )
-    return OsnetAin(checkpoint, device, batch_size=batch_size,
-                    precision=str(getattr(cfg, "precision", "fp32")),
-                    provenance=provenance)
+    return OsnetAin(checkpoint, device, batch_size=batch_size, provenance=provenance)

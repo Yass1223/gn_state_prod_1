@@ -10,10 +10,10 @@ What it builds
 
 Documented fallbacks (NOT converted here)
 -----------------------------------------
-* OSNet-AIN (tracker appearance and GTA-Link) runs on PyTorch, governed by the pipeline's
-  ``precision`` flag (fp16 autocast by default, fp32 selectable): both stages read the same
-  flag so they produce the same embedding for the same crop, and the run audit fails on a
-  mismatch. Neither stage has a ``use_tensorrt`` path.
+* OSNet-AIN (tracker appearance and GTA-Link) runs on PyTorch in fp16 (torch autocast on
+  CUDA, fp32 outputs), baked in after the Kaggle fp16/fp32 validation: both stages build
+  the same embedder module so they produce the same embedding for the same crop, and the
+  run audit fails on a checkpoint-pin mismatch. Neither stage has a ``use_tensorrt`` path.
 * NBJW-Calib HRNet (pitch + calibration), prtreid (team ReID), MMOCR (jersey number)
   keep running on PyTorch. They use custom ops / multi-stage mm* pipelines / geometry
   post-processing that don't export to a single clean ONNX graph without mmdeploy or a
@@ -131,7 +131,7 @@ def main(argv=None):
 
     # 2) documented fallbacks (not converted; run on PyTorch)
     status["OSNet-AIN (tracker + GTA-Link)"] = (
-        "FALLBACK (PyTorch, `precision` flag) — by design: both stages must embed a "
+        "FALLBACK (PyTorch, fp16 autocast) — by design: both stages must embed a "
         "crop identically, enforced by the run audit")
     status["NBJW-Calib HRNet (pitch/calibration)"] = (
         "FALLBACK (PyTorch) — geometry post-processing / custom pipeline, no clean ONNX")

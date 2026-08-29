@@ -8,8 +8,8 @@
 #
 # Components checked: bbox_detector, reid, track+gta_link, track internals (BoT-SORT
 # sidecar: frame coverage, camera-motion identity rate, clipped crops, zero
-# embeddings, ran-vs-declared settings/checkpoint/precision, and track==gta_link
-# checkpoint+precision pin equality), calibration (bbox_pitch +
+# embeddings, ran-vs-declared settings/checkpoint, and track==gta_link checkpoint
+# pin equality), calibration (bbox_pitch +
 # camera JSON), jersey_number_detect (cache blob: rule vote_pool, sha256 of BOTH
 # checkpoints vs the staged files, every eligible tracklet answered, detection
 # columns consistent with the blob, provisioning provenance of SATRN and PARSeq),
@@ -32,7 +32,9 @@ cfg:
   # run against. Everything below resolves through OmegaConf interpolation from the
   # track and gta_link module configs, so the audit compares what RAN (the sidecar)
   # against what the composed config DECLARES, and fails on any disagreement —
-  # including the two stages pinning different weights or precisions.
+  # including the two stages pinning different weights. (Arithmetic is fp16 by
+  # construction: both stages build the same embedder module, so there is no
+  # precision knob left to compare.)
   track_sidecar_dir: ${modules.track.cfg.audit_dir}
   expected_tracker:
     ain_sha256_track: ${modules.track.cfg.ain_sha256}
@@ -41,8 +43,6 @@ cfg:
     ain_file_gta: ${modules.gta_link.cfg.ain_file}
     ain_revision_track: ${modules.track.cfg.ain_revision}
     ain_revision_gta: ${modules.gta_link.cfg.ain_revision}
-    precision_track: ${modules.track.cfg.precision}
-    precision_gta: ${modules.gta_link.cfg.precision}
     appearance_thresh: ${modules.track.cfg.hyperparams.appearance_thresh}
     sof_scale: ${modules.track.cfg.sof_scale}
 

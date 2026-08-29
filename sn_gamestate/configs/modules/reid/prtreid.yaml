@@ -8,10 +8,6 @@ job_id: "${oc.env:SLURM_JOBID,0}" # TODO
 save_path: reid
 use_keypoints_visibility_scores_for_reid: False
 training_enabled: False
-# Forward-pass arithmetic for feature extraction: fp16 runs the bpbreid extractor
-# under torch autocast on CUDA (outputs are cast back to fp32 before leaving the
-# stage). Reads the pipeline-wide flag; override here to pin this stage to fp32.
-precision: ${precision}
 cfg:
   project:
     name: "TrackLab"

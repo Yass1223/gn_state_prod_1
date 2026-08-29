@@ -80,16 +80,13 @@ model_dir: "${project_dir}/pretrained_models"
 use_tensorrt: false
 trt_dir: "${model_dir}/trt"
 
-# Numerical precision for the stages this environment controls: the YOLO11 detector,
-# the OSNet-AIN embedder in `track` and `gta_link` (torch autocast on CUDA), and the
-# prtreid `reid` stage. fp16 is the default; set precision=fp32 (here or on the CLI)
-# for exact parity with the fp32-validated reference numbers. After any integration
-# change, run fp32 once so a precision effect is never mistaken for an integration
-# bug; if fp16 measurably degrades a stage on Kaggle, pin that stage back by
-# overriding its module cfg (each stage reads ${precision} individually).
+# Numerical precision is fp16, baked in - there is no switch. The YOLO11 detector
+# (ultralytics half), the OSNet-AIN embedder in `track` + `gta_link` and the prtreid
+# `reid` stage (torch autocast on CUDA, fp32 outputs) all run fp16; validated against
+# fp32 on the Kaggle 5-sequence test run (tracking HOTA 71.61 vs 71.08, GS-HOTA 64.98
+# vs 64.70, calibration bit-identical; deltas inside the observed run-to-run noise).
 # Out of reach by construction: BroadTrack (a C++ subprocess), the jersey stage (its
 # own python 3.10 venv), and SOF camera motion (OpenCV on CPU, no fp16 exists).
-precision: fp16
 
 # Machine configuration
 num_cores: 4

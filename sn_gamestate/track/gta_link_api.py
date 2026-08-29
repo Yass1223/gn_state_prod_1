@@ -51,7 +51,7 @@ Appearance model
 ----------------
 The same OSNet-AIN used by the tracker, built from the same shared module
 (``sn_gamestate.reid.osnet_ain``) so a detection's embedding here is identical to the one
-the tracker saw for it: same checkpoint, same letterbox geometry, same precision flag.
+the tracker saw for it: same checkpoint, same letterbox geometry, same arithmetic.
 This runs as its own pipeline stage right after ``track`` and leaves the prtreid ``reid``
 module — consumed by team, role and jersey — completely untouched.
 """
@@ -152,10 +152,10 @@ class GTALink(VideoLevelModule):
         self.cfg = cfg
         self.device = device
 
-        # The tracker's appearance model: same checkpoint, same letterbox
-        # preprocessing, and the same `precision` flag, so a crop embeds to the same
-        # vector in both stages. A precision or checkpoint mismatch between the two
-        # module configs is a run-audit FAIL, not a silent divergence.
+        # The tracker's appearance model: same module, same checkpoint, same
+        # letterbox preprocessing, same fp16-autocast arithmetic, so a crop embeds
+        # to the same vector in both stages. A checkpoint-pin mismatch between the
+        # two module configs is a run-audit FAIL, not a silent divergence.
         self.embedder = osnet_ain.from_config(
             cfg, device, batch_size=int(getattr(cfg, "batch_size", 64))
         )

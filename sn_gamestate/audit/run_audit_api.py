@@ -253,10 +253,12 @@ class RunAudit(VideoLevelModule):
     def _check_tracker_internals(self, seq, metadatas):
         c = Check(
             "track internals (BoT-SORT \u00b7 SOF + OSNet-AIN)",
-            "track and gta_link configs pin the same OSNet-AIN weights and precision; "
-            "a diagnostics sidecar covers every frame; the settings, checkpoint digest "
-            "and precision that RAN equal the ones the configs declare; camera motion "
-            "mostly non-identity; no clipped crops, zero embeddings or dropped rows")
+            "track and gta_link configs pin the same OSNet-AIN weights (both stages "
+            "build the same embedder module, so the arithmetic is identical by "
+            "construction); a diagnostics sidecar covers every frame; the settings "
+            "and checkpoint digest that RAN equal the ones the configs declare; "
+            "camera motion mostly non-identity; no clipped crops, zero embeddings or "
+            "dropped rows")
         exp = self.expected_tracker
 
         # Config-level identity between the two embedding stages first: each stage
@@ -264,8 +266,7 @@ class RunAudit(VideoLevelModule):
         # even before the sidecar is opened.
         for a, b, what in (("ain_sha256_track", "ain_sha256_gta", "ain_sha256"),
                            ("ain_file_track", "ain_file_gta", "ain_file"),
-                           ("ain_revision_track", "ain_revision_gta", "ain_revision"),
-                           ("precision_track", "precision_gta", "precision")):
+                           ("ain_revision_track", "ain_revision_gta", "ain_revision")):
             va, vb = exp.get(a), exp.get(b)
             c.observed[what] = {"track": va, "gta_link": vb}
             if va in (None, "", "None") or vb in (None, "", "None"):
@@ -304,13 +305,16 @@ class RunAudit(VideoLevelModule):
         if want_scale is not None and ran_scale is not None \
                 and abs(float(ran_scale) - float(want_scale)) > 1e-9:
             c.set(FAIL, f"sof_scale that ran ({ran_scale}) != configured ({want_scale})")
-        for key, want in (("sha256", exp.get("ain_sha256_track")),
-                          ("precision", exp.get("precision_track"))):
-            got = emb.get(key)
-            c.observed[f"ran_embedder_{key}"] = got
-            if want not in (None, "", "None") and got is not None \
-                    and str(got) != str(want):
-                c.set(FAIL, f"embedder {key} that ran ({got}) != configured ({want})")
+        got_sha = emb.get("sha256")
+        want_sha = exp.get("ain_sha256_track")
+        c.observed["ran_embedder_sha256"] = got_sha
+        # Recorded, not asserted: fp16 autocast is baked in and a CPU-only run
+        # legitimately resolves to fp32, so the arithmetic is informational.
+        c.observed["ran_embedder_precision"] = emb.get("precision")
+        if want_sha not in (None, "", "None") and got_sha is not None \
+                and str(got_sha) != str(want_sha):
+            c.set(FAIL, f"embedder sha256 that ran ({got_sha}) "
+                        f"!= configured ({want_sha})")
 
         if n:
             ident = sum(1 for f in frames[1:] if f.get("identity"))
