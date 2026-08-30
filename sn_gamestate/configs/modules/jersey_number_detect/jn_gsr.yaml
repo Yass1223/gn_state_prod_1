@@ -58,7 +58,7 @@ cfg:
   parseq_ckpt: parseq_gsr_ft_s1.ckpt
   satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
 
-  # --- scope: recognize tracklets whose majority prtreid role_detection is here ---
+  # --- scope: recognize tracklets whose `role` (from the role_team stage) is here ---
   roles: [player, goalkeeper]
 
   # --- GPU sharding: auto = one worker per nvidia-smi GPU (1 if none) ---

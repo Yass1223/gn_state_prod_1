@@ -18,13 +18,11 @@ set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VENV="${VENV:-.venv}"; SPLITS="${SPLITS:-test}"
-DATA="data/SoccerNetGS"; REID="pretrained_models/reid"
+DATA="data/SoccerNetGS"
 JN="plugins/jn_gsr";     BT="pretrained_models/broadtrack"
 PY="uv run --python ${VENV}"
 
 # Published checksums, copied from the repo's own fetchers.
-MD5_PRTREID="9633825232bc89f23a94522c5561650e"          # prtreid_api.py:98
-MD5_HRNET="58ea12b0420aa3adaa2f74114c9f9721"            # prtreid_api.py:102
 SHA_DBNET="1e8ee32969a0264dd8d26918a3dea7ab9914c90033b087b1bf97c5eefecfe6c9"
 SHA_LEGIB="b9c61dabaea4a6ec99528c5ae394f5875aecb8207de38484eccb0f977a373e41"
 SHA_PARSEQ="22d936444e09b0358b5b7339c2971ab5e792fee9d53dd30a98917abcd3ee1887"
@@ -36,7 +34,7 @@ SATRN_CKPT="recog2/best_recog_word_acc_epoch_10.pth"
 # 'crnn', 'trba', 'trbc', 'vitstr' -- strhub routes on the path string.
 PARSEQ_CKPT="parseq_gsr_ft_s1.ckpt"
 
-NEED_DATA=0; NEED_HF=0; NEED_REID=0; NEED_JN=0; NEED_BT=0; FAILED=0
+NEED_DATA=0; NEED_HF=0; NEED_TEAM=0; NEED_JN=0; NEED_BT=0; FAILED=0
 G="\033[0;32m"; R="\033[0;31m"; Y="\033[0;33m"; N="\033[0m"
 ok()   { printf "  ${G}OK${N}    %s\n" "$1"; }
 bad()  { printf "  ${R}MISS${N}  %s\n" "$1"; FAILED=1; }
@@ -101,9 +99,18 @@ else
   bad "hf cache unreadable (huggingface_hub missing?)"; NEED_HF=1
 fi
 
-hdr "4. prtreid + HRNet  (Zenodo, md5 published in prtreid_api.py)"
-check_file "${REID}/prtreid-soccernet-baseline.pth.tar" 1000000 md5 "$MD5_PRTREID" || NEED_REID=1
-check_file "${REID}/hrnetv2_w32_imagenet_pretrained.pth" 1000000 md5 "$MD5_HRNET"  || NEED_REID=1
+hdr "4. team-appearance model  (HF Ynniss/osnet_team, digest recorded by the audit)"
+if team_out=$(${PY} python - <<'PYEOF' 2>/dev/null
+from huggingface_hub import try_to_load_from_cache
+p = try_to_load_from_cache("Ynniss/osnet_team", "osnet_team_best.pt")
+print(("OK " if isinstance(p, str) else "MISS ") + "osnet_team_best.pt")
+PYEOF
+); then
+  echo "$team_out" | while read -r st f; do [ "$st" = OK ] && ok "hf: $f" || bad "hf: $f"; done
+  echo "$team_out" | grep -q MISS && NEED_TEAM=1
+else
+  bad "hf cache unreadable (huggingface_hub missing?)"; NEED_TEAM=1
+fi
 
 hdr "5. jersey stage  (${JN})"
 [ -x "${JN}/.venv_jn/bin/python" ] && ok "${JN}/.venv_jn/bin/python" \
@@ -181,12 +188,10 @@ if [ "$NEED_HF" = 1 ]; then
     || warn "HF fetch failed - private repo? export HF_TOKEN=hf_..."
 fi
 
-if [ "$NEED_REID" = 1 ]; then
-  hdr "-> prtreid + HRNet"; mkdir -p "${REID}"
-  wget -q --show-progress -c -O "${REID}/prtreid-soccernet-baseline.pth.tar" \
-    "https://zenodo.org/records/10653453/files/prtreid-soccernet-baseline.pth.tar?download=1"
-  wget -q --show-progress -c -O "${REID}/hrnetv2_w32_imagenet_pretrained.pth" \
-    "https://zenodo.org/records/10604211/files/hrnetv2_w32_imagenet_pretrained.pth?download=1"
+if [ "$NEED_TEAM" = 1 ]; then
+  hdr "-> team-appearance model"
+  ${PY} hf download Ynniss/osnet_team osnet_team_best.pt \
+    || warn "HF fetch failed - private repo? export HF_TOKEN=hf_..."
 fi
 
 if [ "$NEED_JN" = 1 ]; then

@@ -54,7 +54,7 @@ is why it is 67 MB. Only `ema` is used, matching the reference pipeline.
 
 The role head is built because the checkpoint carries it and the load is strict about
 missing tensors, but its output is unused: in this pipeline role and team come from
-the prtreid `reid` stage and the `team` / `team_side` stages downstream.
+the `team_embed` + `role_team` stages downstream (sn_gamestate/team).
 """
 import contextlib
 import hashlib
@@ -370,7 +370,7 @@ def crop_ltrb(image: np.ndarray, box) -> np.ndarray:
 
 # -------------------------------------------------------------------------- model
 
-# Tried in order. torchreid is VlSomers/bpbreid (a dependency of prtreid); strong_sort
+# Tried in order. torchreid is VlSomers/bpbreid (declared in pyproject.toml); strong_sort
 # is bundled by tracklab. Which of them carries the backbone is resolved at runtime.
 _FACTORIES = ("torchreid.models.build_model", "strong_sort.deep.models.build_model")
 
