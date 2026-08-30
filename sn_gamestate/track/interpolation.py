@@ -51,8 +51,17 @@ calibration -> jersey_number_detect -> tracklet_agg -> team -> team_side``.
 * ``team_side`` — needs ``team_cluster``, ``bbox_pitch``, ``role``; all derived
   per tracklet. Satisfied.
 
-Consequence, and why this module still lives in the pipeline
-------------------------------------------------------------
+Status after the role/team rework
+---------------------------------
+The audit above describes the pipeline at 2026-08-06 (prtreid ``reid``, k-means
+``team``, ``team_side``). Those stages are gone: role and team now come from
+``crop_filter`` (runs before ``gta_link``), ``team_embed`` and ``role_team``. A
+synthesized row carries no ``crop_single``/``crop_rT``/``crop_rB`` and no
+``team_embedding``, so the module is NOT in ``soccernet.yaml``'s ``pipeline:``; it is
+kept as a module only for ``scripts/tune_gta_kaggle.py`` (tracking-only states).
+
+Consequence, and why this module still exists
+---------------------------------------------
 The tracking-metrics path is unaffected: ``scripts/reference_metrics.py
 --skip gsr jersey_number calibration`` needs only ``track_id``, ``bbox_ltwh`` and
 ``image_id``, and a state that stops after this stage never reaches ``team``.
@@ -175,9 +184,8 @@ class LinearInterpolation(VideoLevelModule):
         self.n_min = int(getattr(cfg, "n_min", 5))
         if self.enabled:
             log.warning(
-                "[interpolation] enabled: synthesized rows carry no `embeddings`, "
-                "and TrackletTeamClustering vstacks that column per tracklet - the "
-                "`team` stage will raise unless it is made to tolerate them. Safe "
+                "[interpolation] enabled: synthesized rows carry no crop label and no "
+                "team_embedding, so the role_team stage must not run on them. Safe "
                 "for tracking-only states (reference_metrics.py --skip gsr "
                 "jersey_number calibration). See the module docstring."
             )

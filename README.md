@@ -4,22 +4,29 @@ A single, rigorously-scoped GSR pipeline. One entry config, one path, no alterna
 backends: every file in this repository belongs to the active pipeline.
 
 ```
-bbox_detector -> reid -> track -> gta_link -> interpolation -> calibration
-              -> jersey_number_detect -> tracklet_agg -> team -> team_side -> audit
+bbox_detector -> track -> crop_filter -> gta_link -> calibration -> team_embed
+              -> role_team -> jersey_number_detect -> tracklet_agg -> audit
 ```
 
 | Stage | Implementation | Notes |
 |---|---|---|
 | `bbox_detector` | YOLO11-L SoccerNet fine-tune | imgsz 1280, conf floor 0.1 (`>=`), RGB→BGR fix |
-| `reid` | prtreid (bpbreid / HRNet32, 256-d) | feeds team clustering + role; **not** used by the tracker |
 | `track` | BoT-SORT · SOF + OSNet-AIN (boxmot) | calls boxmot's `BotSort` directly with injected embeddings and external SOF camera motion; per-frame diagnostics sidecar for the audit |
+| `crop_filter` | single / multi label per detection, tracked-only rule | rT ≤ 0.25, rB < 0.40; only boxes carrying a `track_id` may make another box multi; every detection gets `crop_single`/`crop_rT`/`crop_rB`/`crop_trigger`; no detection is removed |
 | `gta_link` | offline tracklet stitching (Split + Connect) | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); symmetric merge gate; per-frame collision guard |
-| `interpolation` | linear tracklet-gap fill (DTI) | **off by default**; see the tuning-flags table |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
+| `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
+| `role_team` | notebook rule chain (`sn_gamestate/team/rules.py`) | per tracklet: role (player / goalkeeper / referee), team cluster, left/right side; k-means on the single-crop descriptors, position rules on `bbox_pitch`, appearance-outlier channels, keeper-cue naming; frozen parameters from the notebook's tuning split; per-sequence sidecar for the audit |
 | `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level: legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
-| `tracklet_agg` | majority vote | `[jersey_number, role]` |
-| `team` / `team_side` | k-means on prtreid embeddings / mean pitch position | |
+| `tracklet_agg` | majority vote | `[jersey_number]` (role is per-tracklet from `role_team`) |
 | `audit` | per-component verdicts | read-only last stage: PASS/WARN/FAIL per component per sequence → `audit/<seq>.json`; `scripts/verify_run_integrity.py` refuses the run on any FAIL |
+
+The jersey stage recognises tracklets whose `role` is player or goalkeeper (referees carry
+no number) and uses every crop of a tracklet, single or multi; team plays no part in it.
+The role/team stage ignores multi crops, as the notebook did. There is no `reid` (prtreid)
+stage: role and team come from `team_embed` + `role_team`, and the tracker and GTA-Link use
+OSNet-AIN. `interpolation` is kept as a module for `scripts/tune_gta_kaggle.py` but is not in
+the pipeline (synthesized rows would carry neither crop labels nor team embeddings).
 
 There is **no `pitch` stage**: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 detectors internally and emits camera parameters directly.
@@ -49,7 +56,9 @@ JN_SRC=/path/to/jn_pipeline_gsr bash scripts/setup_jn_gsr.sh   # python 3.10 ven
 Everything else downloads at runtime: the detector from Hugging Face (`${hf:...}`
 resolver), the tracker/GTA-Link OSNet-AIN checkpoint from Hugging Face with an enforced
 sha256 pin (`sn_gamestate/reid/osnet_ain.py`; export `HF_TOKEN` if a repo is private),
-prtreid + HRNet from Zenodo.
+and the team-appearance checkpoint `Ynniss/osnet_team/osnet_team_best.pt`
+(`sn_gamestate/reid/osnet_team.py`; `team_sha256` in `modules/team_embed/osnet_team.yaml`
+is unset until the first verified run records the digest — pin it then).
 
 ### Python version on Kaggle / Lightning
 
@@ -83,8 +92,8 @@ bash scripts/lightning_eval.sh             # end-to-end runner (download + setup
 ```
 
 Numerical precision: fp16, baked in (no switch). The detector runs ultralytics `half`,
-and the OSNet-AIN embedder in `track` + `gta_link` and the prtreid `reid` stage run
-under torch autocast on CUDA with fp32 outputs. Validated against fp32 on the Kaggle
+and the OSNet-AIN embedder in `track` + `gta_link` runs under torch autocast on CUDA with
+fp32 outputs; the `team_embed` stage runs fp32 with flip TTA, as the notebook it reproduces. Validated against fp32 on the Kaggle
 5-sequence test run: tracking HOTA 71.61 (fp16) vs 71.08 (fp32), GS-HOTA 64.98 vs
 64.70, calibration bit-identical - deltas inside the observed run-to-run noise. The
 audit fails any run in which `track` and `gta_link` pin different checkpoints.
@@ -125,10 +134,9 @@ python scripts/tune_gta_kaggle.py holdout
 All tuning runs on the **valid** split and on YOLO11L detections — the tool exits
 non-zero against any other detector. `test` is reserved for the frozen production run.
 
-> `interpolation.enabled=true` synthesizes detection rows, which carry none of the
-> columns the `reid` stage produces. That is fine for tracking metrics (the tuning
-> path), but `team` clustering vstacks `embeddings` per tracklet and will raise. See
-> the audit in `sn_gamestate/track/interpolation.py`.
+> `interpolation` is not in the production pipeline. `interpolation.enabled=true`
+> synthesizes detection rows that carry neither crop labels nor team embeddings; that is
+> fine for tracking metrics (the tuning path) but not for the role/team stage.
 
 ## Verify before you measure
 
@@ -136,7 +144,12 @@ Every run ends with the `audit` stage (`sn_gamestate/audit/run_audit_api.py`): f
 sequence and each component it records what the component was supposed to produce, what
 was observed, and a verdict. Neither BroadTrack nor the jersey stage aborts on failure,
 so without this a run can finish with empty pitch coordinates or empty jersey numbers and
-still print plausible metrics. The jersey check is the strictest: the per-sequence cache
+still print plausible metrics. The crop filter, team-embedding and role/team stages are
+checked against what their configs declare: labels must agree with the stored overlap
+ratios at the configured thresholds, every tracklet must carry a team embedding, the
+checkpoint digest and the rule parameters that ran (per-sequence sidecars under
+`audit/team_embed/`, `audit/role_team/`) must equal the configured ones, every tracked
+row must have a valid role, players/keepers a side and referees none. The jersey check is the strictest: the per-sequence cache
 blob must carry `rule = vote_pool` and the sha256 of both staged checkpoints, answer every
 player/goalkeeper tracklet, agree with the detection columns, and the provisioning
 provenance of SATRN and PARSeq must be on record. Thresholds are in
@@ -185,12 +198,15 @@ per-stage contributions (e.g. with/without `gta_link`) are attributed.
 ```
 sn_gamestate/
   bbox_detector/yolo_snft_api.py
-  reid/prtreid_api.py, prtreid_dataset.py
+  crop_filter/crop_filter_api.py         # single/multi label, tracked-only rule
+  reid/osnet_ain.py, osnet_team.py       # tracker/GTA-Link embedder; team-appearance model
   track/bot_sort.py, gta_link_api.py, hf_resolver.py
   calibration/broadtrack_api.py          # calibration + image-to-pitch
+  team/rules.py, team_embed_api.py, role_team_api.py   # notebook rules; the two stages
   jersey/jn_gsr_api.py                   # multi-GPU tracklet recognition
   audit/run_audit_api.py                 # per-component verdicts (last stage)
-  team/, visualization/, configs/
+  visualization/, configs/
+tests/                                         # rules == notebook, stage contracts, audit
 plugins/calibration/sn_calibration_baseline/   # Camera + SoccerPitch geometry
 plugins/jn_gsr/                                # vendored jersey package (+ its own venv)
 scripts/                                       # setup, verification, metrics, TRT

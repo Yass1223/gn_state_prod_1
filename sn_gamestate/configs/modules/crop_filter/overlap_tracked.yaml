@@ -1,0 +1,20 @@
+# Single / multi label for every detector box (tracked-only contaminator rule).
+#
+# Runs after `track` (needs track_id) and before `gta_link`. Every detection gets
+# crop_single / crop_rT / crop_rB / crop_trigger; no detection is removed. Stages
+# that must ignore multi crops (team_embed, role_team) read crop_single; the
+# jersey stage uses every crop.
+#
+# Rule and thresholds are those of tracklet-splitter_dbscan_4_raw.ipynb
+# (label_single, contam_mode="tracked") and the contaminator-selection note:
+# single iff rT <= 0.25 and rB < 0.40, where only boxes carrying a track_id may
+# make another box multi (audited: 98.1 % / 89.4 % of false-positive triggers
+# removed on valid / test, no real overlap hidden). The role notebook's own filter
+# grid tied exactly on all nine (rT, rB) points, so these values cost nothing
+# there. UNTUNED on this pipeline: sweep later, once the run is clean.
+_target_: sn_gamestate.crop_filter.CropFilter
+cfg:
+  thr_target: 0.25        # max share of the crop covered by a contaminator (rT)
+  thr_other: 0.40         # max share of a contaminator lying inside the crop (rB)
+  contam_mode: tracked    # all | conf | tracked | tracked_or_conf
+  conf_thr_other: 0.0     # floor used by the conf / tracked_or_conf modes only

@@ -71,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
         "boxmot.trackers.botsort.botsort.BotSort",
         "boxmot.motion.cmc.get_cmc_method",
         "sn_gamestate.reid.osnet_ain.from_config",
+        "sn_gamestate.reid.osnet_team.from_config",
+        "sn_gamestate.team.rules.run_sequence",
     ]
     print(f"Importing {len(targets)} pipeline stages "
           f"(python {sys.version.split()[0]})\n")
@@ -91,15 +93,18 @@ def main(argv: list[str] | None = None) -> int:
     # exist at all. No network, no GPU - the factory builds from code alone.
     if not args.skip_backbone and not any(
             d.startswith("sn_gamestate.reid.osnet_ain") for d, _, _ in failures):
-        try:
-            from sn_gamestate.reid.osnet_ain import build_backbone
-            _, factory = build_backbone("osnet_ain_x1_0")
-            print(f"  {GREEN}OK  {RESET} osnet_ain_x1_0 buildable via {factory}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  {RED}FAIL{RESET} osnet_ain_x1_0 backbone build")
-            print(f"       {DIM}{type(exc).__name__}: {exc}{RESET}")
-            failures.append(("osnet_ain_x1_0 backbone", str(exc),
-                             traceback.format_exc()))
+        from sn_gamestate.reid.osnet_ain import build_backbone
+        # osnet_x1_0 is the team-appearance backbone (sn_gamestate/reid/osnet_team.py);
+        # the same factory must carry both, or the role_team stage cannot embed a crop.
+        for name in ("osnet_ain_x1_0", "osnet_x1_0"):
+            try:
+                _, factory = build_backbone(name)
+                print(f"  {GREEN}OK  {RESET} {name} buildable via {factory}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {RED}FAIL{RESET} {name} backbone build")
+                print(f"       {DIM}{type(exc).__name__}: {exc}{RESET}")
+                failures.append((f"{name} backbone", str(exc),
+                                 traceback.format_exc()))
 
     print()
     if not failures:

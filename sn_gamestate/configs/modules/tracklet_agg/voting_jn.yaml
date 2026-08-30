@@ -1,0 +1,5 @@
+# Per-tracklet majority vote over the jersey number only. Role is no longer voted
+# here: it is assigned per tracklet by the role_team stage (sn_gamestate/team).
+_target_: tracklab.wrappers.MajorityVoteTracklet
+cfg:
+  attributes: ["jersey_number"]

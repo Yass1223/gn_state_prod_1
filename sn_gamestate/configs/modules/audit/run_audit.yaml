@@ -6,14 +6,21 @@
 # those files and exits non-zero on any FAIL, so metrics from a run in which a
 # stage silently produced nothing cannot be reported.
 #
-# Components checked: bbox_detector, reid, track+gta_link, track internals (BoT-SORT
+# Components checked: bbox_detector, track+gta_link, track internals (BoT-SORT
 # sidecar: frame coverage, camera-motion identity rate, clipped crops, zero
 # embeddings, ran-vs-declared settings/checkpoint, and track==gta_link checkpoint
-# pin equality), calibration (bbox_pitch +
-# camera JSON), jersey_number_detect (cache blob: rule vote_pool, sha256 of BOTH
-# checkpoints vs the staged files, every eligible tracklet answered, detection
-# columns consistent with the blob, provisioning provenance of SATRN and PARSeq),
-# tracklet_agg, team+team_side, and the radar (rows that would have no colour).
+# pin equality), crop_filter (labels on every detection, labels consistent with
+# the stored ratios at the configured thresholds, every multi label has a trigger
+# box, vetoes by boxes GTA-Link later untracked), calibration (bbox_pitch + camera
+# JSON), team_embed (embedding on every tracklet, sidecar: checkpoint digest that
+# ran vs configured, empty/zero embeddings, off-grid tracklets), role_team (valid
+# role on every tracked row, team on every player/keeper, none on referees,
+# per-track constancy, sidecar: parameters that ran vs configured, referee cap,
+# tracklets that reached the rules without an embedding), jersey_number_detect
+# (cache blob: rule vote_pool, sha256 of BOTH checkpoints vs the staged files,
+# every eligible tracklet answered, detection columns consistent with the blob,
+# provisioning provenance of SATRN and PARSeq), tracklet_agg (jersey_number), and
+# the radar (rows that would have no colour).
 _target_: sn_gamestate.audit.RunAudit
 cfg:
   out_dir: ${project_dir}/audit
@@ -23,8 +30,8 @@ cfg:
   models_dir: ${project_dir}/plugins/jn_gsr/models
   parseq_ckpt: parseq_gsr_ft_s1.ckpt
   satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
-  # Roles the jersey stage recognises (jn_gsr.yaml `roles`); tracklets whose majority
-  # role_detection is elsewhere are not expected to carry a number.
+  # Roles the jersey stage recognises (jn_gsr.yaml `roles`); tracklets whose role
+  # (from the role_team stage) is elsewhere are not expected to carry a number.
   jn_roles: [player, goalkeeper]
 
   # Tracker diagnostics sidecars written by the track stage (must equal the track
@@ -32,9 +39,7 @@ cfg:
   # run against. Everything below resolves through OmegaConf interpolation from the
   # track and gta_link module configs, so the audit compares what RAN (the sidecar)
   # against what the composed config DECLARES, and fails on any disagreement —
-  # including the two stages pinning different weights. (Arithmetic is fp16 by
-  # construction: both stages build the same embedder module, so there is no
-  # precision knob left to compare.)
+  # including the two stages pinning different weights.
   track_sidecar_dir: ${modules.track.cfg.audit_dir}
   expected_tracker:
     ain_sha256_track: ${modules.track.cfg.ain_sha256}
@@ -46,15 +51,31 @@ cfg:
     appearance_thresh: ${modules.track.cfg.hyperparams.appearance_thresh}
     sof_scale: ${modules.track.cfg.sof_scale}
 
+  # Crop filter, team-embedding and role/team stages: sidecar locations (must equal
+  # those modules' audit_dir) and the configuration they must have run with.
+  expected_crop_filter:
+    thr_target: ${modules.crop_filter.cfg.thr_target}
+    thr_other: ${modules.crop_filter.cfg.thr_other}
+    contam_mode: ${modules.crop_filter.cfg.contam_mode}
+  team_embed_sidecar_dir: ${modules.team_embed.cfg.audit_dir}
+  expected_team_embed:
+    sha256: ${modules.team_embed.cfg.team_sha256}
+    pos_stride: ${modules.team_embed.cfg.pos_stride}
+    crops_per_track: ${modules.team_embed.cfg.crops_per_track}
+  role_team_sidecar_dir: ${modules.role_team.cfg.audit_dir}
+  expected_role_team:
+    params: ${modules.role_team.cfg.params}
+
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.
   thresholds:
     empty_frames_warn: 0.20            # frames without any detection
-    reid_null_warn: 0.01               # detections lacking embeddings / role_detection
     tracked_warn: 0.50                 # detections without track_id
+    single_share_warn: 0.30            # tracked detections labelled single, below this = WARN
     pitch_missing_warn: 0.05           # tracked detections without bbox_pitch
+    embed_missing_warn: 0.01           # tracklets without any team embedding, above this = FAIL
+    off_grid_warn: 0.05                # tracklets with no frame on the stride grid
     jn_min_eligible_for_zero_fail: 10  # FAIL "0 numbered" only with >= this many eligible tracklets
-    team_missing_warn: 0.05            # player/GK rows without team left/right
     radar_skipped_tracked_warn: 0.05   # tracked rows with a pitch position but no colour
     cmc_identity_warn: 0.02            # frames falling back to an identity warp (ref notebook)
     crop_clipped_warn: 0.001           # high-conf crops clipping to nothing (ref notebook)

@@ -1,0 +1,24 @@
+# Team-appearance embeddings (osnet_team) of <= 16 crops per tracklet, sampled on
+# the stride-5 frame grid; single and multi crops are both embedded (the role stage
+# applies the single filter afterwards, as the notebook did). Runs after
+# calibration, before role_team.
+#
+# Checkpoint: Ynniss/osnet_team / osnet_team_best.pt — the notebook's model
+# (OSNet x1.0, 128x64 crops on grey 110, 256-d, fp32 + flip TTA). Widths and the
+# input size are read from the checkpoint's own config.
+#
+# team_sha256 is null because the digest could not be computed where this config
+# was written; the stage logs the digest it loaded and records it in the audit
+# sidecar. Pin it (and team_revision) after the first verified Kaggle run so a
+# changed upload fails loudly.
+_target_: sn_gamestate.team.TeamEmbedding
+cfg:
+  team_repo: Ynniss/osnet_team
+  team_file: osnet_team_best.pt
+  team_revision: null       # Hub revision (commit sha) to pin; null = main
+  team_sha256: null         # enforced when set; null = recorded only
+  team_local_path: null     # read the checkpoint from disk (e.g. a Kaggle dataset) instead
+  pos_stride: 5             # frames between sampled crops / positions (notebook POS_STRIDE)
+  crops_per_track: 16       # crops embedded per tracklet (notebook CROPS_PER_TRK)
+  batch_size: 128           # crops per forward pass
+  audit_dir: ${project_dir}/audit/team_embed

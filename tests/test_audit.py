@@ -1,0 +1,50 @@
+"""Audit checks for crop_filter / team_embed / role_team on the synthetic run."""
+import sys, tempfile
+from pathlib import Path
+from types import SimpleNamespace
+import numpy as np, pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import test_stages as T
+from sn_gamestate.crop_filter.crop_filter_api import CropFilter
+from sn_gamestate.team.team_embed_api import TeamEmbedding
+from sn_gamestate.team.role_team_api import RoleTeamAssignment
+from sn_gamestate.team import rules
+from sn_gamestate.audit.run_audit_api import RunAudit
+
+tmp = Path(tempfile.mkdtemp())
+ckpt = tmp / "osnet_team_best.pt"; T.make_checkpoint(ckpt)
+det, meta = T.make_data(tmp / "data")
+det = CropFilter(SimpleNamespace(thr_target=0.25, thr_other=0.40, contam_mode="tracked", conf_thr_other=0.0)).process(det, meta)
+te = TeamEmbedding(SimpleNamespace(team_local_path=str(ckpt), team_sha256=None, team_repo="x", team_file="y", team_revision=None,
+                                   audit_dir=str(tmp / "audit/team_embed"), pos_stride=5, crops_per_track=16, batch_size=32), device="cpu")
+det = te.process(det, meta)
+det = RoleTeamAssignment(SimpleNamespace(params=dict(rules.FROZEN_PARAMS), audit_dir=str(tmp / "audit/role_team"), pos_stride=5, crops_per_track=16)).process(det, meta)
+det["jersey_number_detection"] = None; det["jersey_number_confidence"] = 0.0; det["jersey_number"] = np.nan
+cfg = SimpleNamespace(out_dir=str(tmp / "audit"), jn_cache_dir=str(tmp / "jn"), calib_dir=str(tmp / "calib"), models_dir=str(tmp / "models"),
+                      jn_roles=["player", "goalkeeper"], thresholds={}, track_sidecar_dir=None, expected_tracker={},
+                      expected_crop_filter=dict(thr_target=0.25, thr_other=0.40, contam_mode="tracked"),
+                      team_embed_sidecar_dir=str(tmp / "audit/team_embed"), expected_team_embed=dict(sha256=None, pos_stride=5, crops_per_track=16),
+                      role_team_sidecar_dir=str(tmp / "audit/role_team"), expected_role_team=dict(params=dict(rules.FROZEN_PARAMS)))
+audit = RunAudit(cfg)
+import json
+audit.process(det, meta)
+rep = json.loads((tmp / "audit" / "SNGS-000.json").read_text())
+by = {c["component"]: c for c in rep["checks"]}
+for name in ("crop_filter", "team_embed (osnet_team)", "role_team"):
+    print(f"{by[name]['verdict']:4} {name}: {by[name]['note'] or 'ok'}")
+assert by["crop_filter"]["verdict"] == "PASS"
+assert by["team_embed (osnet_team)"]["verdict"] == "PASS" and "not pinned" in by["team_embed (osnet_team)"]["note"]
+assert by["role_team"]["verdict"] in ("PASS", "WARN")   # WARN = degenerate spread, legitimate on random-noise frames
+# negative controls: a wrong parameter, a missing embedding, a wrong threshold
+cfg.expected_role_team = dict(params=dict(rules.FROZEN_PARAMS, k=2.5))
+assert RunAudit(cfg)._check_role_team("SNGS-000", det.dropna(subset=["track_id"])).verdict == "FAIL"
+cfg.expected_role_team = dict(params=dict(rules.FROZEN_PARAMS))
+cfg.expected_crop_filter = dict(thr_target=0.99, thr_other=0.999, contam_mode="tracked")  # would relabel the multi crops
+assert RunAudit(cfg)._check_crop_filter(det, det.dropna(subset=["track_id"])).verdict == "FAIL"
+cfg.expected_team_embed = dict(sha256="0" * 64, pos_stride=5, crops_per_track=16)
+assert RunAudit(cfg)._check_team_embed("SNGS-000", det.dropna(subset=["track_id"])).verdict == "FAIL"
+d2 = det.copy(); d2.loc[d2.track_id == 2.0, "role"] = None
+cfg.expected_team_embed = dict(sha256=None, pos_stride=5, crops_per_track=16)
+assert RunAudit(cfg)._check_role_team("SNGS-000", d2.dropna(subset=["track_id"])).verdict == "FAIL"
+print("audit: positives PASS, four negative controls FAIL")

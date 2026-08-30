@@ -2,11 +2,11 @@
 # ships as tools/interpolation.py and GTA-Link (sjc042) does not have. Runs directly
 # after `gta_link`, on final track ids.
 #
-# enabled: false is today's baseline and a true no-op. Turning it on is safe for
-# tracking-only states (the reference_metrics.py tracking block needs only
-# track_id / bbox_ltwh / image_id); the FULL pipeline additionally needs the `team`
-# stage to tolerate rows without `embeddings` — see the audit in
-# sn_gamestate/track/interpolation.py.
+# NOT in the production pipeline (soccernet.yaml `pipeline:`): synthesized rows
+# carry no crop label (crop_filter runs before gta_link) and no team_embedding, so
+# the role_team stage would meet rows without the columns it reads. The module is
+# kept for scripts/tune_gta_kaggle.py, whose tracking-only states need only
+# track_id / bbox_ltwh / image_id. enabled: false is a true no-op.
 #
 # n_dti / n_min are UNTUNED (the values below are the brief's starting points, not
 # measured optima). The Kaggle sweep on YOLO11L sets them.

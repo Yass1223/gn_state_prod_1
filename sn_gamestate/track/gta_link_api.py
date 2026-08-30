@@ -52,8 +52,10 @@ Appearance model
 The same OSNet-AIN used by the tracker, built from the same shared module
 (``sn_gamestate.reid.osnet_ain``) so a detection's embedding here is identical to the one
 the tracker saw for it: same checkpoint, same letterbox geometry, same arithmetic.
-This runs as its own pipeline stage right after ``track`` and leaves the prtreid ``reid``
-module — consumed by team, role and jersey — completely untouched.
+This runs as its own pipeline stage right after ``track`` and ``crop_filter``. Note that
+the per-frame collision guard below can set a ``track_id`` to NaN; the crop filter's
+labels are computed before that and are not recomputed (the run audit counts vetoes
+that came from a box untracked afterwards).
 """
 import logging
 from collections import OrderedDict

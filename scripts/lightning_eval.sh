@@ -5,9 +5,9 @@
 # split(s), installs deps into a local .venv, and runs single-worker to avoid
 # the cuDNN/torch_shm_manager issue on the Studio.
 #
-# This repo has a SINGLE entry config (`soccernet`): YOLO11-SNFT -> prtreid ->
-# BoT-SORT·SOF (boxmot + OSNet-AIN) -> GTA-Link (same OSNet-AIN) -> BroadTrack ->
-# jn_pipeline_gsr -> voting -> team.
+# This repo has a SINGLE entry config (`soccernet`): YOLO11-SNFT ->
+# BoT-SORT·SOF (boxmot + OSNet-AIN) -> crop filter -> GTA-Link (same OSNet-AIN) ->
+# BroadTrack -> osnet_team embeddings -> role/team rules -> jn_pipeline_gsr -> voting -> audit.
 #
 # BroadTrack and the jersey stage each need a one-off provisioning step (both are
 # Docker-free). Run them before the first evaluation:

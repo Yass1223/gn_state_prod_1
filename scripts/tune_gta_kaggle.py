@@ -284,7 +284,7 @@ def cmd_stage1(args) -> int:
         print(f"  [{name}]")
         run_tracklab({
             **overrides,
-            "pipeline": hydra_list(["bbox_detector", "reid", "track"]),
+            "pipeline": hydra_list(["bbox_detector", "track"]),
             "dataset.eval_set": args.split,
             "dataset.nvid": -1,
             f"dataset.vids_dict.{args.split}": hydra_list(plan["sweep"]),
@@ -526,7 +526,7 @@ def cmd_holdout(args) -> int:
     if not hold_state.is_file() or args.force:
         run_tracklab({
             **variant_overrides,
-            "pipeline": hydra_list(["bbox_detector", "reid", "track"]),
+            "pipeline": hydra_list(["bbox_detector", "track"]),
             "dataset.eval_set": plan["split"], "dataset.nvid": -1,
             f"dataset.vids_dict.{plan['split']}": hydra_list(plan["holdout"]),
             "state.save_file": str(hold_state), "state.load_file": "null",

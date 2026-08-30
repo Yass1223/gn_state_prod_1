@@ -2,7 +2,8 @@
 
 Neither BroadTrack nor the jersey stage aborts the run when it fails: each logs
 an ERROR and returns, and the pipeline runs to completion with empty columns.
-Team clustering only reaches ``player`` tracklets; the radar only draws rows
+The role/team stage labels every tracked row, but a tracklet the team-embedding
+stage never reached falls back to "player, no team"; the radar only draws rows
 with a defined team. A run can therefore finish, evaluate and render while a
 component silently did nothing. This module is the LAST stage of the pipeline
 and, per sequence, states for each component what it was supposed to do, what
@@ -58,6 +59,14 @@ def _is_nan(v):
         return False
     try:
         return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_number(v):
+    try:
+        float(v)
+        return True
     except (TypeError, ValueError):
         return False
 
@@ -121,15 +130,28 @@ class RunAudit(VideoLevelModule):
         self.satrn_ckpt = str(getattr(cfg, "satrn_ckpt",
                                       "recog2/best_recog_word_acc_epoch_10.pth"))
         self.jn_roles = set(getattr(cfg, "jn_roles", ["player", "goalkeeper"]))
+        # Sidecars of the team-embedding and role/team stages (must equal those
+        # modules' audit_dir) and what their configs declare, resolved by OmegaConf.
+        d = getattr(cfg, "team_embed_sidecar_dir", None)
+        self.team_embed_sidecar_dir = Path(str(d)) if d else None
+        d = getattr(cfg, "role_team_sidecar_dir", None)
+        self.role_team_sidecar_dir = Path(str(d)) if d else None
+        self.expected_crop_filter = {str(k): v for k, v in
+                                     (getattr(cfg, "expected_crop_filter", {}) or {}).items()}
+        self.expected_team_embed = {str(k): v for k, v in
+                                    (getattr(cfg, "expected_team_embed", {}) or {}).items()}
+        self.expected_role_team = {str(k): v for k, v in
+                                   (getattr(cfg, "expected_role_team", {}) or {}).items()}
         thr = getattr(cfg, "thresholds", None) or {}
         g = lambda k, d: float(thr[k]) if k in thr else d  # noqa: E731
         self.thr = {
             "empty_frames_warn": g("empty_frames_warn", 0.20),
-            "reid_null_warn": g("reid_null_warn", 0.01),
+            "single_share_warn": g("single_share_warn", 0.30),
+            "embed_missing_warn": g("embed_missing_warn", 0.01),
+            "off_grid_warn": g("off_grid_warn", 0.05),
             "tracked_warn": g("tracked_warn", 0.50),
             "pitch_missing_warn": g("pitch_missing_warn", 0.05),
             "jn_min_eligible_for_zero_fail": g("jn_min_eligible_for_zero_fail", 10),
-            "team_missing_warn": g("team_missing_warn", 0.05),
             "radar_skipped_tracked_warn": g("radar_skipped_tracked_warn", 0.05),
             "cmc_identity_warn": g("cmc_identity_warn", 0.02),
             "crop_clipped_warn": g("crop_clipped_warn", 0.001),
@@ -191,19 +213,52 @@ class RunAudit(VideoLevelModule):
             c.set(WARN, f"{empty:.1%} frames without detections")
         return c
 
-    def _check_reid(self, det):
-        c = Check("reid", "embeddings + role_detection on every detection")
-        for col in ("embeddings", "role_detection"):
+    def _check_crop_filter(self, det, tracked):
+        c = Check("crop_filter", "crop_single / crop_rT / crop_rB on every detection; thresholds and "
+                                 "contaminator mode as configured; only tracked boxes veto (tracked-only)")
+        for col in ("crop_single", "crop_rT", "crop_rB", "crop_trigger"):
             if col not in det.columns:
                 c.observed[col] = "column missing"
                 c.set(FAIL, f"{col} column missing")
-                continue
-            null = int(det[col].apply(_is_nan).sum())
-            c.observed[f"{col}_null"] = null
-            if len(det) and null == len(det):
-                c.set(FAIL, f"{col} all null")
-            elif _share(null, len(det)) > self.thr["reid_null_warn"]:
-                c.set(WARN, f"{col} null on {_share(null, len(det)):.1%}")
+        if c.verdict == FAIL:
+            return c
+        c.observed["expected"] = dict(self.expected_crop_filter)
+        null = int(det["crop_single"].apply(_is_nan).sum())
+        c.observed["crop_single_null"] = null
+        if len(det) and null:
+            c.set(FAIL, f"crop_single missing on {null} detections")
+        thr_t = self.expected_crop_filter.get("thr_target")
+        thr_b = self.expected_crop_filter.get("thr_other")
+        single = det["crop_single"].astype(bool)
+        if thr_t is not None and thr_b is not None:
+            recomputed = (det["crop_rT"].astype(float) <= float(thr_t)) & (det["crop_rB"].astype(float) < float(thr_b))
+            mism = int((recomputed != single).sum())
+            c.observed["labels_inconsistent_with_ratios"] = mism
+            if mism:
+                c.set(FAIL, f"{mism} labels disagree with the stored ratios at the configured thresholds")
+        share = _share(int((single & det["track_id"].notna()).sum()), len(tracked)) if "track_id" in det.columns else 0.0
+        c.observed["single_share_tracked"] = round(share, 4)
+        if len(tracked) and share < self.thr["single_share_warn"]:
+            c.set(WARN, f"only {share:.1%} of tracked detections labelled single")
+        # tracked-only rule: every veto must come from a box that was tracked when the
+        # filter ran. GTA-Link's collision guard can NaN a track_id afterwards; count it.
+        mode = str(self.expected_crop_filter.get("contam_mode", "tracked"))
+        trig = det["crop_trigger"]
+        fired = trig.notna()
+        c.observed["multi_labels"] = int((~single).sum())
+        c.observed["multi_without_trigger"] = int(((~single) & ~fired).sum())
+        if int(((~single) & ~fired).sum()):
+            c.set(FAIL, "multi labels with no recorded trigger box")
+        if mode == "tracked" and fired.any():
+            tid_now = det["track_id"]
+            trig_idx = trig[fired].astype(int)
+            valid = trig_idx.isin(det.index)
+            if not valid.all():
+                c.set(FAIL, f"{int((~valid).sum())} trigger indices not in the frame")
+            now_untracked = int(tid_now.reindex(trig_idx[valid]).isna().sum())
+            c.observed["vetoes_by_box_now_untracked"] = now_untracked
+            if now_untracked:
+                c.set(INFO, f"{now_untracked} vetoes came from boxes untracked after GTA-Link")
         return c
 
     def _check_track(self, det, tracked):
@@ -381,12 +436,13 @@ class RunAudit(VideoLevelModule):
         return c
 
     def _eligible_tids(self, tracked):
-        """Tracklets the jersey stage recognises: majority role in jn_roles."""
-        if "role_detection" not in tracked.columns:
+        """Tracklets the jersey stage recognises: role (per-track constant, from the
+        role_team stage) in jn_roles."""
+        if "role" not in tracked.columns:
             return set()
         out = set()
         for tid, grp in tracked.groupby("track_id"):
-            mode = grp["role_detection"].mode()
+            mode = grp["role"].mode()
             if len(mode) and mode.iloc[0] in self.jn_roles:
                 out.add(_tid(tid))
         return out
@@ -516,9 +572,9 @@ class RunAudit(VideoLevelModule):
         return c
 
     def _check_tracklet_agg(self, tracked):
-        c = Check("tracklet_agg", "jersey_number and role constant per track; "
-                                  "jersey_number equals the per-track detection")
-        for col in ("jersey_number", "role"):
+        c = Check("tracklet_agg", "jersey_number constant per track and equal to the "
+                                  "per-track detection")
+        for col in ("jersey_number",):
             if col not in tracked.columns:
                 c.observed[col] = "column missing"
                 c.set(FAIL, f"{col} column missing")
@@ -539,28 +595,145 @@ class RunAudit(VideoLevelModule):
                 c.set(FAIL, f"{mism} tracks where jersey_number != detection")
         return c
 
-    def _check_team(self, tracked):
-        c = Check("team + team_side", "every tracked player/goalkeeper has team in "
-                                      "{left, right}; both teams present; referees none")
-        if "team" not in tracked.columns:
-            c.observed["team"] = "column missing"
-            return c.set(FAIL, "team column missing")
-        role = tracked["role"] if "role" in tracked.columns else pd.Series(index=tracked.index, dtype=object)
+    def _read_sidecar(self, directory, seq):
+        if directory is None or not directory.is_dir():
+            return None
+        p = directory / f"{seq}.json"
+        if not p.is_file():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _check_team_embed(self, seq, tracked):
+        c = Check("team_embed (osnet_team)",
+                  "team_embedding on the sampled crops of EVERY tracklet; the checkpoint "
+                  "that ran equals the configured one; no empty/zero embeddings")
+        if "team_embedding" not in tracked.columns:
+            c.observed["team_embedding"] = "column missing"
+            return c.set(FAIL, "team_embedding column missing")
+        n_tr = tracked["track_id"].nunique()
+        covered = 0
+        for tid, grp in tracked.groupby("track_id"):
+            if any(isinstance(e, np.ndarray) and e.size for e in grp["team_embedding"]):
+                covered += 1
+        c.observed.update({"tracklets": int(n_tr), "tracklets_with_embedding": int(covered)})
+        if n_tr and covered == 0:
+            c.set(FAIL, "no tracklet has a team embedding")
+        elif _share(n_tr - covered, n_tr) > self.thr["embed_missing_warn"]:
+            c.set(FAIL, f"{n_tr - covered} tracklet(s) without any team embedding")
+        elif n_tr - covered:
+            c.set(WARN, f"{n_tr - covered} tracklet(s) without any team embedding")
+        data = self._read_sidecar(self.team_embed_sidecar_dir, seq)
+        c.observed["sidecar"] = str(self.team_embed_sidecar_dir / f"{seq}.json") if self.team_embed_sidecar_dir else None
+        if data is None:
+            return c.set(FAIL, "no team_embed sidecar for this sequence (stage did not run, "
+                               "audit_dir unset, or unwritable)")
+        emb = data.get("embedder") or {}
+        c.observed.update({"ran_sha256": emb.get("sha256"), "ran_source": emb.get("source"),
+                           "ran_input_hw": emb.get("input_hw"), "ran_dim": emb.get("embedding_dim"),
+                           "crops_sampled": data.get("crops_sampled"), "crops_embedded": data.get("crops_embedded"),
+                           "crops_empty": data.get("crops_empty"),
+                           "tracklets_off_grid": data.get("tracklets_off_grid"),
+                           "nonfinite_or_zero": data.get("embeddings_nonfinite_or_zero")})
+        want = self.expected_team_embed.get("sha256")
+        if want not in (None, "", "None"):
+            if str(emb.get("sha256")) != str(want):
+                c.set(FAIL, f"embedder sha256 that ran ({emb.get('sha256')}) != configured ({want})")
+        else:
+            c.set(INFO, "team_sha256 not pinned in the config; digest recorded only")
+        if not emb.get("sha256"):
+            c.set(FAIL, "sidecar records no embedder digest")
+        if data.get("tracklets") and data.get("crops_embedded", 0) == 0:
+            c.set(FAIL, "stage ran but embedded no crop")
+        if data.get("embeddings_nonfinite_or_zero"):
+            c.set(FAIL, f"{data['embeddings_nonfinite_or_zero']} non-finite or all-zero embeddings")
+        n_off = int(data.get("tracklets_off_grid") or 0)
+        if data.get("tracklets") and _share(n_off, data["tracklets"]) > self.thr["off_grid_warn"]:
+            c.set(WARN, f"{n_off} tracklet(s) had no frame on the stride grid (all rows used)")
+        for key in ("pos_stride", "crops_per_track"):
+            want = self.expected_team_embed.get(key)
+            got = data.get("stride" if key == "pos_stride" else key)
+            if want is not None and got is not None and int(want) != int(got):
+                c.set(FAIL, f"{key} that ran ({got}) != configured ({want})")
+        return c
+
+    def _check_role_team(self, seq, tracked):
+        c = Check("role_team", "every tracked row has a role in {player, goalkeeper, referee}; players "
+                               "and goalkeepers have team in {left, right}, referees none; role and "
+                               "team constant per track; both teams present; parameters that ran "
+                               "equal the configured ones; per-clip caps respected")
+        for col in ("role", "team", "team_cluster"):
+            if col not in tracked.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+        if c.verdict == FAIL:
+            return c
+        role = tracked["role"]
+        bad_role = int((~role.isin(["player", "goalkeeper", "referee"])).sum())
+        c.observed["rows_without_valid_role"] = bad_role
+        if bad_role:
+            c.set(FAIL, f"{bad_role} tracked rows without a valid role")
         pg = tracked[role.isin(["player", "goalkeeper"])]
         has = pg["team"].isin(["left", "right"])
-        miss = _share(int((~has).sum()), len(pg))
-        c.observed = {"player_gk_rows": int(len(pg)),
-                      "team_missing_share": round(miss, 4),
-                      "left_tracklets": int(pg[pg["team"] == "left"]["track_id"].nunique()),
-                      "right_tracklets": int(pg[pg["team"] == "right"]["track_id"].nunique())}
-        if "team_cluster" in tracked.columns:
-            c.observed["clusters"] = sorted({int(v) for v in tracked["team_cluster"] if not _is_nan(v)})
-        if len(pg) and int(has.sum()) == 0:
-            c.set(FAIL, "no player/goalkeeper has a team")
-        elif miss > self.thr["team_missing_warn"]:
-            c.set(WARN, f"{miss:.1%} player/GK rows without team")
+        c.observed.update({"player_gk_rows": int(len(pg)), "rows_missing_team": int((~has).sum()),
+                           "left_tracklets": int(pg[pg["team"] == "left"]["track_id"].nunique()),
+                           "right_tracklets": int(pg[pg["team"] == "right"]["track_id"].nunique()),
+                           "referee_tracklets": int(tracked[role == "referee"]["track_id"].nunique()),
+                           "goalkeeper_tracklets": int(tracked[role == "goalkeeper"]["track_id"].nunique())})
+        if len(pg) and int((~has).sum()):
+            c.set(FAIL, f"{int((~has).sum())} player/GK rows without team")
+        ref_team = int(tracked[(role == "referee") & tracked["team"].isin(["left", "right"])].shape[0])
+        if ref_team:
+            c.set(FAIL, f"{ref_team} referee rows carry a team")
+        for col in ("role", "team"):
+            bad = self._per_track_constant(tracked, col)
+            c.observed[f"{col}_inconsistent_tracks"] = len(bad)
+            if bad:
+                c.set(FAIL, f"{col} varies within {len(bad)} tracks")
         if len(pg) and (c.observed["left_tracklets"] == 0 or c.observed["right_tracklets"] == 0):
             c.set(WARN, "only one team present")
+        data = self._read_sidecar(self.role_team_sidecar_dir, seq)
+        c.observed["sidecar"] = str(self.role_team_sidecar_dir / f"{seq}.json") if self.role_team_sidecar_dir else None
+        if data is None:
+            return c.set(FAIL, "no role_team sidecar for this sequence (stage did not run, "
+                               "audit_dir unset, or unwritable)")
+        ran = data.get("params") or {}
+        want = self.expected_role_team.get("params") or {}
+        diff = {}
+        for k, v in want.items():
+            got = ran.get(k)
+            if got is None:
+                diff[k] = (got, v)
+            elif _is_number(got) and _is_number(v):
+                if abs(float(got) - float(v)) > 1e-9:
+                    diff[k] = (got, v)
+            elif str(got) != str(v):
+                diff[k] = (got, v)
+        c.observed["params_ran"] = ran
+        if diff:
+            c.set(FAIL, f"parameters that ran differ from the config: {diff}")
+        lvl = data.get("sequence_level") or {}
+        c.observed.update({"s_ok": lvl.get("s_ok"), "named_left_cluster": lvl.get("named_left_cluster"),
+                           "cues": lvl.get("cues"), "dbscan_eps": lvl.get("dbscan_eps"),
+                           "tracklets_no_embedding": data.get("tracklets_no_embedding"),
+                           "tracklets_off_grid": data.get("tracklets_off_grid")})
+        if data.get("tracklets_no_embedding"):
+            c.set(FAIL, f"{data['tracklets_no_embedding']} tracklet(s) reached the rules without "
+                        f"a team embedding (labelled player, no team)")
+        if lvl and lvl.get("s_ok") is False:
+            c.set(WARN, "distance rule disabled: degenerate spread of embedding distances")
+        max_ref = want.get("max_ref")
+        if max_ref is not None and c.observed["referee_tracklets"] > int(max_ref):
+            c.set(FAIL, f"{c.observed['referee_tracklets']} referees > max_ref {max_ref}")
+        per = data.get("per_tracklet") or []
+        reasons = {}
+        for r in per:
+            reasons[r.get("why")] = reasons.get(r.get("why"), 0) + 1
+        c.observed["reasons"] = reasons
+        if per and not tracked.empty and len(per) + int(data.get("tracklets_no_embedding") or 0) != tracked["track_id"].nunique():
+            c.set(FAIL, f"sidecar covers {len(per)} tracklets, detections hold {tracked['track_id'].nunique()}")
         return c
 
     def _check_visualization(self, det, tracked):
@@ -585,13 +758,14 @@ class RunAudit(VideoLevelModule):
         tracked = det.dropna(subset=["track_id"]) if "track_id" in det.columns else det.iloc[0:0]
         checks = [
             self._check_detector(det, metadatas),
-            self._check_reid(det),
             self._check_track(det, tracked),
             self._check_tracker_internals(seq, metadatas),
+            self._check_crop_filter(det, tracked),
             self._check_calibration(seq, tracked),
+            self._check_team_embed(seq, tracked),
+            self._check_role_team(seq, tracked),
             self._check_jersey(seq, tracked),
             self._check_tracklet_agg(tracked),
-            self._check_team(tracked),
             self._check_visualization(det, tracked),
         ]
         report = {"sequence": seq, "detections": int(len(det)),

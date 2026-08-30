@@ -1,7 +1,7 @@
 # GTA-Link offline tracklet stitching, run as its own pipeline stage right after `track`.
 # Uses the same OSNet-AIN as the tracker, built from the shared module
-# sn_gamestate/reid/osnet_ain.py. The GSR downstream (prtreid role/team, jersey) works
-# on the final track ids this stage produces and is otherwise independent of it.
+# sn_gamestate/reid/osnet_ain.py. The GSR downstream (team_embed, role_team, jersey)
+# works on the final track ids this stage produces and is otherwise independent of it.
 #
 # Connect hyperparameters are the per-tracker tuned optima carried over from the
 # BoT-SORT · SOF variant (appearance_thresh 0.25, spatial_thresh 150,

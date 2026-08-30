@@ -1,0 +1,37 @@
+# Role (player / goalkeeper / referee), team cluster and side (left / right) per
+# tracklet: the notebook's rule chain (sn_gamestate/team/rules.py, a verbatim port
+# of role-team-gt-tracks-3.ipynb run_sequence) at the parameters it froze on the
+# tuning split. Runs after team_embed, before jersey_number_detect (the jersey
+# stage reads `role` to skip referees).
+#
+# Notebook results at these values (ground-truth tracklets, YOLO11-L boxes, one
+# tracklet = one count): valid three-class macro-F1 0.947, test 0.926; referee
+# recall/precision on test 0.879/0.888; team split 1.000; naming 0.908 (four
+# test clips mirrored under every cue).
+#
+# Positions are bbox_pitch at stride 5; tau_n counts those sampled positions.
+# Tuned on ground-truth track ids and annotation-derived homographies; the
+# per-clip caps (one keeper per half, one assistant per side, max_ref referees)
+# assume one tracklet per identity. UNTUNED on this pipeline's tracklets and
+# BroadTrack projections: sweep later, once the run is clean.
+_target_: sn_gamestate.team.RoleTeamAssignment
+cfg:
+  pos_stride: 5
+  crops_per_track: 16
+  audit_dir: ${project_dir}/audit/role_team
+  params:
+    k: 3.25               # distance rule d > m + k*s
+    dbscan_min: 4         # DBSCAN min_samples
+    dbscan_scale: 1.5     # scale on the knee eps
+    tau_n: 5              # min sampled positions before any non-player role
+    tau_a: 0.85           # assistant: |y| >= tau_a * clip max |y|
+    tau_a_sy: 3.0         # assistant: max y std (m)
+    tau_r: 2.0            # centre referee: movement-range margin above typical
+    tau_m: 0.30           # position margin that accepts an unconfirmed candidate
+    confirm: outlier      # geometry | outlier
+    extra_ref: strong     # none | both | rule | strong
+    k_strong: 4.0         # z threshold of the strong variant
+    extra_pool: all       # nogk | all (rejected keeper candidates may become referees)
+    centre_confirm: outlier   # margin | outlier
+    max_ref: 3            # cap on referees per sequence
+    side_rule: keeper     # sign | mean | quantile | vote | centroid | keeper | vote2

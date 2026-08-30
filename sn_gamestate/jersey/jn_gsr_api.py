@@ -37,12 +37,14 @@ Output contract is byte-compatible with the MMOCR stage it replaces: per-detecti
 ``jersey_number_detection`` (digit string, or None for "-1"/unrecognized) and
 ``jersey_number_confidence`` (the consolidation share; 0.0 with None). The stage
 keeps the same pipeline slot; ``MajorityVoteTracklet`` then votes over a per-track
-constant, yielding the identical final ``jersey_number`` -- role voting, team,
-team_side, the GSR encoder and the eval are untouched.
+constant, yielding the identical final ``jersey_number`` -- the GSR encoder and
+the eval are untouched.
 
-Scope follows the package's validated setting: only tracklets whose majority
-per-detection prtreid ``role_detection`` is in ``roles`` (player, goalkeeper) are
-recognized; the rest get (None, 0.0), exactly like MMOCR's no-digit outcome.
+Scope follows the package's validated setting: only tracklets whose ``role`` (the
+per-tracklet role assigned by the ``role_team`` stage, which runs before this one)
+is in ``roles`` (player, goalkeeper) are recognized; referees get (None, 0.0),
+exactly like MMOCR's no-digit outcome. Team plays no part here. Every crop of a
+tracklet is used, single or multi: the crop filter's label is not consulted.
 
 Caching, rigorously
 -------------------
@@ -104,7 +106,7 @@ def detect_gpus():
 class JNGsrTrackletRecognizer(VideoLevelModule):
     """Tracklet-level jersey recognition via the vendored jn_pipeline_gsr package."""
 
-    input_columns = ["track_id", "bbox_ltwh", "image_id", "role_detection"]
+    input_columns = ["track_id", "bbox_ltwh", "image_id", "role"]
     output_columns = ["jersey_number_detection", "jersey_number_confidence"]
 
     def __init__(self, cfg, device, tracking_dataset=None):
@@ -144,8 +146,8 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         tracked = detections.dropna(subset=["track_id"])
         manifest, skipped_roles = {}, 0
         for tid, grp in tracked.groupby("track_id"):
-            if "role_detection" in grp.columns:
-                majority_role = grp["role_detection"].mode()
+            if "role" in grp.columns:
+                majority_role = grp["role"].mode()
                 role = majority_role.iloc[0] if len(majority_role) else None
                 if role not in self.roles:
                     skipped_roles += 1
