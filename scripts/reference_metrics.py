@@ -7,7 +7,7 @@ One coherent, reviewable performance file per experiment, holding exactly the re
 metrics agreed for this project — nothing mixed into the pipeline's own eval outputs:
 
   tracking     : HOTA, DetA, AssA, MOTA, IDF1, IDSW           (image space, no attributes)
-  gsr          : GS-HOTA, GS-DetA, GS-AssA                    (pitch space, roles+teams+jersey)
+  gsr          : GS-HOTA, GS-DetA, GS-AssA, GS-IDF1           (pitch space, roles+teams+jersey)
   jersey_number: det_acc_all, precision, recall, f1, trk_acc_all, trk_acc_numbered
   calibration  : JaC5, JaC10, MRE, MedRE, CR (+ final_score = CR * JaC5)
 
@@ -195,8 +195,9 @@ def gsr_block(summary):
         "GS-HOTA": _num(summary, "HOTA", "HOTA"),
         "GS-DetA": _num(summary, "HOTA", "DetA"),
         "GS-AssA": _num(summary, "HOTA", "AssA"),
+        "GS-IDF1": _num(summary, "Identity", "IDF1"),
         "_config": "EVAL_SPACE=pitch, USE_ROLES/TEAMS/JERSEY=True, EVAL_DIST_TOL=5m "
-                   "(official GSR challenge GS-HOTA)",
+                   "(official GSR challenge GS-HOTA; GS-IDF1 = Identity in the same space)",
     }
 
 
@@ -414,7 +415,7 @@ def calibration_block(image_pred, image_gt, eval_w=960, eval_h=540):
 ROWS = [
     ("tracking", "HOTA"), ("tracking", "DetA"), ("tracking", "AssA"),
     ("tracking", "MOTA"), ("tracking", "IDF1"), ("tracking", "IDSW"),
-    ("gsr", "GS-HOTA"), ("gsr", "GS-DetA"), ("gsr", "GS-AssA"),
+    ("gsr", "GS-HOTA"), ("gsr", "GS-DetA"), ("gsr", "GS-AssA"), ("gsr", "GS-IDF1"),
     ("jersey_number", "det_acc_all"), ("jersey_number", "f1"),
     ("jersey_number", "trk_acc_all"), ("jersey_number", "trk_acc_numbered"),
     ("calibration", "JaC5"), ("calibration", "JaC10"),
@@ -520,8 +521,8 @@ def main():
                                       work / "trackeval", args.num_cores)
             report["tracking"] = tracking_block(s)
         if "gsr" not in args.skip:
-            print("  [gsr] GS-HOTA in pitch space (attributes on)...")
-            s = run_trackeval_variant("gsr", "pitch", True, ["HOTA"],
+            print("  [gsr] GS-HOTA + GS-IDF1 in pitch space (attributes on)...")
+            s = run_trackeval_variant("gsr", "pitch", True, ["HOTA", "Identity"],
                                       tracking_dataset, video_md, detections_pred,
                                       image_pred, args.dataset_path, args.eval_set,
                                       work / "trackeval", args.num_cores)

@@ -204,7 +204,7 @@ python scripts/reference_metrics.py --state states/sn-gamestate.pklz \
 | Block | Metrics | Source |
 |---|---|---|
 | `tracking` | HOTA, DetA, AssA, MOTA, IDF1, IDSW | pipeline evaluator, image space, attributes off |
-| `gsr` | GS-HOTA, GS-DetA, GS-AssA | same evaluator, pitch space, attributes on, 5 m tolerance |
+| `gsr` | GS-HOTA, GS-DetA, GS-AssA, GS-IDF1 | same evaluator, pitch space, attributes on, 5 m tolerance |
 | `jersey_number` | det_acc_all, precision, recall, F1, trk_acc_all, trk_acc_numbered | Hungarian IoU ≥ 0.5, unnumbered = −1 |
 | `calibration` | JaC5, JaC10, MRE, MedRE, CR | official sn-calibration protocol at 960×540, mirror-aware |
 
