@@ -8,6 +8,8 @@
 #   split_merge    DBSCAN tracklet split + appearance merge   -> track_id (final)
 #                  (same OSNet-AIN as the tracker; reads crop_single)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
+#   pitch_gate     off-pitch tracklets (mean bbox_pitch outside  -> track_id NaN on their rows,
+#                  105x68 m + margin_m; on/off switch)             track_id_pregate, pitch_gate_offpitch
 #   team_embed     osnet_team on <= 16 sampled crops/tracklet  -> team_embedding
 #   role_team      notebook rules: role, cluster, side        -> role, team_cluster, team
 #   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU
@@ -46,6 +48,7 @@ defaults:
   - modules/split_merge: split_merge
   - modules/interpolation: dti
   - modules/calibration: broadtrack
+  - modules/pitch_gate: pitch_gate
   - modules/team_embed: osnet_team
   - modules/role_team: rules
   - modules/jersey_number_detect: jn_gsr
@@ -59,6 +62,8 @@ defaults:
 #   * split_merge BEFORE everything that depends on final track ids (team_embed,
 #     role_team and jersey recognition are tracklet-level; tracklet_agg votes per track_id);
 #   * calibration before role_team (it consumes bbox_pitch);
+#   * pitch_gate right after calibration (it needs bbox_pitch) and before team_embed:
+#     a gated tracklet loses its track_id, and every later stage groups by track_id;
 #   * team_embed before role_team, role_team before jersey_number_detect (the jersey
 #     stage reads `role` to skip referees);
 #   * audit LAST: it reads every column the other stages produce and writes none.
@@ -68,6 +73,7 @@ pipeline:
   - crop_filter
   - split_merge
   - calibration
+  - pitch_gate
   - team_embed
   - role_team
   - jersey_number_detect

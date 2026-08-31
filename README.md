@@ -4,7 +4,7 @@ A single, rigorously-scoped GSR pipeline. One entry config, one path, no alterna
 backends: every file in this repository belongs to the active pipeline.
 
 ```
-bbox_detector -> track -> crop_filter -> split_merge -> calibration -> team_embed
+bbox_detector -> track -> crop_filter -> split_merge -> calibration -> pitch_gate -> team_embed
               -> role_team -> jersey_number_detect -> tracklet_agg -> audit
 ```
 
@@ -15,6 +15,7 @@ bbox_detector -> track -> crop_filter -> split_merge -> calibration -> team_embe
 | `crop_filter` | single / multi label per detection, tracked-only rule | rT ≤ 0.25, rB < 0.40; only boxes carrying a `track_id` may make another box multi; every detection gets `crop_single`/`crop_rT`/`crop_rB`/`crop_trigger`; no detection is removed |
 | `split_merge` | DBSCAN tracklet splitting + agglomerative fragment merging on appearance | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); clusters and merges on `crop_single` detections only; `eps 0.2, min_samples 5, tau 0.60`; one detection per trajectory and frame; a detection that cannot be placed gets `track_id` NaN; per-sequence sidecar for the audit |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
+| `pitch_gate` | off-pitch tracklet gate on the mean projected position | per final `track_id`, the mean of `bbox_pitch` (bottom-middle) over the rows with a finite projection; off-pitch iff `abs(mean_x) > 52.5 + margin_m` or `abs(mean_y) > 34 + margin_m`; the rows of an off-pitch tracklet lose their `track_id` (NaN, so no later stage and no export sees them), the original id stays in `track_id_pregate`; `enabled` switch (off = columns and sidecar still written, `track_id` untouched); `margin_m 5` untuned; a tracklet without a projection is kept; no detection is removed; per-sequence sidecar for the audit |
 | `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
 | `role_team` | notebook rule chain (`sn_gamestate/team/rules.py`) | per tracklet: role (player / goalkeeper / referee), team cluster, left/right side; k-means on the single-crop descriptors, position rules on `bbox_pitch`, appearance-outlier channels, keeper-cue naming; frozen parameters from the notebook's tuning split; per-sequence sidecar for the audit |
 | `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level, single crops only (`crop_single`): legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
@@ -55,6 +56,34 @@ detection in every trajectory, unassigned share).
 
 There is **no `pitch` stage**: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 detectors internally and emits camera parameters directly.
+
+### The `pitch_gate` stage
+
+The detector is a single-class person model and no stage before `calibration` can tell
+a bench player, a steward or a photographer from an athlete, so without this stage every
+tracklet is exported and receives a role. `pitch_gate`
+(`sn_gamestate/pitch_gate/pitch_gate_api.py`) runs directly after `calibration` and
+before `team_embed`. Per final `track_id` it takes the mean of the projected bottom-middle
+points over the rows that carry a finite `bbox_pitch` and calls the tracklet off-pitch when
+`|mean_x| > 52.5 + margin_m` or `|mean_y| > 34 + margin_m` (105 x 68 m pitch, metres,
+centre at the origin). The tracklet mean is used rather than a per-frame test so that
+projection error at the far touchline cannot flicker single frames of an on-pitch player.
+With `enabled: true` the rows of an off-pitch tracklet get `track_id` NaN: the evaluation
+export drops them and `team_embed`, `role_team`, the jersey stage, `tracklet_agg` and the
+radar never see them, so the role rules run their k-means and outlier statistics on
+on-pitch tracklets only. With `enabled: false` `track_id` is untouched. Either way the stage
+writes `track_id_pregate` (the id `split_merge` left), `pitch_gate_offpitch` (the rule's
+outcome), `pitch_mean_x` / `pitch_mean_y` and a sidecar `audit/pitch_gate/<seq>.json`; no
+detection row is deleted and a tracklet without any projection is kept.
+
+`margin_m` (`configs/modules/pitch_gate/pitch_gate.yaml`, default 5 m) is untuned: it is
+an assumption meant to absorb projection error at the touchline and players a step outside
+it (throw-ins, retrieving a ball) while still gating the benches and the area behind the
+goals. Sweep it on the **valid** split; the audit records how many tracklets were gated
+per sequence and warns when the share is implausibly high (a calibration problem rather
+than off-pitch people). `tracklab -cn soccernet modules.pitch_gate.cfg.enabled=false` runs
+the pipeline without the gate (the stage still writes its columns and sidecar), which is
+how its contribution is attributed with `scripts/reference_metrics.py`.
 
 ## Why BroadTrack
 
@@ -161,7 +190,11 @@ checked against what their configs declare: labels must agree with the stored ov
 ratios at the configured thresholds, the `split_merge` sidecar must record the configured
 `eps`/`min_samples`/`tau` and checkpoint digest, its split/merge/pass counts must be
 consistent with each other and with the final `track_id`s (one detection per frame per
-trajectory, a clean detection in every trajectory), every tracklet must carry a team embedding, the
+trajectory, a clean detection in every trajectory), the `pitch_gate` sidecar must record
+the configured switch and margin, its mean positions and off-pitch flags must equal the
+ones recomputed from `bbox_pitch`, and `track_id` must have been cleared on off-pitch
+tracklets if and only if the gate is enabled (the split_merge, crop_filter and calibration
+checks compare against the pre-gate ids in `track_id_pregate`), every tracklet must carry a team embedding, the
 checkpoint digest and the rule parameters that ran (per-sequence sidecars under
 `audit/team_embed/`, `audit/role_team/`) must equal the configured ones, every tracked
 row must have a valid role, players/keepers a side and referees none. The jersey check is the strictest: the per-sequence cache
@@ -220,6 +253,7 @@ sn_gamestate/
   reid/osnet_ain.py, osnet_team.py       # tracker/split_merge embedder; team-appearance model
   track/bot_sort.py, split_merge.py, split_merge_api.py, hf_resolver.py
   calibration/broadtrack_api.py          # calibration + image-to-pitch
+  pitch_gate/pitch_gate_api.py           # off-pitch tracklet gate (mean bbox_pitch, on/off switch)
   team/rules.py, team_embed_api.py, role_team_api.py   # notebook rules; the two stages
   jersey/jn_gsr_api.py                   # multi-GPU tracklet recognition
   audit/run_audit_api.py                 # per-component verdicts (last stage)

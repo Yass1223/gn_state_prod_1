@@ -191,6 +191,25 @@ def audit_columns(det, img):
         checks.append(col_check(col, everyrow, "crop_filter"))
     # calibration: bbox_pitch on tracked rows (role/team need it there)
     checks.append(col_check("bbox_pitch", trackedrows, "calibration", elem_ok=is_pitch))
+    # pitch_gate: pre-gate id and off-pitch flag on every row; with the gate enabled
+    # no off-pitch row may still carry a track_id
+    checks.append(col_check("pitch_gate_offpitch", everyrow, "pitch_gate"))
+    c = Check("column:track_id_pregate", "written by pitch_gate; the id split_merge left, on every pre-gate tracked row")
+    if "track_id_pregate" not in det.columns or "pitch_gate_offpitch" not in det.columns:
+        c.set(FAIL, "column missing")
+    else:
+        pre = det["track_id_pregate"].notna()
+        off = det["pitch_gate_offpitch"].map(lambda v: bool(v) if not _is_nan(v) else False)
+        c.observed.update(tracked_before_gate=int(pre.sum()), tracked_after_gate=n_tracked,
+                          off_pitch_rows=int(off.sum()), off_pitch_rows_still_tracked=int((off & tracked).sum()),
+                          new_ids_after_gate=int((~pre & tracked).sum()))
+        if int((~pre & tracked).sum()):
+            c.set(FAIL, "rows tracked now that had no track_id before the gate")
+        if int(off.sum()) and int((off & tracked).sum()) == int(off.sum()):
+            c.set(INFO, "off-pitch rows kept their track_id (gate disabled)")
+        elif int((off & tracked).sum()):
+            c.set(FAIL, f"{int((off & tracked).sum())} off-pitch rows still tracked while others were gated")
+    checks.append(c.to_dict())
     # image parameters
     c = Check("column:parameters", "written by calibration on image rows")
     if len(img) == 0 or "parameters" not in img.columns:

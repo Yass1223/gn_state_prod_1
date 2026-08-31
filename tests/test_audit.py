@@ -1,4 +1,4 @@
-"""Audit checks for crop_filter / team_embed / role_team on the synthetic run."""
+"""Audit checks for crop_filter / pitch_gate / team_embed / role_team on the synthetic run."""
 import sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_stages as T
 from sn_gamestate.crop_filter.crop_filter_api import CropFilter
+from sn_gamestate.pitch_gate.pitch_gate_api import PitchGate
 from sn_gamestate.team.team_embed_api import TeamEmbedding
 from sn_gamestate.team.role_team_api import RoleTeamAssignment
 from sn_gamestate.team import rules
@@ -16,6 +17,9 @@ tmp = Path(tempfile.mkdtemp())
 ckpt = tmp / "osnet_team_best.pt"; T.make_checkpoint(ckpt)
 det, meta = T.make_data(tmp / "data")
 det = CropFilter(SimpleNamespace(thr_target=0.25, thr_other=0.40, contam_mode="tracked", conf_thr_other=0.0)).process(det, meta)
+# every synthetic tracklet stands inside the pitch: the gate must change nothing here
+det = PitchGate(SimpleNamespace(enabled=True, margin_m=5.0, audit_dir=str(tmp / "audit/pitch_gate"))).process(det, meta)
+assert det["track_id"].equals(det["track_id_pregate"]) and not det["pitch_gate_offpitch"].any()
 te = TeamEmbedding(SimpleNamespace(team_local_path=str(ckpt), team_sha256=None, team_repo="x", team_file="y", team_revision=None,
                                    audit_dir=str(tmp / "audit/team_embed"), pos_stride=5, crops_per_track=16, batch_size=32), device="cpu")
 det = te.process(det, meta)
@@ -25,15 +29,17 @@ cfg = SimpleNamespace(out_dir=str(tmp / "audit"), jn_cache_dir=str(tmp / "jn"), 
                       jn_roles=["player", "goalkeeper"], thresholds={}, track_sidecar_dir=None, expected_tracker={},
                       expected_crop_filter=dict(thr_target=0.25, thr_other=0.40, contam_mode="tracked"),
                       team_embed_sidecar_dir=str(tmp / "audit/team_embed"), expected_team_embed=dict(sha256=None, pos_stride=5, crops_per_track=16),
-                      role_team_sidecar_dir=str(tmp / "audit/role_team"), expected_role_team=dict(params=dict(rules.FROZEN_PARAMS)))
+                      role_team_sidecar_dir=str(tmp / "audit/role_team"), expected_role_team=dict(params=dict(rules.FROZEN_PARAMS)),
+                      pitch_gate_sidecar_dir=str(tmp / "audit/pitch_gate"), expected_pitch_gate=dict(enabled=True, margin_m=5.0))
 audit = RunAudit(cfg)
 import json
 audit.process(det, meta)
 rep = json.loads((tmp / "audit" / "SNGS-000.json").read_text())
 by = {c["component"]: c for c in rep["checks"]}
-for name in ("crop_filter", "team_embed (osnet_team)", "role_team"):
+for name in ("crop_filter", "pitch_gate", "team_embed (osnet_team)", "role_team"):
     print(f"{by[name]['verdict']:4} {name}: {by[name]['note'] or 'ok'}")
 assert by["crop_filter"]["verdict"] == "PASS"
+assert by["pitch_gate"]["verdict"] == "PASS" and by["pitch_gate"]["observed"]["tracklets_gated"] == 0
 assert by["team_embed (osnet_team)"]["verdict"] == "PASS" and "not pinned" in by["team_embed (osnet_team)"]["note"]
 assert by["role_team"]["verdict"] in ("PASS", "WARN")   # WARN = degenerate spread, legitimate on random-noise frames
 # negative controls: a wrong parameter, a missing embedding, a wrong threshold
@@ -47,4 +53,7 @@ assert RunAudit(cfg)._check_team_embed("SNGS-000", det.dropna(subset=["track_id"
 d2 = det.copy(); d2.loc[d2.track_id == 2.0, "role"] = None
 cfg.expected_team_embed = dict(sha256=None, pos_stride=5, crops_per_track=16)
 assert RunAudit(cfg)._check_role_team("SNGS-000", d2.dropna(subset=["track_id"])).verdict == "FAIL"
-print("audit: positives PASS, four negative controls FAIL")
+cfg.expected_pitch_gate = dict(enabled=False, margin_m=5.0)   # switch that ran != configured
+assert RunAudit(cfg)._check_pitch_gate("SNGS-000", det).verdict == "FAIL"
+cfg.expected_pitch_gate = dict(enabled=True, margin_m=5.0)
+print("audit: positives PASS, five negative controls FAIL")

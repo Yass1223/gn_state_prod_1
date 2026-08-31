@@ -144,6 +144,12 @@ class RunAudit(VideoLevelModule):
                                     (getattr(cfg, "expected_team_embed", {}) or {}).items()}
         self.expected_role_team = {str(k): v for k, v in
                                    (getattr(cfg, "expected_role_team", {}) or {}).items()}
+        # Pitch-gate stage sidecar (written by sn_gamestate.pitch_gate.pitch_gate_api)
+        # and the switch / margin it must have run with.
+        d = getattr(cfg, "pitch_gate_sidecar_dir", None)
+        self.pitch_gate_sidecar_dir = Path(str(d)) if d else None
+        self.expected_pitch_gate = {str(k): v for k, v in
+                                    (getattr(cfg, "expected_pitch_gate", {}) or {}).items()}
         thr = getattr(cfg, "thresholds", None) or {}
         g = lambda k, d: float(thr[k]) if k in thr else d  # noqa: E731
         self.thr = {
@@ -160,6 +166,8 @@ class RunAudit(VideoLevelModule):
             "zero_emb_warn": g("zero_emb_warn", 0.01),
             "split_merge_unassigned_warn": g("split_merge_unassigned_warn", 0.05),
             "split_merge_zero_emb_warn": g("split_merge_zero_emb_warn", 0.01),
+            "pitch_gate_gated_warn": g("pitch_gate_gated_warn", 0.50),
+            "pitch_gate_no_position_warn": g("pitch_gate_no_position_warn", 0.05),
         }
         # Split/merge stage sidecar (written by sn_gamestate.track.split_merge_api)
         # and the settings/checkpoint it must have run with.
@@ -246,13 +254,14 @@ class RunAudit(VideoLevelModule):
             c.observed["labels_inconsistent_with_ratios"] = mism
             if mism:
                 c.set(FAIL, f"{mism} labels disagree with the stored ratios at the configured thresholds")
-        share = _share(int((single & det["track_id"].notna()).sum()), len(tracked)) if "track_id" in det.columns else 0.0
+        share = _share(int(single.reindex(tracked.index).fillna(False).astype(bool).sum()), len(tracked)) if "track_id" in det.columns else 0.0
         c.observed["single_share_tracked"] = round(share, 4)
         if len(tracked) and share < self.thr["single_share_warn"]:
             c.set(WARN, f"only {share:.1%} of tracked detections labelled single")
         # tracked-only rule: every veto must come from a box that was tracked when the
         # filter ran. split_merge can leave a detection unassigned (track_id NaN)
-        # afterwards; count it.
+        # afterwards; count it. The pitch gate also clears track_id, so the id as
+        # split_merge left it (track_id_pregate) is used when the gate stage ran.
         mode = str(self.expected_crop_filter.get("contam_mode", "tracked"))
         trig = det["crop_trigger"]
         fired = trig.notna()
@@ -261,7 +270,7 @@ class RunAudit(VideoLevelModule):
         if int(((~single) & ~fired).sum()):
             c.set(FAIL, "multi labels with no recorded trigger box")
         if mode == "tracked" and fired.any():
-            tid_now = det["track_id"]
+            tid_now = det["track_id_pregate"] if "track_id_pregate" in det.columns else det["track_id"]
             trig_idx = trig[fired].astype(int)
             valid = trig_idx.isin(det.index)
             if not valid.all():
@@ -430,7 +439,12 @@ class RunAudit(VideoLevelModule):
         distance <= tau). Outputs (recomputed from the detections): the tracked
         rows and tracklets the audit sees equal what the stage reports, no
         (image_id, track_id) collision, a clean detection in every trajectory,
-        unassigned share within threshold."""
+        unassigned share within threshold.
+
+        ``tracked`` must hold the track ids as split_merge LEFT them: when the
+        pitch_gate stage ran afterwards, ``process`` rebuilds it from
+        ``track_id_pregate`` (the gate clears track_id on off-pitch tracklets, which
+        is checked by ``_check_pitch_gate``, not here)."""
         c = Check("split_merge (DBSCAN split + appearance merge)",
                   "sidecar for the sequence; settings (eps, min_samples, tau) and checkpoint "
                   "that ran equal the configured ones; crop_single received and clean "
@@ -576,6 +590,123 @@ class RunAudit(VideoLevelModule):
                         f"(track_id set to NaN)")
         c.observed["tracklets_split"] = sp.get("tracklets_split")
         c.observed["merges"] = n_merges
+        return c
+
+    # --------------------------------------------------- pitch gate stage --
+    def _check_pitch_gate(self, seq, det):
+        """Recomputes the gate from the detections and holds the stage to its switch.
+
+        Columns present; sidecar present with the switch and margin equal to the
+        configured ones; per pre-gate tracklet the mean projected position and the
+        rule outcome recomputed from bbox_pitch equal the stored columns; with the
+        gate enabled every off-pitch row has track_id NaN and every other tracked
+        row kept its id, with the gate disabled track_id equals track_id_pregate
+        everywhere; counts equal the sidecar's; gated share and share of tracklets
+        without a projection within thresholds."""
+        from sn_gamestate.pitch_gate.pitch_gate_api import gate_tracklets
+        c = Check("pitch_gate", "track_id_pregate / pitch_gate_offpitch / pitch_mean_x / pitch_mean_y on "
+                                "every row; sidecar with the switch and margin that ran equal to the "
+                                "configured ones; mean position and rule recomputed from bbox_pitch equal "
+                                "the stored columns; track_id cleared on off-pitch tracklets iff enabled; "
+                                "counts equal the sidecar's")
+        exp = self.expected_pitch_gate
+        c.observed["expected"] = dict(exp)
+        for col in ("track_id_pregate", "pitch_gate_offpitch", "pitch_mean_x", "pitch_mean_y"):
+            if col not in det.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+        if "track_id" not in det.columns or "bbox_pitch" not in det.columns:
+            c.set(FAIL, "track_id or bbox_pitch column missing")
+        if c.verdict == FAIL:
+            return c
+        data = self._read_sidecar(self.pitch_gate_sidecar_dir, seq)
+        c.observed["sidecar"] = (str(self.pitch_gate_sidecar_dir / f"{seq}.json")
+                                if self.pitch_gate_sidecar_dir else None)
+        if data is None:
+            return c.set(FAIL, "no pitch_gate sidecar for this sequence (stage did not run, "
+                               "audit_dir unset, or unwritable)")
+        ran_enabled, ran_margin = data.get("enabled"), data.get("margin_m")
+        c.observed["ran"] = dict(enabled=ran_enabled, margin_m=ran_margin, pitch=data.get("pitch"))
+        want_enabled, want_margin = exp.get("enabled"), exp.get("margin_m")
+        if want_enabled is None or ran_enabled is None:
+            c.set(FAIL, "enabled not declared (config) or not recorded (sidecar)")
+        elif bool(want_enabled) != bool(ran_enabled):
+            c.set(FAIL, f"enabled that ran ({ran_enabled}) != configured ({want_enabled})")
+        if want_margin is None or ran_margin is None:
+            c.set(FAIL, "margin_m not declared (config) or not recorded (sidecar)")
+        elif abs(float(ran_margin) - float(want_margin)) > 1e-9:
+            c.set(FAIL, f"margin_m that ran ({ran_margin}) != configured ({want_margin})")
+        if ran_margin is None:
+            return c
+        margin = float(ran_margin)
+        enabled = bool(ran_enabled)
+
+        # --- recompute the gate on the ids as the stage received them
+        pre = det.copy()
+        pre["track_id"] = pre["track_id_pregate"]
+        mean_x, mean_y, off, per = gate_tracklets(pre, margin)
+        got_x = det["pitch_mean_x"].astype(float)
+        got_y = det["pitch_mean_y"].astype(float)
+        got_off = det["pitch_gate_offpitch"].astype(bool)
+        same_x = (np.isclose(mean_x, got_x, atol=1e-6, equal_nan=True))
+        same_y = (np.isclose(mean_y, got_y, atol=1e-6, equal_nan=True))
+        n_mean_mismatch = int((~(same_x & same_y)).sum())
+        n_rule_mismatch = int((off.to_numpy() != got_off.to_numpy()).sum())
+        c.observed.update(rows=int(len(det)), mean_mismatch_rows=n_mean_mismatch,
+                          rule_mismatch_rows=n_rule_mismatch)
+        if n_mean_mismatch:
+            c.set(FAIL, f"{n_mean_mismatch} rows whose stored mean position differs from the "
+                        f"one recomputed from bbox_pitch")
+        if n_rule_mismatch:
+            c.set(FAIL, f"{n_rule_mismatch} rows whose pitch_gate_offpitch differs from the rule "
+                        f"at margin {margin}")
+
+        # --- track_id changed exactly as the switch says
+        tid_now, tid_pre = det["track_id"], det["track_id_pregate"]
+        if enabled:
+            off_with_id = int((got_off & tid_now.notna()).sum())
+            kept = (~got_off) & tid_pre.notna()
+            kept_changed = int((kept & ~(tid_now == tid_pre)).sum())
+            new_ids = int((tid_pre.isna() & tid_now.notna()).sum())
+            c.observed.update(offpitch_rows_still_tracked=off_with_id,
+                              onpitch_rows_with_changed_id=kept_changed, rows_with_new_id=new_ids)
+            if off_with_id:
+                c.set(FAIL, f"{off_with_id} off-pitch rows still carry a track_id although the gate is enabled")
+            if kept_changed or new_ids:
+                c.set(FAIL, f"the gate changed track_id on {kept_changed + new_ids} rows it must not touch")
+        else:
+            changed = int((~((tid_now == tid_pre) | (tid_now.isna() & tid_pre.isna()))).sum())
+            c.observed["rows_with_changed_id"] = changed
+            if changed:
+                c.set(FAIL, f"gate disabled but track_id differs from track_id_pregate on {changed} rows")
+
+        # --- counts against the sidecar
+        n_trk = len(per)
+        n_off = sum(1 for p in per if p["off_pitch"])
+        n_nopos = sum(1 for p in per if p["n_positions"] == 0)
+        rows_gated_now = int((tid_pre.notna() & tid_now.isna()).sum())
+        c.observed.update(tracklets=n_trk, tracklets_off_pitch=n_off,
+                          tracklets_without_position=n_nopos,
+                          tracklets_gated=n_off if enabled else 0, rows_gated=rows_gated_now,
+                          tracked_rows_before=int(tid_pre.notna().sum()),
+                          tracked_rows_after=int(tid_now.notna().sum()),
+                          off_pitch_track_ids=[p["track_id"] for p in per if p["off_pitch"]])
+        for key, val in (("tracklets", n_trk), ("tracklets_off_pitch", n_off),
+                         ("tracklets_without_position", n_nopos),
+                         ("tracklets_gated", n_off if enabled else 0), ("rows_gated", rows_gated_now)):
+            rec = data.get(key)
+            if rec is None or int(rec) != int(val):
+                c.set(FAIL, f"sidecar {key} ({rec}) != recomputed ({val})")
+        share_off = _share(n_off, n_trk)
+        share_nopos = _share(n_nopos, n_trk)
+        c.observed.update(off_pitch_share=round(share_off, 4), no_position_share=round(share_nopos, 4))
+        if n_trk and share_off > self.thr["pitch_gate_gated_warn"]:
+            c.set(WARN, f"{share_off:.1%} of the tracklets are off-pitch at margin {margin} m "
+                        f"(implausible; check the calibration)")
+        if n_trk and share_nopos > self.thr["pitch_gate_no_position_warn"]:
+            c.set(WARN, f"{share_nopos:.1%} of the tracklets have no projection and could not be gated")
+        if n_trk and not enabled and n_off:
+            c.set(INFO, f"gate disabled: {n_off} off-pitch tracklet(s) kept")
         return c
 
     def _check_calibration(self, seq, tracked):
@@ -980,13 +1111,22 @@ class RunAudit(VideoLevelModule):
         seq = self._seq_name(metadatas)
         det = detections
         tracked = det.dropna(subset=["track_id"]) if "track_id" in det.columns else det.iloc[0:0]
+        # The ids as split_merge left them: the pitch gate clears track_id on off-pitch
+        # tracklets and keeps the original in track_id_pregate, so the split_merge
+        # check compares its sidecar with that column when the gate stage ran.
+        if "track_id_pregate" in det.columns:
+            tracked_pregate = det[det["track_id_pregate"].notna()].copy()
+            tracked_pregate["track_id"] = tracked_pregate["track_id_pregate"]
+        else:
+            tracked_pregate = tracked
         checks = [
             self._check_detector(det, metadatas),
             self._check_track(det, tracked),
             self._check_tracker_internals(seq, metadatas),
-            self._check_split_merge(seq, det, tracked),
-            self._check_crop_filter(det, tracked),
-            self._check_calibration(seq, tracked),
+            self._check_split_merge(seq, det, tracked_pregate),
+            self._check_crop_filter(det, tracked_pregate),
+            self._check_calibration(seq, tracked_pregate),
+            self._check_pitch_gate(seq, det),
             self._check_team_embed(seq, tracked),
             self._check_role_team(seq, tracked),
             self._check_jersey(seq, tracked),

@@ -17,7 +17,11 @@
 # labels consistent with the stored ratios at the configured thresholds, every
 # multi label has a trigger box, vetoes by boxes split_merge later left
 # unassigned), calibration (bbox_pitch + camera
-# JSON), team_embed (embedding on every tracklet, sidecar: checkpoint digest that
+# JSON), pitch_gate (columns on every row, sidecar: switch and margin that ran vs
+# configured, mean position and off-pitch rule recomputed from bbox_pitch vs the
+# stored columns, track_id cleared on off-pitch tracklets iff the gate is enabled,
+# counts vs sidecar; the split_merge / crop_filter / calibration checks use the
+# pre-gate ids in track_id_pregate), team_embed (embedding on every tracklet, sidecar: checkpoint digest that
 # ran vs configured, empty/zero embeddings, off-grid tracklets), role_team (valid
 # role on every tracked row, team on every player/keeper, none on referees,
 # per-track constancy, sidecar: parameters that ran vs configured, referee cap,
@@ -85,6 +89,13 @@ cfg:
   expected_role_team:
     params: ${modules.role_team.cfg.params}
 
+  # Pitch-gate stage: sidecar location (must equal the module's audit_dir) and the
+  # switch / margin it must have run with.
+  pitch_gate_sidecar_dir: ${modules.pitch_gate.cfg.audit_dir}
+  expected_pitch_gate:
+    enabled: ${modules.pitch_gate.cfg.enabled}
+    margin_m: ${modules.pitch_gate.cfg.margin_m}
+
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.
   thresholds:
@@ -101,3 +112,5 @@ cfg:
     zero_emb_warn: 0.01                # high-conf detections with an all-zero embedding
     split_merge_unassigned_warn: 0.05  # tracked detections split_merge could not place (track_id -> NaN)
     split_merge_zero_emb_warn: 0.01    # tracked detections with an all-zero split_merge embedding
+    pitch_gate_gated_warn: 0.50        # tracklets off-pitch at the configured margin, above this = WARN (calibration suspect)
+    pitch_gate_no_position_warn: 0.05  # tracklets with no finite bbox_pitch (kept, could not be gated)
