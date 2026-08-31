@@ -38,6 +38,11 @@ cfg:
   # Roles the jersey stage recognises (jn_gsr.yaml `roles`); tracklets whose role
   # (from the role_team stage) is elsewhere are not expected to carry a number.
   jn_roles: [player, goalkeeper]
+  # Whether the jersey stage hands only single crops (crop_single) to the
+  # recognisers. Resolved from jn_gsr.yaml; the blob must record the same value,
+  # and with true a tracklet without a single crop is not expected to carry a
+  # number (it is not eligible) and must not carry one.
+  jn_single_crops_only: ${modules.jersey_number_detect.cfg.single_crops_only}
 
   # Tracker diagnostics sidecars written by the track stage (must equal the track
   # module's audit_dir), and the declared tracker/embedder configuration to hold the

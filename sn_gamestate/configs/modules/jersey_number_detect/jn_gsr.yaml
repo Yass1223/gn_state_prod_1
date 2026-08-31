@@ -60,6 +60,13 @@ cfg:
 
   # --- scope: recognize tracklets whose `role` (from the role_team stage) is here ---
   roles: [player, goalkeeper]
+  # Only single crops (crop_filter's crop_single: one person in the box) are handed
+  # to the recognisers; overlapping crops are excluded from the manifest and a
+  # tracklet with no single crop stays unnumbered. `stride` then steps over the
+  # tracklet's single crops. Part of the cache key; recorded in the blob; the run
+  # audit fails if the blob disagrees with this value or if a number sits on a
+  # tracklet without a single crop.
+  single_crops_only: true
 
   # --- GPU sharding: auto = one worker per nvidia-smi GPU (1 if none) ---
   gpus: auto             # auto | <int> | [0, 1, ...]

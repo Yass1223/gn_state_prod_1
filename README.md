@@ -17,12 +17,14 @@ bbox_detector -> track -> crop_filter -> split_merge -> calibration -> team_embe
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
 | `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
 | `role_team` | notebook rule chain (`sn_gamestate/team/rules.py`) | per tracklet: role (player / goalkeeper / referee), team cluster, left/right side; k-means on the single-crop descriptors, position rules on `bbox_pitch`, appearance-outlier channels, keeper-cue naming; frozen parameters from the notebook's tuning split; per-sequence sidecar for the audit |
-| `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level: legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
+| `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level, single crops only (`crop_single`): legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
 | `tracklet_agg` | majority vote | `[jersey_number]` (role is per-tracklet from `role_team`) |
 | `audit` | per-component verdicts | read-only last stage: PASS/WARN/FAIL per component per sequence → `audit/<seq>.json`; `scripts/verify_run_integrity.py` refuses the run on any FAIL |
 
 The jersey stage recognises tracklets whose `role` is player or goalkeeper (referees carry
-no number) and uses every crop of a tracklet, single or multi; team plays no part in it.
+no number) and, with `single_crops_only: true` (the default), hands the recognisers only the
+single crops of a tracklet (`crop_single`); overlapping crops are excluded and a tracklet with
+no single crop stays unnumbered. Team plays no part in it.
 The role/team stage ignores multi crops, as the notebook did. There is no `reid` (prtreid)
 stage: role and team come from `team_embed` + `role_team`, and the tracker and `split_merge`
 use OSNet-AIN. `interpolation` is kept as a module for tracking-only experiments but is not
@@ -163,8 +165,11 @@ trajectory, a clean detection in every trajectory), every tracklet must carry a 
 checkpoint digest and the rule parameters that ran (per-sequence sidecars under
 `audit/team_embed/`, `audit/role_team/`) must equal the configured ones, every tracked
 row must have a valid role, players/keepers a side and referees none. The jersey check is the strictest: the per-sequence cache
-blob must carry `rule = vote_pool` and the sha256 of both staged checkpoints, answer every
-player/goalkeeper tracklet, agree with the detection columns, and the provisioning
+blob must carry `rule = vote_pool`, the sha256 of both staged checkpoints and the
+`single_crops_only` value that ran (equal to the config), its manifest counts must equal
+the eligible tracklets and their single crops in the state, it must answer every
+player/goalkeeper tracklet that holds a single crop, no number may sit on a tracklet without
+one, the columns must agree with the blob, and the provisioning
 provenance of SATRN and PARSeq must be on record. Thresholds are in
 `configs/modules/audit/run_audit.yaml`.
 

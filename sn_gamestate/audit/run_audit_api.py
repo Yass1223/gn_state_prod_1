@@ -130,6 +130,8 @@ class RunAudit(VideoLevelModule):
         self.satrn_ckpt = str(getattr(cfg, "satrn_ckpt",
                                       "recog2/best_recog_word_acc_epoch_10.pth"))
         self.jn_roles = set(getattr(cfg, "jn_roles", ["player", "goalkeeper"]))
+        # jersey stage crop selection (jn_gsr.yaml single_crops_only); see _check_jersey
+        self.jn_single_crops_only = bool(getattr(cfg, "jn_single_crops_only", True))
         # Sidecars of the team-embedding and role/team stages (must equal those
         # modules' audit_dir) and what their configs declare, resolved by OmegaConf.
         d = getattr(cfg, "team_embed_sidecar_dir", None)
@@ -607,23 +609,54 @@ class RunAudit(VideoLevelModule):
 
     def _eligible_tids(self, tracked):
         """Tracklets the jersey stage recognises: role (per-track constant, from the
-        role_team stage) in jn_roles."""
+        role_team stage) in jn_roles and, with jn_single_crops_only, at least one
+        crop_single detection (the stage hands only single crops to the recognisers
+        and skips a tracklet that has none)."""
         if "role" not in tracked.columns:
             return set()
         out = set()
         for tid, grp in tracked.groupby("track_id"):
             mode = grp["role"].mode()
-            if len(mode) and mode.iloc[0] in self.jn_roles:
+            if not (len(mode) and mode.iloc[0] in self.jn_roles):
+                continue
+            if self.jn_single_crops_only and not self._has_single(grp):
+                continue
+            out.add(_tid(tid))
+        return out
+
+    @staticmethod
+    def _has_single(grp):
+        return "crop_single" in grp.columns and bool(grp["crop_single"].astype(bool).any())
+
+    def _role_eligible_without_single(self, tracked):
+        """Role-eligible tracklets that hold no single crop (left unnumbered by design
+        when single crops only)."""
+        if "role" not in tracked.columns:
+            return set()
+        out = set()
+        for tid, grp in tracked.groupby("track_id"):
+            mode = grp["role"].mode()
+            if len(mode) and mode.iloc[0] in self.jn_roles and not self._has_single(grp):
                 out.add(_tid(tid))
         return out
 
     def _check_jersey(self, seq, tracked):
         c = Check("jersey_number_detect",
                   f"per-sequence cache blob with rule={RULE}, real sha256 of both "
-                  f"checkpoints, an answer for every eligible tracklet, per-track "
-                  f"constant jersey_number_detection consistent with the blob")
+                  f"checkpoints, single_crops_only as configured, an answer for every "
+                  f"eligible tracklet, no number on a tracklet without a single crop, "
+                  f"per-track constant jersey_number_detection consistent with the blob")
         eligible = self._eligible_tids(tracked)
         c.observed["eligible_tracklets"] = len(eligible)
+        c.observed["single_crops_only"] = self.jn_single_crops_only
+        no_single = self._role_eligible_without_single(tracked)
+        if self.jn_single_crops_only:
+            c.observed["role_eligible_without_single_crop"] = len(no_single)
+            if "crop_single" not in tracked.columns:
+                c.set(FAIL, "crop_single column missing; single-crop eligibility cannot be checked")
+            if no_single:
+                c.set(INFO, f"{len(no_single)} role-eligible tracklet(s) hold no single crop and are "
+                            f"left unnumbered by design")
 
         for col in ("jersey_number_detection", "jersey_number_confidence"):
             if col not in tracked.columns:
@@ -644,7 +677,10 @@ class RunAudit(VideoLevelModule):
                 numbered.add(_tid(tid))
         c.observed["eligible_numbered"] = len(numbered & eligible)
         c.observed["numbered_outside_eligible"] = len(numbered - eligible)
-        if numbered - eligible:
+        if self.jn_single_crops_only and (numbered & no_single):
+            c.set(FAIL, f"{len(numbered & no_single)} tracklet(s) without a single crop carry a "
+                        f"number; with single_crops_only such a tracklet never reaches the recognisers")
+        if numbered - eligible - no_single:
             c.set(WARN, "numbers on tracklets outside the role filter")
         if (len(eligible) >= self.thr["jn_min_eligible_for_zero_fail"]
                 and not (numbered & eligible)):
@@ -665,6 +701,24 @@ class RunAudit(VideoLevelModule):
         c.observed["rule"] = blob.get("rule")
         if blob.get("rule") != RULE:
             c.set(FAIL, f"blob rule {blob.get('rule')!r} != {RULE!r}")
+        if "single_crops_only" not in blob:
+            c.set(FAIL, "blob does not record single_crops_only (written by an older stage)")
+        elif bool(blob.get("single_crops_only")) != self.jn_single_crops_only:
+            c.set(FAIL, f"blob single_crops_only={blob.get('single_crops_only')} != "
+                        f"configured {self.jn_single_crops_only}")
+        ms = blob.get("manifest_stats") or {}
+        if ms:
+            c.observed["manifest_stats"] = dict(ms)
+            n_eligible_blob = int(ms.get("manifest_tracklets") or 0)
+            if n_eligible_blob != len(eligible):
+                c.set(FAIL, f"blob manifest held {n_eligible_blob} tracklets, the state has "
+                            f"{len(eligible)} eligible ones")
+            if self.jn_single_crops_only and "crop_single" in tracked.columns:
+                elig_rows = tracked[tracked["track_id"].map(_tid).isin(eligible)]
+                n_single_rows = int(elig_rows["crop_single"].astype(bool).sum())
+                if int(ms.get("manifest_frames") or 0) != n_single_rows:
+                    c.set(FAIL, f"blob manifest held {ms.get('manifest_frames')} crops, the eligible "
+                                f"tracklets hold {n_single_rows} single crops")
         for key, rel in (("parseq_sha256", self.parseq_ckpt),
                          ("satrn_sha256", self.satrn_ckpt)):
             v = str(blob.get(key, ""))

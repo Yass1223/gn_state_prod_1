@@ -10,9 +10,10 @@ frame receives three columns, tracked or not:
                 ratio which made T multi, or NaN when T is single / no contaminator
 
 A crop is "single" when it shows one person. Downstream stages that must ignore
-multi crops (the team embedding and the role/team rules) read ``crop_single``, and
-the ``split_merge`` stage clusters and merges on single crops only; no stage
-recomputes overlaps. The jersey stage does not read it (it uses every crop).
+multi crops (the team embedding and the role/team rules) read ``crop_single``,
+the ``split_merge`` stage clusters and merges on single crops only, and the
+jersey stage hands the recognisers single crops only (``single_crops_only``); no
+stage recomputes overlaps.
 
 Contaminator set C(T) — which boxes may make T multi — is selected by
 ``contam_mode``:

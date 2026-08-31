@@ -8,6 +8,12 @@ vote_pool consolidation: the pooled per-frame decodes of both models are
 majority-voted; see ``plugins/jn_gsr/jn_recognizer.py``). vote_pool is the
 only rule of this build; there is no ``rule`` setting.
 
+Crop selection: with ``cfg.single_crops_only`` (default true) only the detections
+the crop filter labelled ``crop_single`` are handed to the recognisers; overlapping
+crops never enter the manifest, and a tracklet with no single crop is left
+unnumbered. The worker's ``stride`` therefore steps over the tracklet's single
+crops, not over all its frames.
+
 Measured on GT-box tracklets (fusion run of 2026-08-17, both audits 0 fail):
 GSR-2024 test trk_acc 87.86 / numbered 91.34 / -1 F1 0.82 (PARSeq maxconf
 alone: 87.48 / 90.83 / 0.82); SN jersey-2023 test 85.30 / 84.58 / 0.81
@@ -49,8 +55,9 @@ tracklet is used, single or multi: the crop filter's label is not consulted.
 Caching, rigorously
 -------------------
 Per-sequence cache keyed on a sha256 of the manifest CONTENT (track ids + frame
-paths + boxes + rule + stride + legibility_thr + the sha256 of BOTH recogniser
-checkpoints). Track ids change whenever tracking or split_merge is retuned, so a
+paths + boxes + rule + stride + legibility_thr + single_crops_only + the sha256 of
+BOTH recogniser checkpoints). Track ids change whenever tracking or split_merge is
+retuned, so a
 name-only cache would silently serve stale numbers; exact-hash match only.
 
 The last components exist because they are the ways this stage's output can
@@ -106,7 +113,7 @@ def detect_gpus():
 class JNGsrTrackletRecognizer(VideoLevelModule):
     """Tracklet-level jersey recognition via the vendored jn_pipeline_gsr package."""
 
-    input_columns = ["track_id", "bbox_ltwh", "image_id", "role"]
+    input_columns = ["track_id", "bbox_ltwh", "image_id", "role", "crop_single"]
     output_columns = ["jersey_number_detection", "jersey_number_confidence"]
 
     def __init__(self, cfg, device, tracking_dataset=None):
@@ -133,6 +140,11 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         self._ckpt_ids = {}                       # memoised; see _ckpt_id()
         self.fp16 = bool(getattr(cfg, "fp16", True))
         self.roles = set(getattr(cfg, "roles", ["player", "goalkeeper"]))
+        # Single crops only: hand the recognisers the detections the crop filter
+        # labelled crop_single (one person in the box); overlapping crops are
+        # excluded from the manifest. A tracklet with no single crop is left
+        # unnumbered. Recorded in the cache key and in the blob; audit-checked.
+        self.single_crops_only = bool(getattr(cfg, "single_crops_only", True))
         self.gpus = getattr(cfg, "gpus", "auto")
         self.timeout = int(getattr(cfg, "timeout", 10800))     # per video
         self.worker_extra_args = [str(x) for x in
@@ -140,17 +152,33 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
 
     # ------------------------------------------------------------- manifest --
     def _build_manifest(self, detections, metadatas):
-        """{tid: [[frame_path, [l,t,w,h]], ...]} chronological; role-filtered."""
+        """{tid: [[frame_path, [l,t,w,h]], ...]} chronological; role-filtered and,
+        with single_crops_only, restricted to crop_single detections.
+        Returns (manifest, stats) with stats = dict(tracklets_skipped_role,
+        tracklets_skipped_no_single, frames_excluded_multi, manifest_tracklets,
+        manifest_frames)."""
+        if self.single_crops_only and "crop_single" not in detections.columns:
+            raise RuntimeError("[jn_gsr] crop_single column missing - the crop_filter "
+                               "stage must run before jersey_number_detect")
         id2path = {idx: str(p) for idx, p in metadatas["file_path"].items()}
         order = {idx: Path(p).name for idx, p in id2path.items()}
         tracked = detections.dropna(subset=["track_id"])
-        manifest, skipped_roles = {}, 0
+        manifest = {}
+        stats = dict(tracklets_skipped_role=0, tracklets_skipped_no_single=0,
+                     frames_excluded_multi=0, manifest_tracklets=0, manifest_frames=0)
         for tid, grp in tracked.groupby("track_id"):
             if "role" in grp.columns:
                 majority_role = grp["role"].mode()
                 role = majority_role.iloc[0] if len(majority_role) else None
                 if role not in self.roles:
-                    skipped_roles += 1
+                    stats["tracklets_skipped_role"] += 1
+                    continue
+            if self.single_crops_only:
+                keep = grp["crop_single"].astype(bool)
+                stats["frames_excluded_multi"] += int((~keep).sum())
+                grp = grp[keep]
+                if len(grp) == 0:
+                    stats["tracklets_skipped_no_single"] += 1
                     continue
             grp = grp.assign(_fn=grp["image_id"].map(order)).sort_values("_fn")
             frames = []
@@ -162,7 +190,9 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                 frames.append([fp, [l, t, w, h]])
             if frames:
                 manifest[str(tid)] = frames
-        return manifest, skipped_roles
+        stats["manifest_tracklets"] = len(manifest)
+        stats["manifest_frames"] = sum(len(v) for v in manifest.values())
+        return manifest, stats
 
     # ------------------------------------------------------- cache identity --
     def _ckpt_id(self, rel):
@@ -199,6 +229,7 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         payload = json.dumps({"tracklets": manifest, "rule": rule,
                               "stride": stride,
                               "legibility_thr": self.legibility_thr,
+                              "single_crops_only": self.single_crops_only,
                               "parseq_sha256": self._ckpt_id(self.parseq_ckpt),
                               "satrn_sha256": self._ckpt_id(self.satrn_ckpt)},
                              sort_keys=True)
@@ -277,10 +308,12 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
 
         seq = Path(str(metadatas["file_path"].iloc[0])).parent.parent.name \
             if len(metadatas) else "unknown"
-        manifest, skipped = self._build_manifest(detections, metadatas)
+        manifest, stats = self._build_manifest(detections, metadatas)
+        skipped = stats["tracklets_skipped_role"]
         if not manifest:
             log.warning(f"[jn_gsr] {seq}: no eligible tracklets "
-                        f"({skipped} skipped by role filter)")
+                        f"({skipped} skipped by role filter, "
+                        f"{stats['tracklets_skipped_no_single']} with no single crop)")
             return detections
         mhash = self._manifest_hash(manifest, self.rule, self.stride)
         cache_file = self.cache_dir / f"{seq}.{mhash[:12]}.json"
@@ -316,6 +349,8 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                 "manifest_sha256": mhash, "rule": self.rule,
                 "stride": self.stride,
                 "legibility_thr": self.legibility_thr,
+                "single_crops_only": self.single_crops_only,
+                "manifest_stats": stats,
                 "parseq_ckpt": self.parseq_ckpt,
                 "parseq_sha256": self._ckpt_id(self.parseq_ckpt),
                 "satrn_ckpt": self.satrn_ckpt,
@@ -335,5 +370,8 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                 n_numbered += 1
         log.info(f"[jn_gsr] {seq}: {n_numbered}/{len(manifest)} tracklets "
                  f"numbered ({skipped} skipped by role filter, "
+                 f"{stats['tracklets_skipped_no_single']} with no single crop, "
+                 f"{stats['frames_excluded_multi']} overlapping crops excluded, "
+                 f"single_crops_only={self.single_crops_only}, "
                  f"legibility > {self.legibility_thr})")
         return detections

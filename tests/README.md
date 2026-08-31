@@ -5,6 +5,7 @@ Run from the repository root with the project venv (`uv venv --python 3.9 .venv 
 ```bash
 .venv/bin/python tests/test_rules_equivalence.py   # ported rules == notebook functions (numpy/sklearn only)
 .venv/bin/python tests/test_split_merge.py         # split_merge port == notebook cells; behaviour; stage + audit check (needs torch + tracklab for part 3)
+.venv/bin/python tests/test_jersey_single_crops.py # jersey manifest = single crops only; cache key; audit jersey check with negative controls (needs tracklab, no torch)
 .venv/bin/python tests/test_stages.py              # crop_filter -> team_embed -> role_team on synthetic frames (needs torch + torchreid)
 .venv/bin/python tests/test_audit.py               # the audit checks for the three stages, with negative controls
 ```
