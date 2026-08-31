@@ -16,6 +16,16 @@ actually running. Non-zero is the count of broken stages.
 """
 from __future__ import annotations
 
+import os
+
+# A hosted-notebook kernel (Kaggle, Jupyter) exports MPLBACKEND=module://matplotlib_inline.
+# backend_inline. matplotlib rejects that value in a plain subprocess, and 16 of the 21
+# stages import matplotlib.pyplot through tracklab.visualization, so every one of them
+# would fail here for a reason that has nothing to do with the pipeline. Force a headless
+# backend before any stage is imported.
+if "inline" in os.environ.get("MPLBACKEND", ""):
+    os.environ["MPLBACKEND"] = "Agg"
+
 import argparse
 import importlib
 import re
