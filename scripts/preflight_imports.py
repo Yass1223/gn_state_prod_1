@@ -83,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         "boxmot.motion.cmc.get_cmc_method",
         "sn_gamestate.reid.osnet_ain.from_config",
         "sn_gamestate.track.split_merge.split_merge_video",
+        "sn_gamestate.track.motion_gate.gate_video",
         "sn_gamestate.reid.osnet_team.from_config",
         "sn_gamestate.team.rules.run_sequence",
     ]

@@ -1,0 +1,34 @@
+# Motion-continuity gate on FINAL trajectories, run directly after `split_merge`.
+# Switchable with `enabled` (false = true no-op: columns and sidecar still written,
+# no detection touched).
+#
+# Rule: a detection that is not in motion continuity with at least `min_support`
+# other detections of its own trajectory is DISABLED (track_id -> NaN; original id
+# kept in track_id_pre_motion_gate, row flagged motion_gate_disabled). Continuity is
+# judged on the bottom-middle point of the box in CAMERA-MOTION-COMPENSATED image
+# coordinates: the per-frame SOF warps the tracker recorded in its diagnostics
+# sidecar (audit/track/<video>.json) are chained into a stabilised coordinate
+# system; detection i is supported by detection j iff |frame_i - frame_j| <= window
+# and ||q_i - q_j|| <= speed_max_px * |frame_i - frame_j| + slack_px. A trajectory
+# with at most `min_support` detections is skipped whole (the criterion is
+# unsatisfiable there). Roles do not exist yet at this pipeline position, so the
+# gate applies to every trajectory.
+#
+# speed_max_px / slack_px / window are UNTUNED heuristics for 1080p 25 fps
+# SoccerNet broadcasts (players' feet rarely exceed ~40 px/frame after camera
+# compensation; slack absorbs box jitter). Tuning them means an A/B with
+# scripts/reference_metrics.py on the valid split, gate on vs off.
+_target_: sn_gamestate.track.motion_gate_api.MotionGate
+cfg:
+  enabled: true        # the on/off switch for the whole gate
+  min_support: 3       # required number of supporting detections in the same trajectory
+  window: 25           # supporters are searched within this many frames (1 s at 25 fps)
+  speed_max_px: 40.0   # max plausible feet speed, px/frame, in stabilised coordinates (UNTUNED)
+  slack_px: 20.0       # constant slack for box jitter, px (UNTUNED)
+  # Where the tracker wrote its per-frame diagnostics (incl. the full 2x3 SOF warp);
+  # MUST equal modules/track cfg.audit_dir. The gate fails loudly when enabled and
+  # this sidecar is absent or predates the full-warp record.
+  track_sidecar_dir: ${modules.track.cfg.audit_dir}
+  # Per-sequence sidecar (settings that ran, warp coverage, per-trajectory disabled
+  # counts) read by the `audit` stage.
+  audit_dir: ${project_dir}/audit/motion_gate

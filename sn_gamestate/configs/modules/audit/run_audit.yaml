@@ -16,7 +16,11 @@
 # every trajectory, unassigned share), crop_filter (labels on every detection,
 # labels consistent with the stored ratios at the configured thresholds, every
 # multi label has a trigger box, vetoes by boxes split_merge later left
-# unassigned), calibration (bbox_pitch + camera
+# unassigned), motion_gate (columns on every row, sidecar: switch and parameters
+# that ran vs configured, flagged rows equal the motion-continuity rule recomputed
+# from the tracker sidecar's SOF warps, flagged rows and only flagged rows lost
+# their track_id, disabled share; the split_merge / crop_filter checks use the
+# reconstructed pre-gate ids), calibration (bbox_pitch + camera
 # JSON), pitch_gate (columns on every row, sidecar: switch and margin that ran vs
 # configured, mean position and off-pitch rule recomputed from bbox_pitch vs the
 # stored columns, track_id cleared on off-pitch tracklets iff the gate is enabled,
@@ -99,6 +103,17 @@ cfg:
     enabled: ${modules.pitch_gate.cfg.enabled}
     margin_m: ${modules.pitch_gate.cfg.margin_m}
 
+  # Motion gate: sidecar location (must equal the module's audit_dir) and the
+  # settings it must have run with. The tracker sidecar (track_sidecar_dir above)
+  # supplies the warps for the audit's rule recompute.
+  motion_gate_sidecar_dir: ${modules.motion_gate.cfg.audit_dir}
+  expected_motion_gate:
+    enabled: ${modules.motion_gate.cfg.enabled}
+    min_support: ${modules.motion_gate.cfg.min_support}
+    window: ${modules.motion_gate.cfg.window}
+    speed_max_px: ${modules.motion_gate.cfg.speed_max_px}
+    slack_px: ${modules.motion_gate.cfg.slack_px}
+
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.
   thresholds:
@@ -117,4 +132,6 @@ cfg:
     split_merge_zero_emb_warn: 0.01    # tracked detections with an all-zero split_merge embedding
     pitch_gate_gated_warn: 0.50        # tracklets off-pitch at the configured margin, above this = WARN (calibration suspect)
     pitch_gate_no_position_warn: 0.05  # tracklets with no finite bbox_pitch (kept, could not be gated)
+    motion_gate_disabled_warn: 0.05    # gate-input detections disabled by the motion gate, above this = WARN
+    motion_gate_missing_warp_warn: 0.05  # warp steps missing from the tracker sidecar (identity used)
     calib_lost_frames_warn: 0.10       # camera-JSON frames below min_score (tracking lost -> last camera reused)
