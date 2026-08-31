@@ -36,6 +36,9 @@ cfg:
   # Must match the other stages' configs -- same values as jn_gsr.yaml / broadtrack.yaml.
   jn_cache_dir: ${project_dir}/jn_cache
   calib_dir: ${project_dir}/broadtrack_calib
+  # Score below which the calibration stage rejects a frame of the camera JSON
+  # (broadtrack.yaml min_score); frames below it are counted as tracking lost.
+  calib_min_score: ${modules.calibration.cfg.min_score}
   models_dir: ${project_dir}/plugins/jn_gsr/models
   parseq_ckpt: parseq_gsr_ft_s1.ckpt
   satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
@@ -114,3 +117,4 @@ cfg:
     split_merge_zero_emb_warn: 0.01    # tracked detections with an all-zero split_merge embedding
     pitch_gate_gated_warn: 0.50        # tracklets off-pitch at the configured margin, above this = WARN (calibration suspect)
     pitch_gate_no_position_warn: 0.05  # tracklets with no finite bbox_pitch (kept, could not be gated)
+    calib_lost_frames_warn: 0.10       # camera-JSON frames below min_score (tracking lost -> last camera reused)

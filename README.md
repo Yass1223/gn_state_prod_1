@@ -92,6 +92,15 @@ MRE **5.02 px** vs 10.28, completeness **100 %** vs 93.67. Radial-distortion mod
 the dominant term — and the projection path here honours it (`unproject_point_on_planeZ0`
 undistorts by default).
 
+The binary writes a camera for every frame, including frames on which it lost track
+(`score < 0.3` in its `main.cpp`; after more than 5 such frames it falls back to the position
+prior). Those cameras are recorded with their low `score`, so the calibration stage rejects
+frames below `min_score` (0.3, the binary's own threshold) and reuses the last accepted camera
+for them; otherwise every player of such a frame is projected with a meaningless camera, which
+propagates through `bbox_pitch` into the pitch gate, the role/team rules and, via `role`, the
+jersey stage. The audit reports the share of rejected frames per sequence
+(`calib_lost_frames_warn`).
+
 ## Install
 
 ```bash

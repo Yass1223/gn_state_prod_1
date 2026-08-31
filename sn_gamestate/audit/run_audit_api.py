@@ -125,6 +125,9 @@ class RunAudit(VideoLevelModule):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.jn_cache_dir = Path(str(cfg.jn_cache_dir))
         self.calib_dir = Path(str(cfg.calib_dir))
+        # Score below which the calibration stage rejects a frame (broadtrack.yaml
+        # min_score); the audit counts such frames in the camera JSON.
+        self.calib_min_score = float(getattr(cfg, "calib_min_score", 0.3))
         self.models_dir = Path(str(cfg.models_dir))
         self.parseq_ckpt = str(getattr(cfg, "parseq_ckpt", "parseq_gsr_ft_s1.ckpt"))
         self.satrn_ckpt = str(getattr(cfg, "satrn_ckpt",
@@ -168,6 +171,7 @@ class RunAudit(VideoLevelModule):
             "split_merge_zero_emb_warn": g("split_merge_zero_emb_warn", 0.01),
             "pitch_gate_gated_warn": g("pitch_gate_gated_warn", 0.50),
             "pitch_gate_no_position_warn": g("pitch_gate_no_position_warn", 0.05),
+            "calib_lost_frames_warn": g("calib_lost_frames_warn", 0.10),
         }
         # Split/merge stage sidecar (written by sn_gamestate.track.split_merge_api)
         # and the settings/checkpoint it must have run with.
@@ -734,6 +738,31 @@ class RunAudit(VideoLevelModule):
                 c.observed["camera_json_frames"] = len(data) if hasattr(data, "__len__") else None
                 if not data:
                     c.set(FAIL, "camera JSON empty")
+                elif isinstance(data, dict):
+                    # The binary records every frame, lost ones included (main.cpp:
+                    # score < 0.3 = tracking lost, reinit attempted; after > 5 lost
+                    # frames with score < 0.2 the camera is reset to the prior). The
+                    # calibration stage rejects frames below min_score and reuses the
+                    # last accepted camera; a large lost share means many reused
+                    # (stale) cameras, so the projections of this sequence are suspect.
+                    scores = [float(v.get("score", 0.0)) for v in data.values()
+                              if isinstance(v, dict) and _is_number(v.get("score", None))]
+                    n_reinit = sum(1 for v in data.values()
+                                   if isinstance(v, dict) and bool(v.get("reinit", False)))
+                    n_lost = sum(1 for sc in scores if sc < self.calib_min_score)
+                    share_lost = _share(n_lost, len(scores))
+                    c.observed.update({
+                        "frames_with_score": len(scores),
+                        "frames_below_min_score": n_lost,
+                        "lost_share": round(share_lost, 4),
+                        "frames_reinit": n_reinit,
+                        "score_median": round(float(np.median(scores)), 4) if scores else None,
+                        "score_min": round(min(scores), 4) if scores else None,
+                        "min_score": self.calib_min_score})
+                    if scores and share_lost > self.thr["calib_lost_frames_warn"]:
+                        c.set(WARN, f"{share_lost:.1%} of the calibrated frames are below "
+                                    f"min_score={self.calib_min_score} (tracking lost; their "
+                                    f"detections use the last accepted camera)")
             except (OSError, json.JSONDecodeError) as e:
                 c.set(FAIL, f"camera JSON unreadable: {e}")
         return c

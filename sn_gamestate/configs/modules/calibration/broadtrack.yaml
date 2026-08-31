@@ -55,8 +55,19 @@ cfg:
   always_stage: false
 
   # --- robustness ---
-  # The binary's loop is `for (i = 1; i < frames_number; i++)`, so the LAST frame of each
-  # sequence is never calibrated; carry-forward keeps bbox_pitch populated (same role as
-  # NBJW's use_prev_homography). min_score=0 keeps every frame (completeness is 100%).
+  # The binary writes EVERY frame with a line-IoU `score` and a `reinit` flag, including
+  # frames on which it lost track. In main.cpp `score < 0.3` is the lost state (keypoint
+  # re-init attempted) and after > 5 consecutive lost frames with `score < 0.2` the camera
+  # is reset to the position prior (pan 0, tilt 80 deg, focal = image diagonal) -- still
+  # recorded. Accepting such a frame projects every player of that frame with a meaningless
+  # camera (all positions jump, then snap back): bbox_pitch outliers feed pitch_gate (tracklet
+  # mean pushed off-pitch -> track_id cleared), role_team (false keeper / referee, flipped
+  # left-right naming) and, through `role`, the jersey stage. min_score therefore uses the
+  # binary's own lost threshold; upstream's compute_tripod.py is stricter (keeps score > 0.6).
+  # Rejected frames, and the LAST frame (the binary's loop is `for (i = 1; i < frames_number;
+  # i++)`, so it is never calibrated), reuse the last accepted camera (same role as NBJW's
+  # use_prev_homography). max_carry_frames caps a run of consecutive reused frames; 0 = no
+  # cap; beyond it the frame gets no parameters and its detections no bbox_pitch.
   use_prev_parameters: true
-  min_score: 0.0
+  min_score: 0.3
+  max_carry_frames: 0

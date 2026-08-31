@@ -30,6 +30,15 @@ Verified behaviours of the BroadTrack binary this wrapper compensates for
 * ``-t <file>`` existing switches the binary to tripod ("soft") mode; otherwise "free"
   mode with the ``--X/--Y/--Z`` prior. The binary's built-in defaults are ``0/90/-18``
   (Bundesliga), *not* the SoccerNet prior, so priors are always passed explicitly.
+* Every frame is written with a line-IoU ``score`` and a ``reinit`` flag, INCLUDING
+  frames on which tracking was lost. In ``main.cpp`` ``score < 0.3`` is the lost state
+  (keypoint re-initialisation is attempted) and after more than 5 consecutive lost
+  frames with ``score < 0.2`` the camera is RESET to the position prior (pan 0, tilt
+  80 deg, focal = image diagonal); that camera is still recorded. Projecting boxes
+  with it scatters every player of the frame across the pitch, which is why
+  ``min_score`` must not be 0: rejected frames fall back to carry-forward
+  (``use_prev_parameters``), optionally capped by ``max_carry_frames``. Upstream's own
+  ``scripts/compute_tripod.py`` keeps only frames with ``score > 0.6``.
 
 Schema conversion
 -----------------
@@ -191,8 +200,16 @@ class BroadTrackCalibration(VideoLevelModule):
         # cv2.error: (-215:Assertion failed) !_src.empty(). Set true whenever
         # running inference on video that has no Labels-GameState.json.
         self.always_stage = bool(getattr(cfg, "always_stage", False))
-        self.min_score = float(getattr(cfg, "min_score", 0.0))
+        # Frames whose binary score is below min_score are treated as uncalibrated
+        # (see the module docstring: 0.3 is the binary's own tracking-lost threshold).
+        self.min_score = float(getattr(cfg, "min_score", 0.3))
         self.use_prev_parameters = bool(getattr(cfg, "use_prev_parameters", True))
+        # Longest run of consecutive frames allowed to reuse the last accepted camera;
+        # 0 = unlimited. Beyond the cap the frame gets no parameters and its
+        # detections no bbox_pitch (same outcome as an uncalibrated NBJW frame).
+        self.max_carry_frames = int(getattr(cfg, "max_carry_frames", 0) or 0)
+        if self.max_carry_frames < 0:
+            raise ValueError(f"[BroadTrack] max_carry_frames must be >= 0, got {self.max_carry_frames}")
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -377,7 +394,9 @@ class BroadTrackCalibration(VideoLevelModule):
 
         params_rows, bbox_pitch = {}, {}
         last_params = None
-        n_carried = n_lowscore = 0
+        n_carried = n_lowscore = n_reinit = n_missing = n_dropped = 0
+        carry_run = 0          # consecutive frames served by carry-forward
+        scores = []
 
         # Temporal order matters for carry-forward: iterate frames sorted by file name
         # (%06d.jpg sorts chronologically); do not rely on the incoming row order.
@@ -385,16 +404,25 @@ class BroadTrackCalibration(VideoLevelModule):
         for image_id in order.sort_values().index:
             entry = by_name.get(order[image_id])
             params = None
-            if entry is not None:
+            if entry is None:
+                n_missing += 1
+            else:
                 score = float(entry.get("score", 0.0))
+                scores.append(score)
+                n_reinit += int(bool(entry.get("reinit", False)))
                 if score >= self.min_score:
                     params = broadtrack_cp_to_sncalib(entry["cp"])
                 else:
                     n_lowscore += 1
-            if params is None and self.use_prev_parameters and last_params is not None:
+            if params is not None:
+                carry_run = 0
+            elif (self.use_prev_parameters and last_params is not None
+                  and (self.max_carry_frames == 0 or carry_run < self.max_carry_frames)):
                 params = last_params
+                carry_run += 1
                 n_carried += 1
             if params is None:
+                n_dropped += 1
                 params_rows[image_id] = {}
                 continue
             last_params = params
@@ -407,9 +435,16 @@ class BroadTrackCalibration(VideoLevelModule):
                 projected = image_dets.bbox.ltrb().apply(get_bbox_pitch(cam))
                 bbox_pitch.update(projected.to_dict())
 
-        if n_carried or n_lowscore:
-            log.info(f"[BroadTrack] {seq_name}: carried-forward {n_carried} frame(s), "
-                     f"{n_lowscore} below min_score={self.min_score}")
+        if scores:
+            arr = np.asarray(scores, dtype=float)
+            log.info(f"[BroadTrack] {seq_name}: score min/median/max "
+                     f"{arr.min():.3f}/{np.median(arr):.3f}/{arr.max():.3f}, "
+                     f"{n_reinit} reinit frame(s)")
+        if n_carried or n_lowscore or n_missing or n_dropped:
+            msg = (f"[BroadTrack] {seq_name}: {n_lowscore} frame(s) below "
+                   f"min_score={self.min_score}, {n_missing} absent from the JSON, "
+                   f"{n_carried} carried-forward, {n_dropped} left without parameters")
+            (log.warning if n_dropped else log.info)(msg)
 
         detections = detections.copy()
         col = pd.Series(bbox_pitch, dtype=object).reindex(detections.index)
