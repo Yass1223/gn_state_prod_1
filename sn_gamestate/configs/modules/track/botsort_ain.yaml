@@ -22,9 +22,10 @@
 # frame_rate / 30 * track_buffer, so 25/30 * 60 = 50 frames of track lifetime.
 #
 # Precision: the OSNet-AIN embedder runs fp16 (torch autocast on CUDA, fp32 outputs),
-# baked in after the Kaggle fp16/fp32 validation. GTA-Link builds the SAME embedder
-# module from the SAME checkpoint pin, so both stages embed a crop identically by
-# construction; the run audit fails the run if the two configs pin different weights.
+# baked in after the Kaggle fp16/fp32 validation. The split_merge stage builds the
+# SAME embedder module from the SAME checkpoint pin, so both stages embed a crop
+# identically by construction; the run audit fails the run if the two configs pin
+# different weights.
 # There is no TensorRT path for the appearance model.
 _target_: sn_gamestate.track.bot_sort.BotSortSOF
 cfg:

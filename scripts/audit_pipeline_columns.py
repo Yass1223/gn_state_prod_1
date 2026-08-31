@@ -177,7 +177,7 @@ def audit_columns(det, img):
     checks.append(col_check("bbox_ltwh", everyrow, "bbox_detector", elem_ok=is_ltwh))
     checks.append(col_check("bbox_conf", everyrow, "bbox_detector"))
     # track_id: expected on *some* rows; FAIL only if zero tracked
-    c = Check("column:track_id", "written by track+gta_link; some detections tracked")
+    c = Check("column:track_id", "written by track+split_merge; some detections tracked")
     if "track_id" not in det.columns:
         c.set(FAIL, "column missing")
     else:

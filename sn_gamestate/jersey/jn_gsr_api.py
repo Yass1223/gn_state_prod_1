@@ -50,7 +50,7 @@ Caching, rigorously
 -------------------
 Per-sequence cache keyed on a sha256 of the manifest CONTENT (track ids + frame
 paths + boxes + rule + stride + legibility_thr + the sha256 of BOTH recogniser
-checkpoints). Track ids change whenever tracking or GTA-Link is retuned, so a
+checkpoints). Track ids change whenever tracking or split_merge is retuned, so a
 name-only cache would silently serve stale numbers; exact-hash match only.
 
 The last components exist because they are the ways this stage's output can

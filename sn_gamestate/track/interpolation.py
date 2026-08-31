@@ -1,8 +1,7 @@
 """Linear interpolation of tracklet gaps (official BoT-SORT ``tools/interpolation.py``).
 
 The official BoT-SORT release ships DTI (disconnected track interpolation) as a
-separate offline step that the GTA-Link reference (sjc042/gta-link) does not
-include, so this pipeline had neither. It fills short gaps inside a finished
+separate offline step. It fills short gaps inside a finished
 tracklet by linearly interpolating the box between the detections that bracket
 the gap, which recovers detections lost to occlusion and raises DetA/recall
 without touching association.
@@ -26,8 +25,9 @@ is not there.
 
 What downstream stages require of a synthesized row (audited, 2026-08-06)
 -------------------------------------------------------------------------
-Pipeline order is ``bbox_detector -> reid -> track -> gta_link -> [here] ->
-calibration -> jersey_number_detect -> tracklet_agg -> team -> team_side``.
+Pipeline order was ``bbox_detector -> reid -> track -> gta_link -> [here] ->
+calibration -> jersey_number_detect -> tracklet_agg -> team -> team_side``
+(``gta_link`` has since been replaced by ``split_merge``).
 ``reid`` runs BEFORE ``track``, so a row created here can never have the columns
 ``reid`` produces (``embeddings``, ``visibility_scores``, ``body_masks``,
 ``role_detection``, ``role_confidence``).
@@ -55,18 +55,18 @@ Status after the role/team rework
 ---------------------------------
 The audit above describes the pipeline at 2026-08-06 (prtreid ``reid``, k-means
 ``team``, ``team_side``). Those stages are gone: role and team now come from
-``crop_filter`` (runs before ``gta_link``), ``team_embed`` and ``role_team``. A
+``crop_filter`` (runs before ``split_merge``), ``team_embed`` and ``role_team``. A
 synthesized row carries no ``crop_single``/``crop_rT``/``crop_rB`` and no
 ``team_embedding``, so the module is NOT in ``soccernet.yaml``'s ``pipeline:``; it is
-kept as a module only for ``scripts/tune_gta_kaggle.py`` (tracking-only states).
+kept as a module only for tracking-only experiments.
 
 Consequence, and why this module still exists
 ---------------------------------------------
 The tracking-metrics path is unaffected: ``scripts/reference_metrics.py
 --skip gsr jersey_number calibration`` needs only ``track_id``, ``bbox_ltwh`` and
 ``image_id``, and a state that stops after this stage never reaches ``team``.
-That is exactly the scoring path the GTA/interpolation tuning uses, so the stage
-can be swept in place with ``enabled: true`` and no other change.
+That is the scoring path a tracking-only experiment uses, so the stage can be
+swept in place with ``enabled: true`` and no other change.
 
 Turning it on in the FULL pipeline additionally requires ``team`` to tolerate
 rows without ``embeddings`` (drop them from the tracklet mean, or carry the
@@ -168,7 +168,7 @@ def interpolate_detections(detections: pd.DataFrame, metadatas: pd.DataFrame,
 
 
 class LinearInterpolation(VideoLevelModule):
-    """Offline DTI as a pipeline stage, directly after ``gta_link``.
+    """Offline DTI as a pipeline stage, directly after ``split_merge``.
 
     ``enabled: false`` is a true no-op on the detections; it only stamps the
     ``interpolated`` column (all False) so the module's output contract holds.

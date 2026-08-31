@@ -1,6 +1,6 @@
 """Team-appearance embeddings of sampled crops per tracklet (``team_embed`` stage).
 
-For every tracklet (final ``track_id``, after GTA-Link) the rows on the position
+For every tracklet (final ``track_id``, after ``split_merge``) the rows on the position
 grid (every ``POS_STRIDE``-th frame) are taken and at most ``CROPS_PER_TRK`` of
 them, evenly spaced in time, are embedded with ``osnet_team`` — single and multi
 crops alike, exactly as the notebook embedded every sampled crop and applied the

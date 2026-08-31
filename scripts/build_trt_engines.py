@@ -10,7 +10,7 @@ What it builds
 
 Documented fallbacks (NOT converted here)
 -----------------------------------------
-* OSNet-AIN (tracker appearance and GTA-Link) runs on PyTorch in fp16 (torch autocast on
+* OSNet-AIN (tracker appearance and split_merge) runs on PyTorch in fp16 (torch autocast on
   CUDA, fp32 outputs), baked in after the Kaggle fp16/fp32 validation: both stages build
   the same embedder module so they produce the same embedding for the same crop, and the
   run audit fails on a checkpoint-pin mismatch. Neither stage has a ``use_tensorrt`` path.
@@ -130,7 +130,7 @@ def main(argv=None):
         status["YOLO11-L detector"] = f"SKIP (weights unavailable: {e})"
 
     # 2) documented fallbacks (not converted; run on PyTorch)
-    status["OSNet-AIN (tracker + GTA-Link)"] = (
+    status["OSNet-AIN (tracker + split_merge)"] = (
         "FALLBACK (PyTorch, fp16 autocast) — by design: both stages must embed a "
         "crop identically, enforced by the run audit")
     status["NBJW-Calib HRNet (pitch/calibration)"] = (

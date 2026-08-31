@@ -37,7 +37,7 @@ cfg:
 
   # --- caching: keyed on a sha256 of the manifest CONTENT (track ids + boxes +
   # rule + stride + legibility_thr + the sha256 of BOTH recogniser checkpoints),
-  # so retuning tracking/GTA-Link, moving the gate, or staging a different
+  # so retuning tracking/split_merge, moving the gate, or staging a different
   # checkpoint under the same filename all invalidate it automatically.
   cache_dir: ${project_dir}/jn_cache
   use_cache: true

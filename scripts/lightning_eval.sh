@@ -6,8 +6,9 @@
 # the cuDNN/torch_shm_manager issue on the Studio.
 #
 # This repo has a SINGLE entry config (`soccernet`): YOLO11-SNFT ->
-# BoT-SORT·SOF (boxmot + OSNet-AIN) -> crop filter -> GTA-Link (same OSNet-AIN) ->
-# BroadTrack -> osnet_team embeddings -> role/team rules -> jn_pipeline_gsr -> voting -> audit.
+# BoT-SORT·SOF (boxmot + OSNet-AIN) -> crop filter -> split_merge (DBSCAN split +
+# appearance merge, same OSNet-AIN) -> BroadTrack -> osnet_team embeddings ->
+# role/team rules -> jn_pipeline_gsr -> voting -> audit.
 #
 # BroadTrack and the jersey stage each need a one-off provisioning step (both are
 # Docker-free). Run them before the first evaluation:

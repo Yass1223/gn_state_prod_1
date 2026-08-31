@@ -1,4 +1,4 @@
-"""OSNet-AIN appearance model, shared by the tracker and by GTA-Link.
+"""OSNet-AIN appearance model, shared by the tracker and by the split_merge stage.
 
 Checkpoint
 ----------
@@ -355,8 +355,8 @@ def crop_ltrb(image: np.ndarray, box) -> np.ndarray:
     frame. Testing emptiness alone would hand the appearance model that slice.
 
     Callers decide what a degenerate box means: the tracker substitutes `EMPTY_CROP`
-    to keep batch order aligned with the detection order, while GTA-Link skips the
-    detection and leaves it a zero feature so it can never be merged.
+    to keep batch order aligned with the detection order, while split_merge skips the
+    detection and leaves it a zero feature so it is never clustered or merged.
     """
     height, width = image.shape[:2]
     x1 = max(0, int(box[0]))
@@ -454,7 +454,7 @@ class OsnetAin:
     71.08, GS-HOTA 64.98 vs 64.70, calibration bit-identical - deltas inside the
     observed run-to-run noise), so there is no precision switch. On CPU, autocast is
     unavailable and the forward runs fp32; `info` records the effective arithmetic.
-    The tracking pass and the GTA-Link pass build this same module, so both embed a
+    The tracking pass and the split_merge pass build this same module, so both embed a
     crop identically by construction.
     """
 

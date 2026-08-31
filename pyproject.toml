@@ -1,7 +1,7 @@
 [project]
 name = "sn-gamestate"
 version = "1.0.0"
-description = "SoccerNet Game State Reconstruction — clean pipeline (BoT-SORT·SOF + GTA-Link + BroadTrack + jn_pipeline_gsr)"
+description = "SoccerNet Game State Reconstruction — clean pipeline (BoT-SORT·SOF + split_merge + BroadTrack + jn_pipeline_gsr)"
 readme = "README.md"
 requires-python = ">=3.9,<3.10"
 
@@ -20,7 +20,7 @@ dependencies = [
     "soccernet==0.1.55",
     "torch==1.13.1",
     # torchreid (the VlSomers/bpbreid fork) provides the OSNet backbones: osnet_ain_x1_0
-    # for the tracker + GTA-Link (sn_gamestate/reid/osnet_ain.py) and osnet_x1_0 for the
+    # for the tracker + split_merge (sn_gamestate/reid/osnet_ain.py) and osnet_x1_0 for the
     # team-appearance model (sn_gamestate/reid/osnet_team.py). prtreid was removed with
     # the `reid` stage: role and team now come from the role_team stage.
     "torchreid @ git+https://github.com/VlSomers/bpbreid",
@@ -38,12 +38,12 @@ dependencies = [
     # leaves albumentations unpinned. Verified working on 1.3.1 and 1.4.24.
     "albumentations<2",
     # Used directly by the pipeline: KMeans + DBSCAN (role_team rules) and
-    # AgglomerativeClustering (gta_link). Never listed as a dependency and not
-    # pulled in transitively. Python 3.9 caps this at 1.6.1 (scikit-learn 1.7
+    # DBSCAN(metric="precomputed") (split_merge). Never listed as a dependency and
+    # not pulled in transitively. Python 3.9 caps this at 1.6.1 (scikit-learn 1.7
     # requires >=3.10); the bound is explicit so relaxing requires-python can't
-    # silently jump versions. Call sites are version-agnostic: gta_link falls back
-    # from metric= to affinity=; the rules use KMeans(n_init=10) and
-    # DBSCAN(metric="cosine"), both present since 0.2x.
+    # silently jump versions. Call sites are version-agnostic: the rules use
+    # KMeans(n_init=10) and DBSCAN(metric="cosine"), split_merge uses
+    # DBSCAN(metric="precomputed"), all present since 0.2x.
     "scikit-learn<1.7",
     # Crop preprocessing of the team-appearance model (PIL bilinear resize, as the
     # notebook). Pillow is also a transitive dependency of tracklab/ultralytics; the

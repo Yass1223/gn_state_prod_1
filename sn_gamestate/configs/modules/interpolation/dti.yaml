@@ -1,15 +1,16 @@
 # Linear interpolation of tracklet gaps (DTI), the offline step official BoT-SORT
-# ships as tools/interpolation.py and GTA-Link (sjc042) does not have. Runs directly
-# after `gta_link`, on final track ids.
+# ships as tools/interpolation.py. Would run directly after `split_merge`, on final
+# track ids.
 #
 # NOT in the production pipeline (soccernet.yaml `pipeline:`): synthesized rows
-# carry no crop label (crop_filter runs before gta_link) and no team_embedding, so
-# the role_team stage would meet rows without the columns it reads. The module is
-# kept for scripts/tune_gta_kaggle.py, whose tracking-only states need only
-# track_id / bbox_ltwh / image_id. enabled: false is a true no-op.
+# carry no crop label (crop_filter runs before split_merge) and no team_embedding,
+# so the role_team stage would meet rows without the columns it reads. The module
+# is kept only for tracking-only experiments (states that stop after this stage and
+# are scored with scripts/reference_metrics.py --skip gsr jersey_number
+# calibration). enabled: false is a true no-op.
 #
 # n_dti / n_min are UNTUNED (the values below are the brief's starting points, not
-# measured optima). The Kaggle sweep on YOLO11L sets them.
+# measured optima).
 _target_: sn_gamestate.track.interpolation.LinearInterpolation
 cfg:
   enabled: false

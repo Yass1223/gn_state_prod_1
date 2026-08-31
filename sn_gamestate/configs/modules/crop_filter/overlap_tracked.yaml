@@ -1,9 +1,9 @@
 # Single / multi label for every detector box (tracked-only contaminator rule).
 #
-# Runs after `track` (needs track_id) and before `gta_link`. Every detection gets
+# Runs after `track` (needs track_id) and before `split_merge`. Every detection gets
 # crop_single / crop_rT / crop_rB / crop_trigger; no detection is removed. Stages
-# that must ignore multi crops (team_embed, role_team) read crop_single; the
-# jersey stage uses every crop.
+# that must ignore multi crops (split_merge, team_embed, role_team) read
+# crop_single; the jersey stage uses every crop.
 #
 # Rule and thresholds are those of tracklet-splitter_dbscan_4_raw.ipynb
 # (label_single, contam_mode="tracked") and the contaminator-selection note:

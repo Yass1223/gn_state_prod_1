@@ -1,6 +1,6 @@
 """Single / multi label for every detector box (tracked-only contaminator rule).
 
-Runs directly after ``track`` (BoT-SORT), before ``gta_link``. Every detection of a
+Runs directly after ``track`` (BoT-SORT), before ``split_merge``. Every detection of a
 frame receives three columns, tracked or not:
 
     crop_rT     max over contaminators B of inter(T, B) / area(T)
@@ -10,8 +10,9 @@ frame receives three columns, tracked or not:
                 ratio which made T multi, or NaN when T is single / no contaminator
 
 A crop is "single" when it shows one person. Downstream stages that must ignore
-multi crops (the team embedding and the role/team rules) read ``crop_single``; no
-stage recomputes overlaps. The jersey stage does not read it (it uses every crop).
+multi crops (the team embedding and the role/team rules) read ``crop_single``, and
+the ``split_merge`` stage clusters and merges on single crops only; no stage
+recomputes overlaps. The jersey stage does not read it (it uses every crop).
 
 Contaminator set C(T) — which boxes may make T multi — is selected by
 ``contam_mode``:
@@ -33,7 +34,7 @@ the tracker because "has a track_id" exists only from that point on.
 
 Two facts recorded for the audit rather than hidden:
 
-* GTA-Link's per-frame collision guard can later set a track_id to NaN. A box that
+* ``split_merge`` can later leave a detection unassigned (track_id NaN). A box that
   vetoed another box here may therefore be untracked by the time the role stage
   runs. ``crop_trigger`` lets the audit count such cases; the label is NOT
   recomputed.

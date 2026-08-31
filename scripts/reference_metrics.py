@@ -30,9 +30,9 @@ Rigor rules
 * Any metric that cannot be computed is reported as null with a "reason" — never a
   silently wrong number.
 * Per-stage attribution: DetA isolates the detector, AssA/IDF1/IDSW isolate association
-  (tracking + ReID). The GTA-Link / tracker / calibration contributions are measured by
+  (tracking + ReID). The split_merge / tracker / calibration contributions are measured by
   running this script on states produced by different pipeline configs (e.g. with and
-  without gta_link, NBJW vs BroadTrack) and comparing the saved files; pass several
+  without split_merge, NBJW vs BroadTrack) and comparing the saved files; pass several
   --state/--label pairs to get a combined comparison table.
 
 Inputs

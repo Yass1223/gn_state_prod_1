@@ -156,11 +156,19 @@ class RunAudit(VideoLevelModule):
             "cmc_identity_warn": g("cmc_identity_warn", 0.02),
             "crop_clipped_warn": g("crop_clipped_warn", 0.001),
             "zero_emb_warn": g("zero_emb_warn", 0.01),
+            "split_merge_unassigned_warn": g("split_merge_unassigned_warn", 0.05),
+            "split_merge_zero_emb_warn": g("split_merge_zero_emb_warn", 0.01),
         }
+        # Split/merge stage sidecar (written by sn_gamestate.track.split_merge_api)
+        # and the settings/checkpoint it must have run with.
+        d = getattr(cfg, "split_merge_sidecar_dir", None)
+        self.split_merge_sidecar_dir = Path(str(d)) if d else None
+        self.expected_split_merge = {str(k): v for k, v in
+                                     (getattr(cfg, "expected_split_merge", {}) or {}).items()}
         # Tracker diagnostics sidecars (written by sn_gamestate.track.bot_sort) and
         # the declared tracker/embedder configuration to hold the run against. The
         # expected values arrive resolved by OmegaConf interpolation from the track
-        # and gta_link module configs (see modules/audit/run_audit.yaml), so a
+        # and split_merge module configs (see modules/audit/run_audit.yaml), so a
         # mismatch between what RAN and what the configs DECLARE is detectable.
         sidecar = getattr(cfg, "track_sidecar_dir", None)
         self.track_sidecar_dir = Path(str(sidecar)) if sidecar else None
@@ -241,7 +249,8 @@ class RunAudit(VideoLevelModule):
         if len(tracked) and share < self.thr["single_share_warn"]:
             c.set(WARN, f"only {share:.1%} of tracked detections labelled single")
         # tracked-only rule: every veto must come from a box that was tracked when the
-        # filter ran. GTA-Link's collision guard can NaN a track_id afterwards; count it.
+        # filter ran. split_merge can leave a detection unassigned (track_id NaN)
+        # afterwards; count it.
         mode = str(self.expected_crop_filter.get("contam_mode", "tracked"))
         trig = det["crop_trigger"]
         fired = trig.notna()
@@ -258,12 +267,12 @@ class RunAudit(VideoLevelModule):
             now_untracked = int(tid_now.reindex(trig_idx[valid]).isna().sum())
             c.observed["vetoes_by_box_now_untracked"] = now_untracked
             if now_untracked:
-                c.set(INFO, f"{now_untracked} vetoes came from boxes untracked after GTA-Link")
+                c.set(INFO, f"{now_untracked} vetoes came from boxes split_merge left unassigned")
         return c
 
     def _check_track(self, det, tracked):
-        c = Check("track + gta_link", "most detections carry a track_id; "
-                                      "tracklets are non-trivial")
+        c = Check("track + split_merge", "most detections carry a track_id; "
+                                         "tracklets are non-trivial")
         if "track_id" not in det.columns:
             c.observed["track_id"] = "column missing"
             return c.set(FAIL, "track_id column missing")
@@ -308,7 +317,7 @@ class RunAudit(VideoLevelModule):
     def _check_tracker_internals(self, seq, metadatas):
         c = Check(
             "track internals (BoT-SORT \u00b7 SOF + OSNet-AIN)",
-            "track and gta_link configs pin the same OSNet-AIN weights (both stages "
+            "track and split_merge configs pin the same OSNet-AIN weights (both stages "
             "build the same embedder module, so the arithmetic is identical by "
             "construction); a diagnostics sidecar covers every frame; the settings "
             "and checkpoint digest that RAN equal the ones the configs declare; "
@@ -319,15 +328,15 @@ class RunAudit(VideoLevelModule):
         # Config-level identity between the two embedding stages first: each stage
         # sha-verifies its own load at runtime, so equal pins guarantee equal weights
         # even before the sidecar is opened.
-        for a, b, what in (("ain_sha256_track", "ain_sha256_gta", "ain_sha256"),
-                           ("ain_file_track", "ain_file_gta", "ain_file"),
-                           ("ain_revision_track", "ain_revision_gta", "ain_revision")):
+        for a, b, what in (("ain_sha256_track", "ain_sha256_split_merge", "ain_sha256"),
+                           ("ain_file_track", "ain_file_split_merge", "ain_file"),
+                           ("ain_revision_track", "ain_revision_split_merge", "ain_revision")):
             va, vb = exp.get(a), exp.get(b)
-            c.observed[what] = {"track": va, "gta_link": vb}
+            c.observed[what] = {"track": va, "split_merge": vb}
             if va in (None, "", "None") or vb in (None, "", "None"):
-                c.set(FAIL, f"{what} not pinned in both track and gta_link configs")
+                c.set(FAIL, f"{what} not pinned in both track and split_merge configs")
             elif str(va) != str(vb):
-                c.set(FAIL, f"track and gta_link disagree on {what}")
+                c.set(FAIL, f"track and split_merge disagree on {what}")
 
         path, data = self._find_track_sidecar(seq, metadatas)
         c.observed["sidecar"] = str(path) if path else None
@@ -404,6 +413,167 @@ class RunAudit(VideoLevelModule):
                             f"(detection index outside the frame)")
             if n > 1 and corners == 0:
                 c.set(WARN, "the motion estimator never found a keypoint")
+        return c
+
+    # ------------------------------------------------- split / merge stage --
+    def _check_split_merge(self, seq, det, tracked):
+        """Inputs, internals and outputs of the split_merge stage.
+
+        Inputs (from the sidecar): the stage received the crop filter's labels and
+        at least one clean detection, and embedded its crops (zero-embedding
+        share). Internals: the settings and checkpoint that ran equal the
+        configured ones; the split/merge/pass counts are mutually consistent
+        (fragments >= tracklets, trajectories == ordinary fragments - merges, every
+        tracked input row is either assigned or unassigned, every accepted merge
+        distance <= tau). Outputs (recomputed from the detections): the tracked
+        rows and tracklets the audit sees equal what the stage reports, no
+        (image_id, track_id) collision, a clean detection in every trajectory,
+        unassigned share within threshold."""
+        c = Check("split_merge (DBSCAN split + appearance merge)",
+                  "sidecar for the sequence; settings (eps, min_samples, tau) and checkpoint "
+                  "that ran equal the configured ones; crop_single received and clean "
+                  "detections present; split/merge/pass counts consistent with each other "
+                  "and with the detections; one detection per frame per trajectory; a clean "
+                  "detection in every trajectory; few unassigned detections")
+        exp = self.expected_split_merge
+        c.observed["expected"] = dict(exp)
+        data = self._read_sidecar(self.split_merge_sidecar_dir, seq)
+        c.observed["sidecar"] = (str(self.split_merge_sidecar_dir / f"{seq}.json")
+                                if self.split_merge_sidecar_dir else None)
+        if data is None:
+            return c.set(FAIL, "no split_merge sidecar for this sequence (stage did not run, "
+                               "audit_dir unset, or unwritable)")
+
+        # --- settings and checkpoint that ran
+        st = data.get("settings") or {}
+        emb = data.get("embedder") or {}
+        c.observed["ran"] = dict(st)
+        c.observed["ran_embedder_sha256"] = emb.get("sha256")
+        c.observed["ran_embedder_precision"] = emb.get("precision")
+        for key in ("eps", "min_samples", "tau"):
+            want, got = exp.get(key), st.get(key)
+            if want is None or got is None:
+                c.set(FAIL, f"{key} not declared (config) or not recorded (sidecar)")
+            elif abs(float(got) - float(want)) > 1e-9:
+                c.set(FAIL, f"{key} that ran ({got}) != configured ({want})")
+        want_sha = exp.get("ain_sha256")
+        if want_sha in (None, "", "None"):
+            c.set(FAIL, "ain_sha256 not pinned in the split_merge config")
+        elif not emb.get("sha256"):
+            c.set(FAIL, "sidecar records no embedder digest")
+        elif str(emb.get("sha256")) != str(want_sha):
+            c.set(FAIL, f"embedder sha256 that ran ({emb.get('sha256')}) != configured ({want_sha})")
+
+        # --- inputs the stage received
+        inp = data.get("inputs") or {}
+        n_in = int(inp.get("tracked") or 0)
+        c.observed["inputs"] = dict(inp)
+        if not data.get("ran", False):
+            if n_in == 0 and len(tracked) == 0:
+                return c.set(INFO, "no tracked detection reached the stage")
+            return c.set(FAIL, "the stage recorded that it did not run on this sequence")
+        if inp.get("crop_single_present") is not True:
+            c.set(FAIL, "the stage did not receive the crop filter's crop_single column")
+        if n_in and int(inp.get("single_tracked") or 0) == 0:
+            c.set(FAIL, "no clean (crop_single) detection among the tracked ones; the splitter "
+                        "had nothing to cluster and no fragment can found a trajectory")
+        n_zero = int(inp.get("zero_embeddings") or 0)
+        if n_in:
+            if n_zero == n_in:
+                c.set(FAIL, "every tracked detection embedded to zero")
+            elif _share(n_zero, n_in) > self.thr["split_merge_zero_emb_warn"]:
+                c.set(WARN, f"{_share(n_zero, n_in):.1%} tracked detections with an all-zero "
+                            f"embedding (excluded from clustering and merging)")
+        if int(inp.get("frames_without_path") or 0) or int(inp.get("frames_unreadable") or 0):
+            c.set(WARN, f"{inp.get('frames_without_path')} frame(s) without path, "
+                        f"{inp.get('frames_unreadable')} unreadable")
+
+        # --- internal consistency of the split, the merge and the two passes
+        sp = data.get("split") or {}
+        mg = data.get("merge") or {}
+        p1 = data.get("pass1") or {}
+        p2 = data.get("pass2") or {}
+        outp = data.get("outputs") or {}
+        c.observed["split"] = {k: v for k, v in sp.items() if k != "per_tracklet"}
+        c.observed["merge"] = {k: v for k, v in mg.items() if k != "merge_distances"}
+        c.observed["pass1"] = dict(p1)
+        c.observed["pass2"] = dict(p2)
+        c.observed["outputs"] = dict(outp)
+        n_trk_in = int(inp.get("tracklets") or 0)
+        n_frag = int(sp.get("fragments") or 0)
+        n_ord = int(mg.get("ordinary_fragments") or 0)
+        n_allm = int(mg.get("allmulti_fragments") or 0)
+        n_merges = int(mg.get("merges") or 0)
+        n_traj = int(mg.get("trajectories") or 0)
+        if n_frag < n_trk_in:
+            c.set(FAIL, f"{n_frag} fragments from {n_trk_in} tracklets (the split can only add)")
+        if n_ord + n_allm != n_frag:
+            c.set(FAIL, f"ordinary ({n_ord}) + clean-less ({n_allm}) fragments != {n_frag}")
+        if n_traj != n_ord - n_merges:
+            c.set(FAIL, f"trajectories ({n_traj}) != ordinary fragments ({n_ord}) - merges ({n_merges})")
+        if n_in and n_ord and n_traj == 0:
+            c.set(FAIL, "no trajectory although ordinary fragments existed")
+        tau = exp.get("tau")
+        dists = mg.get("merge_distances") or []
+        if dists:
+            c.observed["merge"]["merge_distance_max"] = round(float(max(dists)), 4)
+            c.observed["merge"]["merge_distance_median"] = round(float(np.median(dists)), 4)
+            if len(dists) != n_merges:
+                c.set(FAIL, f"{len(dists)} merge distances recorded for {n_merges} merges")
+            if tau is not None and max(dists) > float(tau) + 1e-6:
+                c.set(FAIL, f"a merge was accepted at distance {max(dists):.4f} > tau {tau}")
+        n_assigned = int(outp.get("rows_assigned") or 0)
+        n_unassigned = int(outp.get("rows_unassigned") or 0)
+        if n_assigned + n_unassigned != n_in:
+            c.set(FAIL, f"assigned ({n_assigned}) + unassigned ({n_unassigned}) != tracked input ({n_in})")
+        if int(p2.get("unassigned") or 0) != n_unassigned:
+            c.set(FAIL, f"pass 2 unassigned ({p2.get('unassigned')}) != rows_unassigned ({n_unassigned})")
+        if int(p1.get("single_anomaly") or 0):
+            c.set(WARN, f"{p1.get('single_anomaly')} clean detection(s) shared a frame inside one "
+                        f"trajectory after the merge (set aside)")
+        if int(outp.get("frame_collisions") or 0):
+            c.set(FAIL, f"the stage reported {outp.get('frame_collisions')} frame collision(s) in its output")
+        if int(outp.get("trajectories_without_clean") or 0):
+            c.set(FAIL, f"the stage reported {outp.get('trajectories_without_clean')} trajectories "
+                        f"without a clean detection")
+
+        # --- outputs, recomputed from the detections the audit receives
+        if "track_id" not in det.columns:
+            return c.set(FAIL, "track_id column missing")
+        n_tracked_now = int(len(tracked))
+        n_tracklets_now = int(tracked["track_id"].nunique()) if n_tracked_now else 0
+        c.observed["detections_tracked_now"] = n_tracked_now
+        c.observed["detections_tracklets_now"] = n_tracklets_now
+        if n_tracked_now != n_assigned:
+            c.set(FAIL, f"{n_tracked_now} tracked detections in the state, the stage assigned {n_assigned}")
+        if n_tracklets_now != int(outp.get("tracklets") or 0) or n_tracklets_now != n_traj:
+            c.set(FAIL, f"{n_tracklets_now} tracklets in the state, the stage reports "
+                        f"{outp.get('tracklets')} (trajectories {n_traj})")
+        if n_tracked_now:
+            coll = int(tracked.duplicated(subset=["image_id", "track_id"]).sum())
+            c.observed["frame_collisions_recomputed"] = coll
+            if coll:
+                c.set(FAIL, f"{coll} (image_id, track_id) collision(s): two detections of one "
+                            f"trajectory in one frame")
+            if "crop_single" in tracked.columns:
+                has_clean = tracked.groupby("track_id")["crop_single"].apply(
+                    lambda s: bool(s.astype(bool).any()))
+                n_noclean = int((~has_clean).sum())
+                c.observed["trajectories_without_clean_recomputed"] = n_noclean
+                if n_noclean:
+                    c.set(FAIL, f"{n_noclean} trajector(ies) hold no clean detection")
+                lens = tracked.groupby("track_id").size()
+                c.observed["trajectory_len_median"] = float(lens.median())
+                c.observed["trajectory_len_min"] = int(lens.min())
+            else:
+                c.set(FAIL, "crop_single column missing from the state")
+        share_un = _share(n_unassigned, n_in)
+        c.observed["unassigned_share"] = round(share_un, 4)
+        if n_in and share_un > self.thr["split_merge_unassigned_warn"]:
+            c.set(WARN, f"{share_un:.1%} of the tracked detections could not be placed "
+                        f"(track_id set to NaN)")
+        c.observed["tracklets_split"] = sp.get("tracklets_split")
+        c.observed["merges"] = n_merges
         return c
 
     def _check_calibration(self, seq, tracked):
@@ -760,6 +930,7 @@ class RunAudit(VideoLevelModule):
             self._check_detector(det, metadatas),
             self._check_track(det, tracked),
             self._check_tracker_internals(seq, metadatas),
+            self._check_split_merge(seq, det, tracked),
             self._check_crop_filter(det, tracked),
             self._check_calibration(seq, tracked),
             self._check_team_embed(seq, tracked),
