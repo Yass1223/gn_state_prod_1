@@ -12,7 +12,7 @@
 # sidecar are written either way, so the state has the same shape.
 # No detection row is deleted. A tracklet with no finite projection is kept.
 #
-# margin_m is UNTUNED: 5 m is an assumption chosen to absorb projection error at
+# margin_m is UNTUNED: 3.5 m is an assumption chosen to absorb projection error at
 # the touchline and players a step outside it (throw-ins, retrieving a ball)
 # while still gating the benches and the area behind the goals. Sweep it on the
 # valid split before trusting it; the audit reports how many tracklets it gated
@@ -20,5 +20,5 @@
 _target_: sn_gamestate.pitch_gate.PitchGate
 cfg:
   enabled: true
-  margin_m: 5.0
+  margin_m: 3.5
   audit_dir: ${project_dir}/audit/pitch_gate
