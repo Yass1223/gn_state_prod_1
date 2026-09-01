@@ -117,6 +117,10 @@ class _Diagnostics:
 
     Writing is best-effort: a failure here degrades the audit, and must never take down
     a tracking run.
+
+    Every frame's FULL 2x3 SOF warp is recorded (tx, ty, a00, a01, a10, a11): the
+    motion_gate stage compensates camera motion with exactly the warps that ran here,
+    so the two stages cannot disagree about the camera's motion.
     """
 
     def __init__(self, out_dir, settings: dict):
@@ -286,6 +290,7 @@ class BotSortSOF(_TracklabBotSORT):
             n_det=int(len(dets)), n_high=int(len(high)),
             identity=bool(np.array_equal(warp, IDENTITY)),
             tx=float(warp[0, 2]), ty=float(warp[1, 2]), a00=float(warp[0, 0]),
+            a01=float(warp[0, 1]), a10=float(warp[1, 0]), a11=float(warp[1, 1]),
             corners=int(len(keypoints)) if keypoints is not None else 0,
             clipped=n_clipped, tiny=n_tiny,
             zero_emb=int((~embeddings[high].any(axis=1)).sum()) if len(high) else 0,
