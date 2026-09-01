@@ -6,8 +6,6 @@
 #   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
 #   crop_filter    single/multi label, tracked-only rule      -> crop_single, crop_rT, crop_rB, crop_trigger
 #   split_merge    DBSCAN tracklet split + appearance merge   -> track_id (final)
-#   motion_gate    motion-continuity gate on final trajectories (switchable; CMC-aware)
-#                  -> track_id (NaN for disabled detections), motion_gate_disabled
 #                  (same OSNet-AIN as the tracker; reads crop_single)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
 #   pitch_gate     off-pitch tracklets (mean bbox_pitch outside  -> track_id NaN on their rows,
@@ -48,7 +46,6 @@ defaults:
   - modules/track: botsort_ain
   - modules/crop_filter: overlap_tracked
   - modules/split_merge: split_merge
-  - modules/motion_gate: motion_gate
   - modules/interpolation: dti
   - modules/calibration: broadtrack
   - modules/pitch_gate: pitch_gate
@@ -64,8 +61,6 @@ defaults:
 #     later stage reads the same crop_single label; split_merge reads it too;
 #   * split_merge BEFORE everything that depends on final track ids (team_embed,
 #     role_team and jersey recognition are tracklet-level; tracklet_agg votes per track_id);
-#   * motion_gate directly after split_merge (it gates detections of FINAL trajectories,
-#     using the tracker's recorded SOF warps) and before every per-tracklet consumer;
 #   * calibration before role_team (it consumes bbox_pitch);
 #   * pitch_gate right after calibration (it needs bbox_pitch) and before team_embed:
 #     a gated tracklet loses its track_id, and every later stage groups by track_id;
@@ -77,7 +72,6 @@ pipeline:
   - track
   - crop_filter
   - split_merge
-  - motion_gate
   - calibration
   - pitch_gate
   - team_embed

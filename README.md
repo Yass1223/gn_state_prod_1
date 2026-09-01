@@ -4,7 +4,7 @@ A single, rigorously-scoped GSR pipeline. One entry config, one path, no alterna
 backends: every file in this repository belongs to the active pipeline.
 
 ```
-bbox_detector -> track -> crop_filter -> split_merge -> motion_gate -> calibration -> pitch_gate -> team_embed
+bbox_detector -> track -> crop_filter -> split_merge -> calibration -> pitch_gate -> team_embed
               -> role_team -> jersey_number_detect -> tracklet_agg -> audit
 ```
 
@@ -14,7 +14,6 @@ bbox_detector -> track -> crop_filter -> split_merge -> motion_gate -> calibrati
 | `track` | BoT-SORT · SOF + OSNet-AIN (boxmot) | calls boxmot's `BotSort` directly with injected embeddings and external SOF camera motion; per-frame diagnostics sidecar for the audit |
 | `crop_filter` | single / multi label per detection, tracked-only rule | rT ≤ 0.25, rB < 0.40; only boxes carrying a `track_id` may make another box multi; every detection gets `crop_single`/`crop_rT`/`crop_rB`/`crop_trigger`; no detection is removed |
 | `split_merge` | DBSCAN tracklet splitting + agglomerative fragment merging on appearance | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); clusters and merges on `crop_single` detections only; `eps 0.2, min_samples 5, tau 0.60`; one detection per trajectory and frame; a detection that cannot be placed gets `track_id` NaN; per-sequence sidecar for the audit |
-| `motion_gate` | motion-continuity gate on final trajectories (on/off switch) | per detection: at least `min_support 3` other detections of the SAME trajectory within `window 25` frames and within `speed_max_px 40 * dt + slack_px 20` pixels, in camera-motion-compensated coordinates (the tracker's recorded per-frame SOF warps, chained; nothing re-estimated); a failing detection is disabled (`track_id` NaN, original in `track_id_pre_motion_gate`, flag `motion_gate_disabled`); trajectories with <= `min_support` detections are skipped; `speed_max_px`/`slack_px`/`window` untuned; `enabled` switch (off = columns and sidecar still written, nothing touched); per-sequence sidecar for the audit |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
 | `pitch_gate` | off-pitch tracklet gate on the mean projected position | per final `track_id`, the mean of `bbox_pitch` (bottom-middle) over the rows with a finite projection; off-pitch iff `abs(mean_x) > 52.5 + margin_m` or `abs(mean_y) > 34 + margin_m`; the rows of an off-pitch tracklet lose their `track_id` (NaN, so no later stage and no export sees them), the original id stays in `track_id_pregate`; `enabled` switch (off = columns and sidecar still written, `track_id` untouched); `margin_m 5` untuned; a tracklet without a projection is kept; no detection is removed; per-sequence sidecar for the audit |
 | `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
@@ -58,32 +57,6 @@ detection in every trajectory, unassigned share).
 There is **no `pitch` stage**: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 detectors internally and emits camera parameters directly.
 
-### The `motion_gate` stage
-
-An identity switch or a wrong box that survives `split_merge` puts a detection inside a
-trajectory whose motion it cannot share. `motion_gate`
-(`sn_gamestate/track/motion_gate.py` + `motion_gate_api.py`) runs directly after
-`split_merge`, on final trajectories. Per detection it counts the other detections of the
-SAME trajectory within `window` frames whose distance is at most
-`speed_max_px * dt + slack_px` — measured on the bottom-middle point in
-camera-motion-compensated coordinates, obtained by chaining the per-frame SOF warps the
-tracker recorded in its diagnostics sidecar (the same warps that steered tracking; nothing
-is re-estimated). A detection with fewer than `min_support` such supporters is disabled:
-`track_id` NaN (no later stage and no export sees it), the original id in
-`track_id_pre_motion_gate`, flag `motion_gate_disabled`. A trajectory with at most
-`min_support` detections is skipped whole (the criterion is unsatisfiable there); no
-detection row is deleted. Roles do not exist yet at this position, so the gate applies to
-every trajectory. If the gate is enabled and the tracker sidecar is absent or predates the
-full-warp record, the stage fails loudly rather than judging motion without compensation.
-
-`speed_max_px` / `slack_px` / `window` (`configs/modules/motion_gate/motion_gate.yaml`)
-are untuned heuristics for 1080p 25 fps broadcasts; note the rule's reach grows with the
-frame gap (`speed_max_px * window + slack_px` ≈ 1 020 px at the defaults), so only
-detections implausibly far from EVERY same-trajectory neighbour are disabled.
-`tracklab -cn soccernet modules.motion_gate.cfg.enabled=false` runs the pipeline without
-the gate (the stage still writes its columns and sidecar), which is how its contribution
-is attributed with `scripts/reference_metrics.py`.
-
 ### The `pitch_gate` stage
 
 The detector is a single-class person model and no stage before `calibration` can tell
@@ -99,8 +72,7 @@ With `enabled: true` the rows of an off-pitch tracklet get `track_id` NaN: the e
 export drops them and `team_embed`, `role_team`, the jersey stage, `tracklet_agg` and the
 radar never see them, so the role rules run their k-means and outlier statistics on
 on-pitch tracklets only. With `enabled: false` `track_id` is untouched. Either way the stage
-writes `track_id_pregate` (the id it received, i.e. the id after `motion_gate`),
-`pitch_gate_offpitch` (the rule's
+writes `track_id_pregate` (the id `split_merge` left), `pitch_gate_offpitch` (the rule's
 outcome), `pitch_mean_x` / `pitch_mean_y` and a sidecar `audit/pitch_gate/<seq>.json`; no
 detection row is deleted and a tracklet without any projection is kept.
 
@@ -227,16 +199,11 @@ checked against what their configs declare: labels must agree with the stored ov
 ratios at the configured thresholds, the `split_merge` sidecar must record the configured
 `eps`/`min_samples`/`tau` and checkpoint digest, its split/merge/pass counts must be
 consistent with each other and with the final `track_id`s (one detection per frame per
-trajectory, a clean detection in every trajectory), the `motion_gate` sidecar must record
-the configured switch and parameters, its flagged rows must equal the motion-continuity
-rule recomputed from the tracker sidecar's SOF warps, and flagged rows and only flagged
-rows must have lost their `track_id` at that stage, the `pitch_gate` sidecar must record
+trajectory, a clean detection in every trajectory), the `pitch_gate` sidecar must record
 the configured switch and margin, its mean positions and off-pitch flags must equal the
 ones recomputed from `bbox_pitch`, and `track_id` must have been cleared on off-pitch
-tracklets if and only if the gate is enabled (the split_merge and crop_filter checks
-reconstruct the ids as `split_merge` left them through both gates, from
-`track_id_pregate` and `track_id_pre_motion_gate`; the calibration check uses the
-post-motion, pre-pitch view), every tracklet must carry a team embedding, the
+tracklets if and only if the gate is enabled (the split_merge, crop_filter and calibration
+checks compare against the pre-gate ids in `track_id_pregate`), every tracklet must carry a team embedding, the
 checkpoint digest and the rule parameters that ran (per-sequence sidecars under
 `audit/team_embed/`, `audit/role_team/`) must equal the configured ones, every tracked
 row must have a valid role, players/keepers a side and referees none. The jersey check is the strictest: the per-sequence cache
@@ -293,7 +260,7 @@ sn_gamestate/
   bbox_detector/yolo_snft_api.py
   crop_filter/crop_filter_api.py         # single/multi label, tracked-only rule
   reid/osnet_ain.py, osnet_team.py       # tracker/split_merge embedder; team-appearance model
-  track/bot_sort.py, split_merge.py, split_merge_api.py, motion_gate.py, motion_gate_api.py, hf_resolver.py
+  track/bot_sort.py, split_merge.py, split_merge_api.py, hf_resolver.py
   calibration/broadtrack_api.py          # calibration + image-to-pitch
   pitch_gate/pitch_gate_api.py           # off-pitch tracklet gate (mean bbox_pitch, on/off switch)
   team/rules.py, team_embed_api.py, role_team_api.py   # notebook rules; the two stages
