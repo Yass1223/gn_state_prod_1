@@ -89,9 +89,60 @@ fi
 # BroadTrack's torch::jit::load wants a SINGLE container file at models/<name>.pt; a .zip
 # torch.jit container is staged there by copy (rename), never unzipped.
 git lfs install --skip-repo || true
-if [ ! -d "${BT_SRC}/.git" ]; then
-  echo "==> Cloning evs-broadcast/BroadTrack (code; LFS smudge disabled)"
-  GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/evs-broadcast/BroadTrack.git "${BT_SRC}"
+# Source-code acquisition with fallbacks. Observed on Kaggle (2026-09-02): GitHub can
+# refuse anonymous git-over-HTTPS from shared IPs ("could not read Username for
+# 'https://github.com'"), transiently -- the same clone succeeded earlier the same day.
+#   a) git clone, 3 attempts with backoff (GIT_TERMINAL_PROMPT=0: refusals fail fast,
+#      never hang on a credential prompt)
+#   b) the GitHub codeload tarball (main, then master) -- a different endpoint that is
+#      often unaffected when smart-HTTP is throttled
+#   c) BT_SRC_FALLBACK_REPO, if set: a Hugging Face repo holding broadtrack_src.tar.gz --
+#      the caller's own PRIVATE snapshot under the EVS licence, like the weights mirror
+# The build needs only the source tree, not .git; tarball paths mark the tree with
+# SOURCE_SNAPSHOT.txt. Weight staging is unaffected: a tarball checkout has LFS pointer
+# stubs at models/*.pt, which the automatic weights fallback below replaces from HF.
+if [ ! -d "${BT_SRC}/.git" ] && [ ! -f "${BT_SRC}/CMakeLists.txt" ]; then
+  cloned=0
+  for attempt in 1 2 3; do
+    echo "==> Cloning evs-broadcast/BroadTrack (code; LFS smudge disabled; attempt ${attempt}/3)"
+    if GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 \
+         git clone https://github.com/evs-broadcast/BroadTrack.git "${BT_SRC}"; then
+      cloned=1; break
+    fi
+    rm -rf "${BT_SRC}"; sleep $((attempt * 10))
+  done
+  if [ "${cloned}" != "1" ]; then
+    echo "==> git clone failed 3x; trying the GitHub tarball endpoint"
+    got_tar=0
+    for ref in main master; do
+      if wget -q -O /tmp/broadtrack_src.tar.gz \
+           "https://codeload.github.com/evs-broadcast/BroadTrack/tar.gz/refs/heads/${ref}"; then
+        mkdir -p "${BT_SRC}"
+        if tar -xzf /tmp/broadtrack_src.tar.gz -C "${BT_SRC}" --strip-components=1 \
+           && [ -f "${BT_SRC}/CMakeLists.txt" ]; then
+          echo "github tarball, refs/heads/${ref}, $(date -u +%FT%TZ)" > "${BT_SRC}/SOURCE_SNAPSHOT.txt"
+          got_tar=1; break
+        fi
+        rm -rf "${BT_SRC}"
+      fi
+    done
+    if [ "${got_tar}" != "1" ]; then
+      if [ -n "${BT_SRC_FALLBACK_REPO:-}" ]; then
+        echo "==> tarball endpoint failed; trying Hugging Face ${BT_SRC_FALLBACK_REPO} (broadtrack_src.tar.gz)"
+        rm -rf "${BT_SRC}"; mkdir -p "${BT_SRC}"
+        dl=$(python3 -c "import os; from huggingface_hub import hf_hub_download; print(hf_hub_download('${BT_SRC_FALLBACK_REPO}', 'broadtrack_src.tar.gz', token=os.environ.get('HF_TOKEN')))") \
+          || { echo "ERROR: all three source-acquisition paths failed" >&2; exit 1; }
+        tar -xzf "${dl}" -C "${BT_SRC}" --strip-components=1
+        [ -f "${BT_SRC}/CMakeLists.txt" ] || { echo "ERROR: HF snapshot lacks CMakeLists.txt" >&2; exit 1; }
+        echo "hf ${BT_SRC_FALLBACK_REPO}, broadtrack_src.tar.gz, $(date -u +%FT%TZ)" > "${BT_SRC}/SOURCE_SNAPSHOT.txt"
+      else
+        echo "ERROR: could not obtain BroadTrack sources (git clone and tarball both failed;" >&2
+        echo "       optionally set BT_SRC_FALLBACK_REPO to a PRIVATE HF snapshot repo" >&2
+        echo "       holding broadtrack_src.tar.gz to enable a third path)" >&2
+        exit 1
+      fi
+    fi
+  fi
 fi
 mkdir -p "${BT_SRC}/models"
 

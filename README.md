@@ -131,6 +131,11 @@ Download fallbacks (automatic, no flags needed):
   [`SoccerNet/SN-GSR-2024`](https://huggingface.co/datasets/SoccerNet/SN-GSR-2024)
   (same `train/valid/test/challenge.zip` files) and unzip straight from the
   huggingface_hub cache.
+* **BroadTrack sources.** The EVS clone now retries 3x (no credential prompts) and falls
+  back to the GitHub tarball endpoint (`main`, then `master`); optionally set
+  `BT_SRC_FALLBACK_REPO` to a **private** Hugging Face repo holding
+  `broadtrack_src.tar.gz` as a third path. (Observed on Kaggle: GitHub transiently
+  refusing anonymous git-over-HTTPS from shared IPs.)
 * **BroadTrack weights.** `scripts/setup_broadtrack.sh` pulls the two TorchScript models
   from EVS's git-lfs first; if the pull fails or leaves pointer stubs, it fetches them
   from `BT_WEIGHTS_FALLBACK_REPO` (default `Ynniss/calibiration_weights`) on Hugging
