@@ -123,6 +123,10 @@ and the team-appearance checkpoint `Ynniss/osnet_team/osnet_team_best.pt`
 (`sn_gamestate/reid/osnet_team.py`; `team_sha256` in `modules/team_embed/osnet_team.yaml`
 is unset until the first verified run records the digest — pin it then).
 
+For the verified Kaggle procedure (disk layout, environment rules, timings, one-sequence
+recipe) and every error observed on the way there, see
+[`docs/KAGGLE_GUIDE.md`](docs/KAGGLE_GUIDE.md).
+
 Download fallbacks (automatic, no flags needed):
 
 * **Dataset.** `scripts/lightning_eval.sh` and `preflight_cpu.sh` download each split
@@ -258,7 +262,10 @@ roundtrip (< 1 cm), pitch-wireframe overlay (must sit on the painted lines), fra
 Computed and stored **separately** from the pipeline's own eval output:
 
 ```bash
-python scripts/reference_metrics.py --state states/sn-gamestate.pklz \
+# TrackLab saves the state INSIDE the Hydra run directory (verified on the Kaggle run
+# of 2026-09-02), so point --state at the newest one:
+python scripts/reference_metrics.py \
+    --state "$(ls -t outputs/sn-gamestate/*/*/states/sn-gamestate.pklz | head -1)" \
     --dataset-path data/SoccerNetGS --eval-set test --out reference_metrics
 ```
 

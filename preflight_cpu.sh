@@ -85,10 +85,13 @@ for s in ${SPLITS}; do
   fi
 done
 
-hdr "3. detector + tracker ReID  (HF cache, \${hf:} resolver)"
+hdr "3. detector  (HF cache, \${hf:} resolver)"
 if hf_out=$(${PY} python - <<'PYEOF' 2>/dev/null
 from huggingface_hub import try_to_load_from_cache
-for f in ("yolov11_sn_best.pt", "sports_model.pth.tar-60"):
+# Only the detector: no config references sports_model.pth.tar-60, and the successful
+# end-to-end Kaggle run of 2026-09-02 never touched it (removed as a stale leftover of
+# the upstream baseline; the tracker/split_merge ReID comes from Ynniss/osnet_ain, §5).
+for f in ("yolov11_sn_best.pt",):
     p = try_to_load_from_cache("Ynniss/sn-gamestate-weights", f)
     print(("OK " if isinstance(p, str) else "MISS ") + f)
 PYEOF
@@ -191,8 +194,8 @@ PYEOF
 fi
 
 if [ "$NEED_HF" = 1 ]; then
-  hdr "-> detector + tracker ReID (only the 2 files the configs reference)"
-  ${PY} hf download Ynniss/sn-gamestate-weights yolov11_sn_best.pt sports_model.pth.tar-60 \
+  hdr "-> detector (the only file the configs reference in this repo)"
+  ${PY} hf download Ynniss/sn-gamestate-weights yolov11_sn_best.pt \
     || warn "HF fetch failed - private repo? export HF_TOKEN=hf_..."
 fi
 
