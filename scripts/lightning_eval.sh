@@ -60,17 +60,37 @@ SNGS=$("${PYBIN}" -c "import tracklab,os;print(os.path.join(os.path.dirname(trac
 sed -i 's/gamestate-2025/gamestate-2024/g' "${SNGS}"
 echo "==> Patched dataset task name in ${SNGS}"
 
-# 3. Download only the needed split(s) and unzip into place
+# 3. Download only the needed split(s) and unzip into place.
+#    Primary: the SoccerNet server (KAUST) via the SoccerNet pip package.
+#    Fallback: the official Hugging Face mirror SoccerNet/SN-GSR-2024, which
+#    publishes the same <split>.zip files (train/valid/test/challenge) at the
+#    dataset root. Used automatically when the server errors, does not respond,
+#    or leaves no zip behind. The HF download stays in the huggingface_hub cache
+#    and is unzipped from there (no second copy on disk).
 mkdir -p "${DATA_DIR}"
 for split in ${SPLITS}; do
   if [ ! -d "${DATA_DIR}/${split}" ]; then
-    echo "==> Downloading SoccerNetGS split: ${split}"
+    echo "==> Downloading SoccerNetGS split: ${split} (SoccerNet server)"
+    ZIP="${DATA_DIR}/gamestate-2024/${split}.zip"
     "${PYBIN}" -c "
 from SoccerNet.Downloader import SoccerNetDownloader
 d = SoccerNetDownloader(LocalDirectory='${DATA_DIR}')
 d.downloadDataTask(task='gamestate-2024', split=['${split}'])
-"
-    unzip -o "${DATA_DIR}/gamestate-2024/${split}.zip" -d "${DATA_DIR}/${split}"
+" || echo "==> SoccerNet server download failed; trying the Hugging Face mirror"
+    # Fallback triggers when the zip is absent, empty, or truncated (a partial
+    # server download has no end-of-central-directory record; reading it is
+    # cheap -- only the central directory is parsed, not the 9 GB payload).
+    if [ ! -s "${ZIP}" ] || ! "${PYBIN}" -c "
+import zipfile, sys
+zipfile.ZipFile(r'${ZIP}').namelist()
+" >/dev/null 2>&1; then
+      echo "==> Falling back to Hugging Face: SoccerNet/SN-GSR-2024 ${split}.zip"
+      ZIP=$("${PYBIN}" -c "
+from huggingface_hub import hf_hub_download
+print(hf_hub_download('SoccerNet/SN-GSR-2024', '${split}.zip', repo_type='dataset'))
+")
+    fi
+    unzip -o "${ZIP}" -d "${DATA_DIR}/${split}"
   else
     echo "==> Split '${split}' already present, skipping download."
   fi

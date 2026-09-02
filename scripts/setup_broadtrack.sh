@@ -6,10 +6,12 @@
 # already give a root Linux shell with CUDA, so we execute that recipe natively:
 #
 #   1. clone github.com/evs-broadcast/BroadTrack (CODE only; the two model weights are on
-#      that repo's git-lfs). By default the weights come from EVS's LFS; when its LFS
-#      budget is exhausted (batch response: "exceeded its LFS budget"), set
-#      BT_WEIGHTS_REPO to a Hugging Face repo that holds the SAME two models and they are
-#      fetched from there instead. The clone always runs with LFS smudging OFF so a
+#      that repo's git-lfs). By default the weights come from EVS's LFS; when the pull
+#      fails or leaves pointer stubs (server error, timeout, or "exceeded its LFS
+#      budget"), the script AUTOMATICALLY falls back to a Hugging Face repo holding the
+#      SAME two models (BT_WEIGHTS_FALLBACK_REPO, default Ynniss/calibiration_weights).
+#      Setting BT_WEIGHTS_REPO still skips EVS's LFS entirely and fetches from that
+#      Hugging Face repo directly. The clone always runs with LFS smudging OFF so a
 #      rate-limited or empty LFS cannot break the checkout of the (non-LFS) source code.
 #      On Hugging Face the two models are published as .zip torch.jit CONTAINERS
 #      (nbjw_keypoint_model.zip, tvcalib_model.zip): a .zip whose MEMBERS are data.pkl,
@@ -151,8 +153,38 @@ PYEOF
     stage_container "${dl}" "${BT_SRC}/models/${m}.pt"
   done
 else
-  echo "==> Weights from EVS LFS (set BT_WEIGHTS_REPO to bypass if this is rate-limited)"
-  ( cd "${BT_SRC}" && git lfs pull )
+  echo "==> Weights from EVS LFS (automatic Hugging Face fallback on failure)"
+  ( cd "${BT_SRC}" && git lfs pull ) \
+    || echo "==> git lfs pull failed (server error, timeout or LFS budget); falling back to Hugging Face"
+  # Automatic fallback: any model still missing or left as an LFS pointer stub
+  # (~134 B) after the pull is fetched from the Hugging Face mirror instead.
+  # BT_WEIGHTS_FALLBACK_REPO defaults to Ynniss/calibiration_weights (the same
+  # two models as .zip torch.jit containers; the caller's own private copy under
+  # the EVS licence -- export HF_TOKEN if it is private). This is the same code
+  # path as BT_WEIGHTS_REPO, only triggered per missing file rather than for all.
+  BT_WEIGHTS_FALLBACK_REPO="${BT_WEIGHTS_FALLBACK_REPO:-Ynniss/calibiration_weights}"
+  for m in nbjw_keypoint_model tvcalib_model; do
+    sz=$(stat -c%s "${BT_SRC}/models/${m}.pt" 2>/dev/null || echo 0)
+    if [ "${sz}" -lt 1000000 ]; then
+      echo "==> ${m}.pt missing or a pointer stub (${sz} B); fetching from ${BT_WEIGHTS_FALLBACK_REPO}"
+      dl=$(python3 - "${BT_WEIGHTS_FALLBACK_REPO}" "${m}" <<'PYEOF'
+import sys, os
+from huggingface_hub import hf_hub_download
+repo, m = sys.argv[1], sys.argv[2]
+tok = os.environ.get("HF_TOKEN")
+last = None
+for fn in (f"{m}.zip", f"{m}.pt"):        # this repo publishes .zip; accept .pt too
+    try:
+        print(hf_hub_download(repo, fn, token=tok)); sys.exit(0)
+    except Exception as e:
+        last = e
+sys.exit(f"ERROR: could not fetch {m}.zip or {m}.pt from {repo}: "
+         f"{type(last).__name__}: {last}")
+PYEOF
+      ) || { echo "${dl}" >&2; exit 1; }
+      stage_container "${dl}" "${BT_SRC}/models/${m}.pt"
+    fi
+  done
 fi
 
 # Sanity: the staged files must be real containers (~230-266 MB), not LFS pointers (~134 B).

@@ -170,15 +170,23 @@ SNGS=$(${PY} python -c "import tracklab,os;print(os.path.join(os.path.dirname(tr
 [ -n "$SNGS" ] && sed -i 's/gamestate-2025/gamestate-2024/g' "$SNGS" && ok "tracklab task-name patch applied"
 
 if [ "$NEED_DATA" = 1 ]; then
-  hdr "-> dataset"; mkdir -p "${DATA}"
+  hdr "-> dataset  (SoccerNet server, Hugging Face SoccerNet/SN-GSR-2024 fallback)"
+  mkdir -p "${DATA}"
   for s in ${SPLITS}; do
     n=$(find "${DATA}/${s}" -maxdepth 1 -type d -name 'SNGS-*' 2>/dev/null | wc -l)
     [ "$n" -gt 0 ] && [ -d "$(find "${DATA}/${s}" -maxdepth 1 -type d -name 'SNGS-*'|sort|head -1)/img1" ] && continue
-    ${PY} python - <<PYEOF
+    ZIP="${DATA}/gamestate-2024/${s}.zip"
+    ${PY} python - <<PYEOF || warn "SoccerNet server download failed; trying the Hugging Face mirror"
 from SoccerNet.Downloader import SoccerNetDownloader
 SoccerNetDownloader(LocalDirectory="${DATA}").downloadDataTask(task="gamestate-2024", split=["${s}"])
 PYEOF
-    unzip -q -o "${DATA}/gamestate-2024/${s}.zip" -d "${DATA}/${s}"
+    # Absent, empty or truncated zip (no end-of-central-directory) -> fall back.
+    if [ ! -s "${ZIP}" ] || ! ${PY} python -c "import zipfile; zipfile.ZipFile(r'${ZIP}').namelist()" >/dev/null 2>&1; then
+      warn "falling back to Hugging Face: SoccerNet/SN-GSR-2024 ${s}.zip"
+      ZIP=$(${PY} python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('SoccerNet/SN-GSR-2024', '${s}.zip', repo_type='dataset'))") \
+        || { bad "Hugging Face dataset fallback failed for split '${s}'"; continue; }
+    fi
+    unzip -q -o "${ZIP}" -d "${DATA}/${s}"
   done
 fi
 

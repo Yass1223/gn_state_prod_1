@@ -123,6 +123,20 @@ and the team-appearance checkpoint `Ynniss/osnet_team/osnet_team_best.pt`
 (`sn_gamestate/reid/osnet_team.py`; `team_sha256` in `modules/team_embed/osnet_team.yaml`
 is unset until the first verified run records the digest — pin it then).
 
+Download fallbacks (automatic, no flags needed):
+
+* **Dataset.** `scripts/lightning_eval.sh` and `preflight_cpu.sh` download each split
+  from the SoccerNet server (KAUST) first; if the server errors, does not respond, or
+  leaves a truncated zip, they fall back to the official Hugging Face mirror
+  [`SoccerNet/SN-GSR-2024`](https://huggingface.co/datasets/SoccerNet/SN-GSR-2024)
+  (same `train/valid/test/challenge.zip` files) and unzip straight from the
+  huggingface_hub cache.
+* **BroadTrack weights.** `scripts/setup_broadtrack.sh` pulls the two TorchScript models
+  from EVS's git-lfs first; if the pull fails or leaves pointer stubs, it fetches them
+  from `BT_WEIGHTS_FALLBACK_REPO` (default `Ynniss/calibiration_weights`) on Hugging
+  Face. `BT_WEIGHTS_REPO` still skips EVS entirely; `BT_WEIGHTS_DIR` reads them from
+  disk (e.g. a Kaggle dataset).
+
 ### Python version on Kaggle / Lightning
 
 `pyproject.toml` pins `requires-python = ">=3.9,<3.10"` because of `torch==1.13.1`, which
