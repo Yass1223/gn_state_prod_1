@@ -1,8 +1,13 @@
 # SoccerNet Game State Reconstruction — pipeline reference (repo_prod_v1)
 
-Reference date: 2026-09-02, final. Derived from direct inspection of the repository
+Reference date: 2026-09-03. Derived from direct inspection of the repository
 (configs, source, scripts), not from the README alone, and validated by an end-to-end
-Kaggle run on one test sequence (see §7 findings and `docs/KAGGLE_GUIDE.md`). Intended to
+Kaggle run on one test sequence (see §7 findings and `docs/KAGGLE_GUIDE.md`). Extended
+2026-09-03 with the `traj_refine` stage, the jersey candidate output (blob schema 2),
+and the second detector (YOLOv11L_HM, now the default) — first exercised on Kaggle the
+same day (run 5, §7): full pipeline exit 0, RUN INTEGRITY OK, all 13 audit checks PASS;
+the detector-default decision is pending an A/B (§7 item 9, §9).
+Intended to
 be pasted into any working context as the ground-truth description of the pipeline, so the
 repository does not need to be re-analyzed each time. Statements are marked **[verified]**
 (read directly from code/config or observed at runtime), **[assumption]** (design intent,
@@ -20,8 +25,14 @@ The pipeline order **[verified]**:
 
 ```
 bbox_detector -> track -> crop_filter -> split_merge -> calibration -> pitch_gate
-             -> team_embed -> role_team -> jersey_number_detect -> tracklet_agg -> audit
+             -> team_embed -> role_team -> jersey_number_detect -> traj_refine
+             -> tracklet_agg -> audit
 ```
+
+The bbox detector is a Hydra defaults-group choice between two YOLO11-L fine-tunes with
+an identical operating point (default `yolo_ultralytics_snft_hm`; switch with
+`modules/bbox_detector=yolo_ultralytics_snft`) — one path through the pipeline, one
+stage module, two weight variants **[verified]**.
 
 Package name `sn-gamestate` 1.0.0, licence GPL-3.0 (repository code). BroadTrack (EVS)
 sources/weights are licensed noncommercial-research with no redistribution and are never
@@ -75,7 +86,7 @@ must be launched from the repository root; outputs go to `outputs/sn-gamestate/<
 
 | Stage | `_target_` (module) | Key configuration |
 |---|---|---|
-| `bbox_detector` | `sn_gamestate.bbox_detector.yolo_snft_api.YOLOUltralyticsSNFT` | YOLO11-L fine-tune from HF (`${hf:Ynniss/sn-gamestate-weights,yolov11_sn_best.pt}`); imgsz 1280, conf floor 0.1 (kept with `>=`), iou 0.7, max_det 300, RGB→BGR fix; optional TensorRT (off by default) |
+| `bbox_detector` | `sn_gamestate.bbox_detector.yolo_snft_api.YOLOUltralyticsSNFT` | Defaults-group switch between two YOLO11-L fine-tunes, same module and operating point (imgsz 1280, conf floor 0.1 kept with `>=`, iou 0.7, max_det 300, RGB→BGR fix; optional TensorRT, off by default). **Default (since 2026-09-03): `yolo_ultralytics_snft_hm`** — HF `${hf:Ynniss/YOLOv11L_HM,best.zip,yolov11l_hm_best.pt}` (the 3-arg resolver form copies the download under a .pt name). Alternative: `yolo_ultralytics_snft` — `${hf:Ynniss/sn-gamestate-weights,yolov11_sn_best.pt}` (the run-4 baseline detector). Distinct `engine_path` per variant; `build_trt_engines.py` builds only the snft engine (missing engine ⇒ warn + PyTorch fallback) |
 | `track` | `sn_gamestate.track.bot_sort.BotSortSOF` | boxmot BotSort called directly; embeddings injected from the shared OSNet-AIN module; SOF camera motion (scale 0.15) computed outside; thresholds: high 0.3, low 0.05, new 0.4, match 0.85, proximity 0.5, appearance 0.35, buffer 60, frame_rate 25; fp16 autocast, fp32 outputs; per-frame audit sidecar `audit/track/` |
 | `crop_filter` | `sn_gamestate.crop_filter.CropFilter` | single iff rT ≤ 0.25 and rB < 0.40, contaminators must carry a track_id (`contam_mode: tracked`); writes `crop_single/crop_rT/crop_rB/crop_trigger`; removes nothing |
 | `split_merge` | `sn_gamestate.track.split_merge_api.SplitMerge` | DBSCAN per tracklet (eps 0.2, min_samples 5, precomputed cosine) on `crop_single` rows; agglomerative fragment merge (tau 0.60, disjoint clean frame sets); one detection per trajectory+frame; unplaceable rows get `track_id` NaN; same OSNet-AIN pin as `track` (audit-enforced); sidecar `audit/split_merge/` |
@@ -83,9 +94,10 @@ must be launched from the repository root; outputs go to `outputs/sn-gamestate/<
 | `pitch_gate` | `sn_gamestate.pitch_gate.PitchGate` | enabled, margin_m 3.5 (untuned); off-pitch iff |mean_x| > 52.5+m or |mean_y| > 34+m on the tracklet mean of finite `bbox_pitch`; gated tracklets: `track_id` → NaN, original kept in `track_id_pregate`; no row deleted; sidecar `audit/pitch_gate/` |
 | `team_embed` | `sn_gamestate.team.TeamEmbedding` | osnet_team (OSNet x1.0, 128×64, 256-d) from HF `Ynniss/osnet_team/osnet_team_best.pt`; ≤ 16 crops/tracklet on the stride-5 grid; fp32 + flip TTA; `team_sha256` currently **null** (recorded, not enforced — pin after first verified run); sidecar `audit/team_embed/` |
 | `role_team` | `sn_gamestate.team.RoleTeamAssignment` | notebook rule chain (`team/rules.py`): role player/goalkeeper/referee, team k-means on single-crop descriptors, side; frozen params (k 3.25, tau_n 5, max_ref 3, side_rule keeper, …), untuned on this pipeline's tracklets/BroadTrack projections; sidecar `audit/role_team/` |
-| `jersey_number_detect` | `sn_gamestate.jersey.jn_gsr_api.JNGsrTrackletRecognizer` | subprocess workers in the 3.10 venv; roles [player, goalkeeper]; `single_crops_only: true`; legibility > 0.72 → DBNet++ ROI → PARSeq + SATRN → `vote_pool` (the only rule); stride 5; fp16; GPU sharding auto via nvidia-smi (2 workers on Kaggle 2×T4); content-hash cache `jn_cache/` |
+| `jersey_number_detect` | `sn_gamestate.jersey.jn_gsr_api.JNGsrTrackletRecognizer` | subprocess workers in the 3.10 venv; roles [player, goalkeeper]; `single_crops_only: true`; legibility > 0.72 → DBNet++ ROI → PARSeq + SATRN → `vote_pool` (the only rule); stride 5; fp16; GPU sharding auto via nvidia-smi (2 workers on Kaggle 2×T4); content-hash cache `jn_cache/`. Since 2026-09-03 (blob **schema 2**): two ADDITIVE columns for `traj_refine` — `jersey_number_candidates` (every pooled label of the two recognisers as `[label, mx, conf_sum, votes]`, ranked by the maxconf score exp(mx)·conf_sum; stats, not scores, so merged tracklets recombine exactly: mx=max, conf_sum/votes add) and `jersey_number_maxconf` (assigned number's score). The schema is folded into the cache key (old caches miss and recompute once) and checked on every shard and cached blob; the assigned number stays `vote_pool`, byte-identical |
+| `traj_refine` | `sn_gamestate.refine.traj_refine_api.TrajRefine` | NEW 2026-09-03. Label-aware trajectory refinement between jersey and the vote: phase 2a merges in-scope (player/goalkeeper) cluster pairs with equal team AND equal number, in descending pooled-maxconf pair score, when frames are disjoint ∧ re-enter consistent ∧ distance ≤ tau; a pair claiming one number at the same time is a conflict — the lower-maxconf side walks to its best candidate not previously lost (banned set; cascades walk down the list; "-1"/exhaustion → unnumbered); phase 2b merges agglomeratively (average linkage, split_merge's distance convention) under frames-disjoint ∧ re-enter ∧ vacuous-when-unknown team/number agreement. Same OSNet-AIN pin as track/split_merge (audit-enforced vs split_merge; tau 0.60 borrowed from split_merge, untuned for this stage; edge_margin 0.02 untuned). Role is NOT a merge condition (merged rows → row-majority role); referees untouched; no-centroid trajectories never merge. Snapshots written unconditionally: `track_id_prerefine`, `jersey_number_detection_prerefine`, `jersey_number_confidence_prerefine`; `enabled: false` = snapshots + sidecar only (the A/B switch). Merged clusters recombine candidate stats per the maxconf rule and propagate number/confidence/maxconf/team to all member rows. Sidecar `audit/traj_refine/`; algorithm in `refine/traj_refine.py` (pure numpy, 18 unit tests in `tests/test_traj_refine.py`) |
 | `tracklet_agg` | `tracklab.wrappers.MajorityVoteTracklet` | majority vote over `[jersey_number]` only (role is per-tracklet from role_team) |
-| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs split_merge checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL |
+| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs split_merge checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL. Since 2026-09-03: a `traj_refine` check (snapshots present; settings/embedder digest that ran == configured AND == split_merge's pin; rows only relabelled; tracklets_out == tracklets_in − merges; merge distances ≤ tau; no (image_id, track_id) collision; number/team/role constant per refined track; disabled ⇒ untouched), and the pitch_gate / team_embed / role_team / jersey checks audit against the pre-refine snapshots (`track_id_prerefine`, jersey snapshot columns) so every earlier stage is held to the state it actually produced |
 
 Not in the pipeline **[verified]**: no `pitch` stage (BroadTrack runs NBJW keypoints and
 TVCalib lines internally); no `reid`/prtreid stage; `interpolation` (dti.yaml) exists as a
@@ -106,6 +118,7 @@ All verified against the fetching code, not the README.
 |---|---|---|---|
 | Dataset (SoccerNetGS splits) | SoccerNet server (KAUST) via `SoccerNet` pip package, task `gamestate-2024` | **Hugging Face dataset `SoccerNet/SN-GSR-2024`** (`<split>.zip` at repo root; train 9.76 GB, valid 11.2 GB, test 8.85 GB, challenge 5.31 GB) — automatic on server error/no response/truncated zip (added 2026-09-02) | zip central-directory check triggers the fallback; sequence-count and `img1`-depth checks in `preflight_cpu.sh` |
 | Detector `yolov11_sn_best.pt` | HF `Ynniss/sn-gamestate-weights` via the `${hf:...}` OmegaConf resolver at config-resolution time | none | none (no digest pin) |
+| Detector `best.zip` (YOLOv11L_HM, default since 2026-09-03) | HF `Ynniss/YOLOv11L_HM` via the 3-arg `${hf:...}` form (download copied to `yolov11l_hm_best.pt` beside the cache entry) | none | none (no digest pin, matching the other detector). The .zip IS the torch checkpoint **[verified on Kaggle run 5, 2026-09-03: resolver downloaded it, ultralytics loaded it under torch 1.13.1, bbox_detector audit PASS]**; ~48.5 MB fp16 ultralytics YOLO11 DetectionModel |
 | OSNet-AIN `best_ain_full.zip` (tracker + split_merge) | HF `Ynniss/osnet_ain`, revision `d78f65de…`, the packed file is itself a torch.save archive | exploded snapshot `Ynniss/osnet_ain_ckp` path exists in code (used when `ain_file` is cleared); `ain_local_path` reads from disk | **sha256 enforced** (`a0a7e426…`); audit fails on any pin mismatch between the two stages |
 | Team model `osnet_team_best.pt` | HF `Ynniss/osnet_team` | `team_local_path` | sha256 **recorded only** (`team_sha256: null`) — pin after first verified run |
 | BroadTrack source code | `github.com/evs-broadcast/BroadTrack` git clone, 3 attempts, no credential prompts (LFS smudge off) | GitHub codeload tarball (`main` verified live, then `master`); optional third path `BT_SRC_FALLBACK_REPO` = private HF repo with `broadtrack_src.tar.gz` (added 2026-09-02 after Kaggle observed GitHub refusing anonymous git-over-HTTPS transiently) | `CMakeLists.txt` presence; tarball trees carry `SOURCE_SNAPSHOT.txt` |
@@ -150,15 +163,22 @@ frozen production run.
 ## 6. Running and verifying [verified]
 
 ```
-tracklab -cn soccernet                       # 1 clip (dataset.nvid=1), test split
+tracklab -cn soccernet                       # 1 clip (dataset.nvid=1), test split, HM detector
+tracklab -cn soccernet modules/bbox_detector=yolo_ultralytics_snft   # the run-4 baseline detector
+tracklab -cn soccernet modules.traj_refine.cfg.enabled=false         # refine stage passthrough (A/B)
 tracklab -cn soccernet dataset.nvid=-1       # full split
 bash scripts/lightning_eval.sh               # end-to-end: venv + patch + data + setup + eval
-python scripts/preflight_imports.py          # seconds; every stage importable
-CHECK_ONLY=1 bash preflight_cpu.sh           # artifact audit only
+python scripts/preflight_imports.py          # seconds; every stage importable (incl. traj_refine)
+CHECK_ONLY=1 bash preflight_cpu.sh           # artifact audit only (audits BOTH detector weights)
 python scripts/verify_run_integrity.py --expect-sequences <N>   # non-zero on any audit FAIL
 python scripts/verify_broadtrack_conversion.py -c broadtrack_calib/<seq>.json -f data/.../img1 -o broadtrack_check
 python scripts/reference_metrics.py --state outputs/sn-gamestate/<date>/<time>/states/sn-gamestate.pklz --dataset-path data/SoccerNetGS --eval-set test --out reference_metrics
 ```
+
+A ready-to-run Kaggle notebook for the one-sequence test (full pipeline incl.
+`traj_refine`, the verification chain, and optional detector / refine A/B runs) is at
+`docs/kaggle_one_sequence_test.ipynb` (linked from `docs/KAGGLE_GUIDE.md`) **[verified:
+nbformat-valid, every bash cell syntax-checked; not yet executed on Kaggle]**.
 
 Reference metrics blocks: tracking (HOTA/DetA/AssA/MOTA/IDF1/IDSW), gsr (GS-HOTA family,
 5 m tolerance), jersey_number (Hungarian IoU ≥ 0.5, unnumbered = −1), calibration (JaC5,
@@ -198,15 +218,37 @@ code/config comments]**:
    fine-tunes are legitimate); `audit_parseq.py` and the run audit are the asserting arms.
 6. Jersey-stage quality numbers in configs are for ground-truth-box tracklets; no measured
    row exists yet for predicted tracklets through this pipeline.
+7. NEW 2026-09-03: `traj_refine` `tau` (0.60) is split_merge's operating point, carried
+   over because the stage uses the same embedder pin and distance convention; it is NOT
+   tuned for this stage, and `edge_margin` (0.02) is untuned. Tune on `valid` if the
+   Kaggle test shows over/under-merging.
+8. NEW 2026-09-03: the calibration cache `broadtrack_calib/<seq>.json` is keyed by
+   sequence name only, and BroadTrack's player masks come from our own detections — a
+   cached JSON silently carries the detector that produced it. Reusing it across
+   detector variants is deliberate for A/B comparisons (same camera removes a
+   confound); a from-scratch production run under a new detector should clear
+   `broadtrack_calib/` or override `modules.calibration.cfg.calib_dir`. No audit check
+   catches this staleness.
+9. NEW 2026-09-03, updated after run 5: run-4 baseline numbers (in-run GS-HOTA 58.4–59.4
+   across two sessions on the single sequence test/SNGS-116) were produced with the snft
+   detector and WITHOUT `traj_refine`. Run 5 (HM default + traj_refine) scored in-run
+   GS-HOTA 55.07 on the same sequence — and since `traj_refine` was a no-op there (see
+   run-5 findings below), the drop is attributable to the detector change plus its fresh
+   calibration. Evidence is one sequence; **the HM-vs-snft default decision is pending
+   the confound-free A/B** (notebook flag `RUN_DET_AB=1`, which reruns snft against the
+   session's HM baseline on a shared calibration cache).
+10. NEW 2026-09-03: 2a conflicts among clusters that become same-numbered only through
+    2b inheritance are not re-resolved (2a runs once before 2b, faithful to the
+    method's specification; documented in `refine/traj_refine.py`).
 
 Discrepancies found in this analysis:
 
-7. RESOLVED 2026-09-02: `preflight_cpu.sh` no longer checks/fetches
-   `sports_model.pth.tar-60` (was referenced nowhere; confirmed unused by the successful
-   end-to-end Kaggle run).
-8. RESOLVED 2026-09-02: the README reference-metrics command now locates the newest
-   state under `outputs/sn-gamestate/*/*/states/` (TrackLab saves it inside the Hydra run
-   directory, confirmed on Kaggle; the old `states/...` root-relative path never exists).
+11. RESOLVED 2026-09-02: `preflight_cpu.sh` no longer checks/fetches
+    `sports_model.pth.tar-60` (was referenced nowhere; confirmed unused by the successful
+    end-to-end Kaggle run).
+12. RESOLVED 2026-09-02: the README reference-metrics command now locates the newest
+    state under `outputs/sn-gamestate/*/*/states/` (TrackLab saves it inside the Hydra run
+    directory, confirmed on Kaggle; the old `states/...` root-relative path never exists).
 
 Kaggle findings so far (runs 1-3, 2026-09-02): environment recipe, TrackLab patch, and
 all 22 stage imports work on the current image (host Python 3.12.13, provisioned 3.9.25);
@@ -233,14 +275,35 @@ and the BroadTrack conversion check (model equivalence 3.17e-05 px, roundtrip 6.
 both PASS). Single-sequence numbers are not comparable to full-split figures. Full-split
 behavior and the HF dataset fallback network path remain unexercised.
 
-Still **[unverified]** after the completed one-sequence test: full-split behavior and
-runtime; the HF dataset fallback's actual network path (code path tested synthetically,
-never against a live server failure); the EVS git-lfs weights path and its automatic
-fallback (runs pinned `BT_WEIGHTS_REPO`); the HF mirror zip's internal layout (§5); and
-the line-by-line behavior of files verified only at the config/contract level
-(`broadtrack_api.py`, `run_audit_api.py`, the jersey worker).
+Run 5 (2026-09-03, T4 x2, via `docs/kaggle_one_sequence_test.ipynb`, first exercise of
+the 2026-09-03 batch): full pipeline on test/SNGS-116 with the HM detector default and
+`traj_refine` enabled, exit 0; RUN INTEGRITY: OK — 13 checks PASS, 0 FAIL, 0 WARN,
+including the new `traj_refine` check. HM weights loaded through the 3-arg resolver
+(`best.zip` → `yolov11l_hm_best.pt`); jersey stage computed fresh under blob schema 2
+(2 workers, 15/21 tracklets numbered); fresh calibration from HM detections (CR 749/750,
+mean score 0.577 vs 0.647 under snft; conversion checks PASS at 3.70e-05 px /
+3.27e-06 m). In-run eval (pitch, attributes on): GS-HOTA 55.07, DetA 46.74, AssA 64.06,
+MOTA 30.21, IDF1 64.49, IDSW 0, MT 8 / PT 11 / ML 7 of 26 GT ids, 10200 predicted
+detections vs 10567 GT — below the snft baseline across the board (§7 item 9).
+`traj_refine` was a NO-OP on this sequence: 23 tracklets in, 23 out, 0 merges,
+0 conflicts, 0 rejections, 0 rows relabelled (21 in scope, 15 numbered, all embeddings
+valid, img_w read) — split_merge left nothing for it to act on here, so the stage's
+merge/conflict behavior on real data remains unmeasured. Both optional A/B cells were
+skipped (flags 0). The reference-metrics tables went to the session's
+`reference_metrics/summary.md`, not into the notebook output.
 
-## 8. Changes made on 2026-09-02
+Still **[unverified]** after run 5: full-split behavior and
+runtime; the HF dataset fallback's actual network path (code path tested synthetically,
+never against a live server failure; KAUST served `test.zip` again in run 5 at
+~15 MiB/s); the EVS git-lfs weights path and its automatic
+fallback (runs pinned `BT_WEIGHTS_REPO`); the HF mirror zip's internal layout (§5); the
+line-by-line behavior of files verified only at the config/contract level
+(`broadtrack_api.py`, the jersey worker); the `traj_refine` merge and conflict paths on
+real sequences (exercised only by the 18 unit tests — the stage ran live but had nothing
+to merge on SNGS-116); and the snft-vs-HM A/B on a shared calibration (the pending
+detector-default decision).
+
+## 8. Changes made on 2026-09-02 and 2026-09-03
 
 Batch 1 (pushed before the Kaggle test; presence in the clone verified by the notebook):
 
@@ -269,18 +332,66 @@ Batch 2 (after the test passed; in the local tree, pending the final push):
 8. `docs/PIPELINE_REFERENCE.md` (new) — this document, as the repository's canonical
    ground-truth reference.
 
-Verification performed per edit: `bash -n` on every touched script; the zip-validity
+Batch 3 (2026-09-03, pushed the same day — presence in the clone verified by the run-5
+notebook check; all verified offline before the push: unit tests,
+plugin self-tests, py_compile, YAML parses, byte-compares of installed copies):
+
+9. `traj_refine` stage: `sn_gamestate/refine/` (new package: `traj_refine.py` algorithm,
+   `traj_refine_api.py` stage, `__init__.py`), `configs/modules/traj_refine/
+   traj_refine.yaml` (same OSNet-AIN pin as split_merge; tau 0.60, use_reenter true,
+   edge_margin 0.02, roles [player, goalkeeper], enabled true), `tests/
+   test_traj_refine.py` (18 tests, all passing), wired into `soccernet.yaml`
+   (defaults + pipeline between `jersey_number_detect` and `tracklet_agg`) and
+   `scripts/preflight_imports.py`.
+10. Jersey candidate output, blob **schema 2**: `plugins/jn_gsr/fuse_jn.py`
+    (+`pooled_label_stats`, `ranked_candidates`), `jn_recognizer.py` (+`consolidate_full`,
+    `predict_full`; `predict` unchanged, delegates), `predict_tracklets.py` (candidates in
+    shard results, schema in blob, stub updated); `sn_gamestate/jersey/jn_gsr_api.py`
+    (+`jersey_number_candidates`, `jersey_number_maxconf` columns; schema in the cache
+    key and enforced on shards and cached blobs). All plugin self-tests pass;
+    `plugins/jn_gsr/MANIFEST.sha256` entries for the three edited files regenerated
+    (provenance record; consumed by no script — verified).
+11. Audit extension: `sn_gamestate/audit/run_audit_api.py` (+`_check_traj_refine`;
+    pitch_gate/team_embed/role_team/jersey checks now audit against the pre-refine
+    snapshots), `configs/modules/audit/run_audit.yaml` (+`traj_refine_sidecar_dir`,
+    `expected_traj_refine` incl. pin equality vs split_merge).
+12. Second detector + switch: `configs/modules/bbox_detector/yolo_ultralytics_snft_hm.yaml`
+    (new; HF `Ynniss/YOLOv11L_HM` `best.zip`, identical operating point);
+    `preflight_cpu.sh` audits/fetches both detector weights; `soccernet.yaml` default
+    flipped to `yolo_ultralytics_snft_hm` (the earlier detector stays selectable:
+    `modules/bbox_detector=yolo_ultralytics_snft`).
+13. `docs/kaggle_one_sequence_test.ipynb` (new) — ready-to-run notebook implementing the
+    guide's one-sequence recipe end to end (fail-fast clone check for the pushed files,
+    environment gate, single-sequence extraction, full run with the guide's overrides,
+    verification chain, traj_refine sidecar summary, optional detector / refine A/B
+    cells); linked from `docs/KAGGLE_GUIDE.md`.
+14. This document updated to the 2026-09-03 state (§§1, 3, 4, 6, 7, 9).
+
+Batch 4 (2026-09-03, after run 5; in the local tree, pending push):
+
+15. `docs/kaggle_one_sequence_test.ipynb` — detector A/B cell repaired: after the
+    default flip to HM it selected `yolo_ultralytics_snft_hm` (the default — comparing
+    HM to itself). Flag renamed `RUN_HM_AB` → `RUN_DET_AB`; the cell now selects
+    `modules/bbox_detector=yolo_ultralytics_snft`, labels `hm` (session baseline) vs
+    `snft`, log/output names updated. Revalidated (nbformat schema, `bash -n` per cell).
+16. This document updated with the run-5 findings (§§ header, 4, 7, 8, 9).
+
+Verification performed per edit (2026-09-02 batches): `bash -n` on every touched script; the zip-validity
 fallback trigger exercised against missing/empty/truncated/valid zips (all four correct);
 the clone retry→tarball chain exercised with stubs; the codeload endpoint for
 `evs-broadcast/BroadTrack` probed live (`main` = HTTP 200); every edited region re-read
 in its final on-disk state.
 
-## 9. Plan of record — all three steps complete (2026-09-02)
+## 9. Plan of record — 2026-09-03, after run 5
 
-Step 1: this document + dataset/BroadTrack download fallbacks (later extended with the
-BroadTrack source-acquisition hardening). Step 2: Kaggle test passed on test/SNGS-116 —
-full pipeline exit 0, RUN INTEGRITY OK (0 FAIL / 0 WARN), reference metrics + calibration
-conversion checks all green (results in `docs/KAGGLE_GUIDE.md` and §7 above). Step 3
-(final edits, in the local tree, pending the push): `docs/KAGGLE_GUIDE.md`, the README
-`--state` correction and guide link, the `sports_model.pth.tar-60` removal from
-`preflight_cpu.sh`, and this document at `docs/PIPELINE_REFERENCE.md` (full list in §8).
+Run 5 executed the notebook end to end: full pipeline with `traj_refine` + HM detector
+on test/SNGS-116, exit 0, RUN INTEGRITY OK (13 PASS), all verification checks green —
+but in-run GS-HOTA 55.07 vs the 58.4–59.4 snft baseline, with `traj_refine` a no-op on
+this sequence (§7). Current steps: **(1) push batch 4 (§8 items 15–16); (2) one Kaggle
+session with `RUN_DET_AB=1` (and optionally `RUN_REFINE_AB=1`)** for the confound-free
+snft-vs-HM comparison on a shared calibration cache, then **decide the detector
+default** (one line in `soccernet.yaml`; on the run-5 evidence snft leads); (3) to
+measure `traj_refine` where it can act, evaluate on sequences with fragmented numbered
+tracklets or the full split. After the first accepted configuration: pin `team_sha256`
+(§7 item 3), replace the SATRN digest prefix (§7 item 4), and revisit `traj_refine`
+tau/edge_margin on `valid` if merging looks off (§7 item 7).
