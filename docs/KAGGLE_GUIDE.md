@@ -1,5 +1,9 @@
 # Running on Kaggle — verified procedure and error guide
 
+A ready-to-run notebook implementing this guide's one-sequence recipe (including the
+`traj_refine` stage, the verification chain, and optional detector / refine A/B runs)
+is at `docs/kaggle_one_sequence_test.ipynb` — upload it to Kaggle as-is.
+
 Everything below was established empirically on Kaggle GPU T4 x2 sessions on 2026-09-02
 (image host Python 3.12.13, Ubuntu 22.04, CUDA driver for 2x Tesla T4). Five sessions were
 run; the final one completed the full pipeline on one `test` sequence (SNGS-116) end to
