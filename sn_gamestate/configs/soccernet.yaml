@@ -3,6 +3,9 @@
 # ONE entry config, ONE path through the pipeline. No alternative backends.
 #
 #   bbox_detector  YOLO11-L SoccerNet fine-tune (HF)          -> bbox_ltwh, bbox_conf
+#                  (default; alternative fine-tune YOLOv11L_HM via the defaults group:
+#                   `modules/bbox_detector=yolo_ultralytics_snft_hm` — same operating
+#                   point, different weights; see that config for cache notes)
 #   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
 #   crop_filter    single/multi label, tracked-only rule      -> crop_single, crop_rT, crop_rB, crop_trigger
 #   split_merge    DBSCAN tracklet split + appearance merge   -> track_id (final)
@@ -13,6 +16,12 @@
 #   team_embed     osnet_team on <= 16 sampled crops/tracklet  -> team_embedding
 #   role_team      notebook rules: role, cluster, side        -> role, team_cluster, team
 #   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU
+#                  + per-tracklet maxconf candidate stats  -> jersey_number_candidates, jersey_number_maxconf
+#   traj_refine    label-aware trajectory refinement: same-team same-number
+#                  merges + number-conflict resolution (phase 2a), then
+#                  agglomerative merging under time/re-enter/label conditions
+#                  (phase 2b); same OSNet-AIN as track / split_merge
+#                  -> track_id (refined), track_id_prerefine + jersey snapshots
 #   tracklet_agg   majority vote over [jersey_number]
 #   audit          per-component PASS/WARN/FAIL verdicts -> audit/<seq>.json (read-only)
 #
@@ -30,6 +39,7 @@
 #   python scripts/verify_broadtrack_conversion.py -c <calib.json> -f <frames dir>
 # Run:
 #   tracklab -cn soccernet
+#   tracklab -cn soccernet modules/bbox_detector=yolo_ultralytics_snft_hm   # HM detector
 # Reference metrics (saved separately from the pipeline eval):
 #   python scripts/reference_metrics.py --state states/sn-gamestate.pklz \
 #       --dataset-path data/SoccerNetGS --eval-set test --out reference_metrics
@@ -52,6 +62,7 @@ defaults:
   - modules/team_embed: osnet_team
   - modules/role_team: rules
   - modules/jersey_number_detect: jn_gsr
+  - modules/traj_refine: traj_refine
   - modules/tracklet_agg: voting_jn
   - modules/audit: run_audit
   - _self_
@@ -77,6 +88,7 @@ pipeline:
   - team_embed
   - role_team
   - jersey_number_detect
+  - traj_refine
   - tracklet_agg
   - audit
 

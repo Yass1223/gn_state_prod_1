@@ -28,7 +28,13 @@
 # tracklets that reached the rules without an embedding), jersey_number_detect
 # (cache blob: rule vote_pool, sha256 of BOTH checkpoints vs the staged files,
 # every eligible tracklet answered, detection columns consistent with the blob,
-# provisioning provenance of SATRN and PARSeq), tracklet_agg (jersey_number), and
+# provisioning provenance of SATRN and PARSeq), traj_refine (snapshots present,
+# sidecar: settings and embedder digest that ran vs configured and vs
+# split_merge's pin, rows only relabelled, tracklets_out == tracklets_in -
+# merges, merge distances <= tau, no frame collision, number/team/role constant
+# per refined track, disabled => untouched; the team_embed / role_team / jersey
+# checks use the pre-refine ids in track_id_prerefine and the jersey snapshot
+# columns), tracklet_agg (jersey_number), and
 # the radar (rows that would have no colour).
 _target_: sn_gamestate.audit.RunAudit
 cfg:
@@ -98,6 +104,21 @@ cfg:
   expected_pitch_gate:
     enabled: ${modules.pitch_gate.cfg.enabled}
     margin_m: ${modules.pitch_gate.cfg.margin_m}
+
+  # Trajectory-refinement stage: sidecar location (must equal the module's
+  # audit_dir) and the settings / checkpoint it must have run with. The stage's
+  # embedder pin must ALSO equal split_merge's: tau is on split_merge's
+  # cosine-distance scale, so different weights would silently change what the
+  # threshold means.
+  traj_refine_sidecar_dir: ${modules.traj_refine.cfg.audit_dir}
+  expected_traj_refine:
+    enabled: ${modules.traj_refine.cfg.enabled}
+    tau: ${modules.traj_refine.cfg.tau}
+    use_reenter: ${modules.traj_refine.cfg.use_reenter}
+    edge_margin: ${modules.traj_refine.cfg.edge_margin}
+    roles: ${modules.traj_refine.cfg.roles}
+    ain_sha256: ${modules.traj_refine.cfg.ain_sha256}
+    ain_sha256_split_merge: ${modules.split_merge.cfg.ain_sha256}
 
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.

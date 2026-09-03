@@ -13,10 +13,16 @@ frames in chronological order, xywh = top-left player box (the recognizer's
 native input: it pads/crops internally; stride is applied by the recognizer).
 
 Output (one file per shard):
-    {"shard": i, "num_shards": n, "rule": "vote_pool", "stride": ...,
-     "legibility_thr": ..., "parseq_ckpt": ..., "satrn_ckpt": ...,
+    {"shard": i, "num_shards": n, "rule": "vote_pool", "schema": 2,
+     "stride": ..., "legibility_thr": ..., "parseq_ckpt": ..., "satrn_ckpt": ...,
      "results": {"<tid>": {"number": "1".."99"|"-1",
-                            "confidence": float, "n_used": int}}}
+                            "confidence": float, "n_used": int,
+                            "candidates": [[label, mx, conf_sum, votes], ...]}}}
+
+The candidates rank every pooled label of the two recognisers under the
+maxconf score exp(mx) * conf_sum, best first (jn_recognizer.predict_full);
+mx/conf_sum/votes are per-label stats a downstream consumer can recombine
+when it merges tracklets (mx = max, conf_sum and votes add).
 
 Sharding: sorted(tids)[shard::num_shards] -- deterministic, disjoint, complete.
 Each worker is pinned to one GPU by the launcher via CUDA_VISIBLE_DEVICES (the
@@ -50,6 +56,11 @@ DEFAULT_PARSEQ_CKPT = "parseq_gsr_ft_s1.ckpt"
 DEFAULT_SATRN_CKPT = "recog2/best_recog_word_acc_epoch_10.pth"
 RULE = "vote_pool"
 
+# Shard/blob output schema. 2 adds per-tracklet "candidates": the pooled
+# labels as [label, mx, conf_sum, votes] ranked by the maxconf score (see
+# fuse_jn.ranked_candidates); the host module refuses older blobs.
+SCHEMA = 2
+
 
 def shard_tids(tids, shard, num_shards):
     """Deterministic disjoint complete partition of the tracklet ids."""
@@ -81,13 +92,15 @@ def run(manifest_path, out_path, models_dir, shard, num_shards,
     for k, tid in enumerate(mine):
         frames = [(fp, tuple(xywh)) for fp, xywh in tracklets[tid]]
         try:
-            number, conf, n_used = recognizer.predict(frames)
+            number, conf, n_used, cand = recognizer.predict_full(frames)
         except Exception as e:  # one broken tracklet must not sink the shard
             print(f"[jn-worker {shard}] tracklet {tid} FAILED: "
                   f"{type(e).__name__}: {e}", flush=True)
-            number, conf, n_used = "-1", 0.0, 0
+            number, conf, n_used, cand = "-1", 0.0, 0, []
         results[tid] = {"number": str(number), "confidence": float(conf),
-                        "n_used": int(n_used)}
+                        "n_used": int(n_used),
+                        "candidates": [[str(l), float(m), float(c), int(v)]
+                                       for l, m, c, v in cand]}
         if (k + 1) % 20 == 0 or k + 1 == len(mine):
             print(f"[jn-worker {shard}] {k + 1}/{len(mine)} "
                   f"({time.time() - t0:.0f}s)", flush=True)
@@ -95,7 +108,7 @@ def run(manifest_path, out_path, models_dir, shard, num_shards,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump({"shard": shard, "num_shards": num_shards, "rule": RULE,
-                   "stride": stride,
+                   "schema": SCHEMA, "stride": stride,
                    "legibility_thr": float(legibility_thr),
                    "parseq_ckpt": parseq_ckpt, "satrn_ckpt": satrn_ckpt,
                    "results": results}, f)
@@ -144,13 +157,20 @@ def main(argv=None):
 
 
 class _StubRecognizer:
-    """Deterministic, torch-free stand-in mirroring predict()'s contract."""
+    """Deterministic, torch-free stand-in mirroring the recognizer's contract."""
 
-    def predict(self, frames):
+    def predict_full(self, frames):
         n = len(list(frames))
         if n == 0:
-            return "-1", 0.0, 0
-        return str((n % 99) + 1), 0.75, n
+            return "-1", 0.0, 0, []
+        num = str((n % 99) + 1)
+        # one plausible runner-up so candidate plumbing is exercised end to end
+        return num, 0.75, n, [[num, -0.2, 0.9 * n, n],
+                              ["-1", -1.5, 0.1, 1]]
+
+    def predict(self, frames):
+        number, conf, n_used, _ = self.predict_full(frames)
+        return number, conf, n_used
 
 
 # --------------------------------- self-tests --------------------------------
@@ -190,13 +210,19 @@ def self_test():
             # travel with its output
             assert out["legibility_thr"] == 0.72, out["legibility_thr"]
             assert out["rule"] == "vote_pool", out["rule"]
+            assert out["schema"] == SCHEMA, out.get("schema")
             assert out["parseq_ckpt"] == DEFAULT_PARSEQ_CKPT
             assert out["satrn_ckpt"] == DEFAULT_SATRN_CKPT
             merged.update(out["results"])
         assert set(merged) == set(man["tracklets"])
-        assert merged["d"] == {"number": "-1", "confidence": 0.0, "n_used": 0}
+        assert merged["d"] == {"number": "-1", "confidence": 0.0, "n_used": 0,
+                               "candidates": []}
         assert merged["b"]["number"] == "3" and merged["b"]["n_used"] == 2
         assert merged["e"]["number"] == "5" and merged["e"]["confidence"] == 0.75
+        # candidates: json-safe [label, mx, conf_sum, votes], winner first
+        cand = merged["e"]["candidates"]
+        assert cand and cand[0][0] == "5" and cand[-1][0] == "-1", cand
+        assert all(len(x) == 4 and isinstance(x[0], str) for x in cand)
 
         # a NON-default gate must survive into the shard output too, or the
         # host module's cache key and the worker's behaviour could disagree
@@ -209,7 +235,8 @@ def self_test():
 
     print("predict_tracklets: all self-tests passed (deterministic sharding, "
           "disjoint+complete partition, shard files, merge, -1 path, "
-          "legibility_thr + rule + both checkpoints recorded per shard)")
+          "legibility_thr + rule + schema + candidates + both checkpoints "
+          "recorded per shard)")
     return 0
 
 

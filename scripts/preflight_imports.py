@@ -85,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         "sn_gamestate.track.split_merge.split_merge_video",
         "sn_gamestate.reid.osnet_team.from_config",
         "sn_gamestate.team.rules.run_sequence",
+        "sn_gamestate.refine.traj_refine.refine_video",
     ]
     print(f"Importing {len(targets)} pipeline stages "
           f"(python {sys.version.split()[0]})\n")

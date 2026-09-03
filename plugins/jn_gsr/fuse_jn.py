@@ -160,6 +160,50 @@ def fuse_stats(sa, sb, rules=RULES):
     return out
 
 
+# ------------------------------------------------- pooled candidate ranking --
+# Per-label statistics over the POOLED frames of both models, exactly the
+# quantities the maxconf consolidation rule consumes (see the maxconf note):
+#     mx(L)        = max over L's pooled frames of the raw joint log-lik s(f)
+#     conf_sum(L)  = sum over L's pooled frames of the normalised confidence c(f)
+#     votes(L)     = number of pooled frame decodes that read L
+#     strength(L)  = sum over L's pooled frames of s(f)
+# and score(L) = exp(mx(L)) * conf_sum(L) -- the maxconf rule applied to the
+# pooled frames (identical to the score `joint_maxconf` ranks by). The stats,
+# not just the score, are what a consumer that MERGES tracklets needs: for two
+# groups of frames the combined score is exp(max(mx1, mx2)) * (cs1 + cs2),
+# which cannot be recovered from the two products alone.
+
+
+def pooled_label_stats(sa, sb):
+    """{label: dict(mx, conf_sum, votes, strength)} over the pooled frames of
+    the two models' `label_stats`. A label unseen by one model contributes that
+    model's zeros/-inf identity values."""
+    out = {}
+    for st in (sa, sb):
+        for lab, s in st.items():
+            o = out.setdefault(lab, {"mx": float("-inf"), "conf_sum": 0.0,
+                                     "votes": 0, "strength": 0.0})
+            o["mx"] = max(o["mx"], s["mx"])
+            o["conf_sum"] += s["conf_sum"]
+            o["votes"] += s["votes"]
+            o["strength"] += s["strength"]
+    return out
+
+
+def ranked_candidates(sa, sb):
+    """Every pooled label as [label, mx, conf_sum, votes], sorted best first by
+    the extended maxconf tie rule: (score, pooled votes, pooled strength,
+    label), descending. score = exp(mx) * conf_sum. The first entry is the
+    label `joint_maxconf` selects (same score, same tie rule)."""
+    pooled = pooled_label_stats(sa, sb)
+    order = sorted(pooled,
+                   key=lambda l: (float(np.exp(pooled[l]["mx"])) * pooled[l]["conf_sum"],
+                                  pooled[l]["votes"], pooled[l]["strength"], l),
+                   reverse=True)
+    return [[l, float(pooled[l]["mx"]), float(pooled[l]["conf_sum"]),
+             int(pooled[l]["votes"])] for l in order]
+
+
 # ------------------------------------------------------------- self-tests --
 if __name__ == "__main__":
     import math
@@ -244,5 +288,43 @@ if __name__ == "__main__":
     TA, UA = frames(("3", 0.7)); TB, UB = frames(("8", 0.7))
     r = fuse(TA, UA, TB, UB)
     assert r["vote_pool"] == "8" and r["sum"] == "8"
+
+
+    # 7. ranked_candidates: pooled stats combine per label (mx=max, sums add),
+    #    the ranking follows (score, votes, strength, label) descending, and the
+    #    top entry equals joint_maxconf's winner on the same frames.
+    TA, UA = frames(("45", 0.95), ("23", 0.6), ("23", 0.6))
+    TB, UB = frames(("23", 0.7), ("23", 0.7), ("23", 0.7), ("23", 0.7))
+    sa, sb = label_stats(TA, UA), label_stats(TB, UB)
+    cand = ranked_candidates(sa, sb)
+    labels = [c[0] for c in cand]
+    assert set(labels) == {"23", "45"}, labels
+    assert labels[0] == fuse(TA, UA, TB, UB)["joint_maxconf"] == "23"
+    by = {c[0]: c for c in cand}
+    # pooled votes: 23 read 2 (A) + 4 (B) = 6 times, 45 once
+    assert by["23"][3] == 6 and by["45"][3] == 1, cand
+    # pooled mx is the max of the two models' mx, conf_sum their sum
+    for lab in ("23", "45"):
+        want_mx = max(sa[lab]["mx"] if lab in sa else float("-inf"),
+                      sb[lab]["mx"] if lab in sb else float("-inf"))
+        want_cs = (sa.get(lab, {"conf_sum": 0.0})["conf_sum"]
+                   + sb.get(lab, {"conf_sum": 0.0})["conf_sum"])
+        assert abs(by[lab][1] - want_mx) < 1e-12
+        assert abs(by[lab][2] - want_cs) < 1e-12
+    # scores strictly ordered here: 23 pooled beats 45
+    s23 = float(np.exp(by["23"][1])) * by["23"][2]
+    s45 = float(np.exp(by["45"][1])) * by["45"][2]
+    assert s23 > s45
+
+    # 8. "-1" is a rankable candidate; a one-sided label still appears; empty
+    #    stats give an empty list; a perfect tie falls to the label string.
+    TA, UA = frames(("-1", 0.9), ("7", 0.5))
+    TB, UB = frames(("-1", 0.9), ("-1", 0.9))
+    cand = ranked_candidates(label_stats(TA, UA), label_stats(TB, UB))
+    assert [c[0] for c in cand] == ["-1", "7"], cand
+    assert ranked_candidates({}, {}) == []
+    TA, UA = frames(("3", 0.7)); TB, UB = frames(("8", 0.7))
+    cand = ranked_candidates(label_stats(TA, UA), label_stats(TB, UB))
+    assert [c[0] for c in cand] == ["8", "3"]   # equal score/votes/strength -> label
 
     print("fuse_jn self-tests OK:", len(RULES), "rules")

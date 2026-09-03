@@ -65,7 +65,7 @@ from PIL import Image
 
 from common import subsample
 from crop_classifier import crop_box
-from fuse_jn import fuse_stats, label_stats, votes_of
+from fuse_jn import fuse_stats, label_stats, ranked_candidates, votes_of
 from legibility import frame_verdicts
 
 # The operating point. `LEGIBILITY_THR` is the DEFAULT for the constructor
@@ -194,8 +194,40 @@ class JerseyNumberRecognizer:
         pooled = votes_of(sa, label) + votes_of(sb, label)
         return label, pooled / (len(logls_a) + len(logls_b))
 
+    @staticmethod
+    def consolidate_full(logls_a, logls_b):
+        """`consolidate` plus the pooled per-label candidate list.
+        -> (label, share, candidates) where `label`/`share` are byte-identical
+        to `consolidate` (vote_pool stays the assigned number) and `candidates`
+        is fuse_jn.ranked_candidates on the same stats: every pooled label as
+        [label, mx, conf_sum, votes], best first under the maxconf score
+        exp(mx) * conf_sum with the extended tie rule. The stats (not just the
+        score) are emitted because a consumer that merges tracklets must
+        recombine them per the maxconf rule: mx = max, conf_sum/votes = sum."""
+        if len(logls_a) != len(logls_b):
+            raise RuntimeError(f"[jn] readers disagree on frame count: "
+                               f"{len(logls_a)} vs {len(logls_b)}")
+        if not logls_a:
+            return "-1", 0.0, []
+        sa = label_stats([t for t, _ in logls_a], [u for _, u in logls_a])
+        sb = label_stats([t for t, _ in logls_b], [u for _, u in logls_b])
+        label = fuse_stats(sa, sb, rules=(RULE,))[RULE]
+        pooled = votes_of(sa, label) + votes_of(sb, label)
+        share = pooled / (len(logls_a) + len(logls_b))
+        return label, share, ranked_candidates(sa, sb)
+
     def predict(self, tracklet):
-        """-> (number "1".."99" | "-1", vote_share, n_frames_in_vote)."""
+        """-> (number "1".."99" | "-1", vote_share, n_frames_in_vote).
+        Unchanged contract; delegates to `predict_full` and drops the
+        candidate list."""
+        number, share, n_used, _ = self.predict_full(tracklet)
+        return number, share, n_used
+
+    def predict_full(self, tracklet):
+        """-> (number, vote_share, n_frames_in_vote, candidates). The first
+        three are byte-identical to `predict`; `candidates` ranks every pooled
+        label as [label, mx, conf_sum, votes] under the maxconf score (see
+        `consolidate_full`). Empty when no frame survives the gates."""
         M = self._M
         frames = subsample(list(tracklet), self.stride)
 
@@ -229,12 +261,12 @@ class JerseyNumberRecognizer:
 
         # both readers on the survivors, then the pooled vote
         if not rois:
-            return "-1", 0.0, 0
+            return "-1", 0.0, 0, []
         with self._amp():
             logls = M["read_many"](rois)
             logls2 = M["read_many2"](rois)
-        label, share = self.consolidate(logls, logls2)
-        return label, float(share), len(rois)
+        label, share, cand = self.consolidate_full(logls, logls2)
+        return label, float(share), len(rois), cand
 
 
 # ------------------------------ self-tests ------------------------------- #
@@ -405,8 +437,37 @@ if __name__ == "__main__":
     lab, share = JerseyNumberRecognizer.consolidate(A, B)
     assert lab == ref["vote_pool"] and abs(share - 3 / 6) < 1e-9, (lab, share)
 
+    # 11) predict_full: first three values byte-identical to predict; the
+    #     candidate list ranks the pooled labels with combinable stats.
+    #     A reads 7,7,9 ; B reads 7,9,9 (all survive): 7 and 9 tie 3-3 on
+    #     votes, 7 wins on strength; candidates carry both with votes 3+3.
+    ra = Reader([(7, .9), (7, .9), (9, .6)])
+    rb = Reader([(7, .9), (9, .6), (9, .6)])
+    rec = JerseyNumberRecognizer(models=models(
+        StubGate([0.9, 0.9, 0.9]), StubLeg([0.99, 0.99, 0.99]), ra, rb), stride=1)
+    n4, c4, u4, cand = rec.predict_full(tr[:3])
+    assert (n4, u4) == ("7", 3) and abs(c4 - 3 / 6) < 1e-9, (n4, c4, u4)
+    assert [x[0] for x in cand] == ["7", "9"], cand
+    assert cand[0][3] == 3 and cand[1][3] == 3          # pooled votes
+    assert all(len(x) == 4 for x in cand)
+    # the second-ranked candidate is exactly what a downstream conflict
+    # resolution walks to
+    assert cand[1][0] == "9"
+    # and predict() on the same inputs returns the same first three values
+    ra2 = Reader([(7, .9), (7, .9), (9, .6)])
+    rb2 = Reader([(7, .9), (9, .6), (9, .6)])
+    rec2 = JerseyNumberRecognizer(models=models(
+        StubGate([0.9, 0.9, 0.9]), StubLeg([0.99, 0.99, 0.99]), ra2, rb2), stride=1)
+    assert rec2.predict(tr[:3]) == (n4, c4, u4)
+
+    # 12) predict_full -1 path: empty candidates when nothing survives
+    rec = JerseyNumberRecognizer(models=models(
+        StubGate([0.4]), StubLeg([0.99]), Reader([]), Reader([])), stride=1)
+    assert rec.predict_full([tr[0]]) == ("-1", 0.0, 0, [])
+
     print("jn_recognizer: all self-tests passed (strict gates at 0.72/0.52, "
           "gate order, vote_pool label + pooled share, second model can win, "
           "-1 path, pre-cropped sentinel, stride, two-digit decode, "
           "legibility_thr is a constructor knob, reader count mismatch "
-          "raises, hook requires both readers, agrees with fuse_jn)")
+          "raises, hook requires both readers, agrees with fuse_jn, "
+          "predict_full candidates + -1 path)")

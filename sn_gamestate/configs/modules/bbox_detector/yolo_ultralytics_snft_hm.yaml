@@ -1,0 +1,41 @@
+# YOLO11-L "HM" fine-tune (single-class person), weights fetched from Hugging Face —
+# the ALTERNATIVE detector. Same stage module and identical inference operating point
+# as yolo_ultralytics_snft.yaml (imgsz 1280, conf floor 0.1 kept with `>=`, iou 0.7,
+# max_det 300, RGB->BGR fix, fp16 on CUDA), so a run under this config differs from
+# the default ONLY in the detector weights.
+#
+# Select per run (Hydra defaults group; the default in soccernet.yaml stays the
+# frozen-baseline detector):
+#
+#   tracklab -cn soccernet modules/bbox_detector=yolo_ultralytics_snft_hm
+#
+# Weights: HF Ynniss/YOLOv11L_HM `best.zip` — the .zip IS the torch checkpoint (a
+# torch.save zip archive with its members under one prefix, the same publication
+# pattern as best_ain_full.zip / the SATRN and PARSeq zips), so torch.load reads the
+# download directly. The 3-argument ${hf:...} form materialises a cache-sibling copy
+# named `yolov11l_hm_best.pt` so ultralytics' suffix-based routing sees a .pt.
+# ~50 MB, fp16 storages, ultralytics DetectionModel (YOLO11 blocks). No digest pin,
+# matching the default detector config.
+#
+# Caches when switching detectors:
+#   * jersey cache — content-keyed on track ids + boxes: misses and recomputes
+#     automatically under a different detector. Nothing to do.
+#   * broadtrack_calib/<seq>.json — keyed by sequence name only, and BroadTrack's
+#     player masks come from our own detections. For a detector A/B comparison,
+#     REUSING the existing cache is deliberate (same camera parameters for both runs
+#     removes a confound). For a from-scratch production run under this detector,
+#     clear broadtrack_calib/ or override modules.calibration.cfg.calib_dir.
+#
+# TensorRT: engine_path below is this variant's name, but scripts/build_trt_engines.py
+# currently builds only the default detector's engine; with use_tensorrt=true and no
+# engine at this path the stage warns and falls back to PyTorch (never hard-fails).
+_target_: sn_gamestate.bbox_detector.yolo_snft_api.YOLOUltralyticsSNFT
+batch_size: 4
+cfg:
+  path_to_checkpoint: ${hf:Ynniss/YOLOv11L_HM,best.zip,yolov11l_hm_best.pt}
+  min_confidence: 0.1
+  imgsz: 1280
+  iou: 0.7
+  max_det: 300
+  use_tensorrt: ${use_tensorrt}
+  engine_path: ${trt_dir}/yolov11l_hm_best.engine

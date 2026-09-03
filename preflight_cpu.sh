@@ -88,12 +88,16 @@ done
 hdr "3. detector  (HF cache, \${hf:} resolver)"
 if hf_out=$(${PY} python - <<'PYEOF' 2>/dev/null
 from huggingface_hub import try_to_load_from_cache
-# Only the detector: no config references sports_model.pth.tar-60, and the successful
-# end-to-end Kaggle run of 2026-09-02 never touched it (removed as a stale leftover of
+# BOTH detector variants the configs reference (Hydra defaults group
+# modules/bbox_detector): the default yolo_ultralytics_snft.yaml and the
+# alternative yolo_ultralytics_snft_hm.yaml (best.zip IS the torch checkpoint;
+# the ${hf:} resolver copies it to yolov11l_hm_best.pt at config resolution).
+# No config references sports_model.pth.tar-60 (removed as a stale leftover of
 # the upstream baseline; the tracker/split_merge ReID comes from Ynniss/osnet_ain, §5).
-for f in ("yolov11_sn_best.pt",):
-    p = try_to_load_from_cache("Ynniss/sn-gamestate-weights", f)
-    print(("OK " if isinstance(p, str) else "MISS ") + f)
+for repo, f in (("Ynniss/sn-gamestate-weights", "yolov11_sn_best.pt"),
+                ("Ynniss/YOLOv11L_HM", "best.zip")):
+    p = try_to_load_from_cache(repo, f)
+    print(("OK " if isinstance(p, str) else "MISS ") + f"{repo}/{f}")
 PYEOF
 ); then
   echo "$hf_out" | while read -r st f; do [ "$st" = OK ] && ok "hf: $f" || bad "hf: $f"; done
@@ -194,8 +198,10 @@ PYEOF
 fi
 
 if [ "$NEED_HF" = 1 ]; then
-  hdr "-> detector (the only file the configs reference in this repo)"
+  hdr "-> detector weights (both variants the configs reference)"
   ${PY} hf download Ynniss/sn-gamestate-weights yolov11_sn_best.pt \
+    || warn "HF fetch failed - private repo? export HF_TOKEN=hf_..."
+  ${PY} hf download Ynniss/YOLOv11L_HM best.zip \
     || warn "HF fetch failed - private repo? export HF_TOKEN=hf_..."
 fi
 

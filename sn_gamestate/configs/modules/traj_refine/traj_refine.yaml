@@ -1,0 +1,69 @@
+# Label-aware trajectory refinement, run between `jersey_number_detect` and
+# `tracklet_agg`: it consumes evidence that does not exist at split_merge's
+# position in the pipeline -- the team side (role_team), the jersey number with
+# its pooled maxconf candidate statistics (jn_gsr_api), and exit/entry geometry.
+#
+# Method (sn_gamestate/refine/traj_refine.py): phase 2a merges in-scope
+# trajectory pairs with equal team AND equal jersey number, in descending order
+# of the pair's maxconf score, when their frame sets are disjoint, their
+# exit/entry sides are consistent and their appearance distance is <= tau; a
+# pair claiming one number at the SAME time is a conflict, resolved by
+# reassigning the lower-maxconf side to its best remaining jersey candidate
+# (or leaving it unnumbered). Phase 2b then merges agglomeratively (average
+# linkage, split_merge's distance convention) under time-disjointness,
+# re-enter consistency and vacuous-when-unknown label agreement: teams must
+# agree when both are known, numbers must agree when both are known -- so a
+# fragment with only a team, only a number, or neither can still attach.
+# Role is not a merge condition; a merged cluster's rows are unified to the
+# row-majority role afterwards. Referees are out of scope and untouched.
+#
+# The incoming ids and jersey columns are snapshotted per row
+# (track_id_prerefine, jersey_number_detection_prerefine,
+# jersey_number_confidence_prerefine) so the audit holds every earlier stage
+# to the state it actually produced -- the pattern pitch_gate uses with
+# track_id_pregate. `enabled: false` keeps the snapshots and the sidecar but
+# changes nothing: the attribution switch for A/B metric runs.
+#
+# Appearance: the tracker's OSNet-AIN, built from the shared module
+# sn_gamestate/reid/osnet_ain.py with the SAME checkpoint pin as
+# modules/track/botsort_ain.yaml and modules/split_merge/split_merge.yaml, so
+# tau keeps the cosine-distance scale split_merge's tau was tuned on. The run
+# audit fails the run on any pin mismatch against split_merge.
+_target_: sn_gamestate.refine.traj_refine_api.TrajRefine
+cfg:
+  # OSNet-AIN checkpoint -- SAME coordinates and digest as modules/track/botsort_ain.yaml
+  # and modules/split_merge/split_merge.yaml.
+  ain_repo: Ynniss/osnet_ain
+  ain_file: best_ain_full.zip
+  ain_revision: d78f65ded828f0cbd8dff2a06dcbff4fc6835dfe
+  ain_sha256: a0a7e42676edad0cbc3a4ba0f7d0f8ded75612443ef7a9eabb57cb9e5e245293
+  # As in the track config: set this to read the checkpoint from disk instead of
+  # the Hub. Keep it in step with the tracker's value.
+  ain_local_path: null
+
+  # Master switch. false = snapshots + sidecar only, detections unchanged
+  # (for measuring this stage's metric contribution on the same run).
+  enabled: true
+
+  # Merge acceptance threshold on the appearance distance (1 - dot of mean unit
+  # vectors over clean detections), both phases. Same convention and value as
+  # split_merge's tau (0.60, its notebook-validated operating point); NOT
+  # re-tuned for this stage on any validation split yet.
+  tau: 0.60
+
+  # Re-enter condition (C3): when one trajectory ends before the other begins
+  # and both boundary boxes touch a lateral image edge, the sides must match.
+  # edge_margin is the touch tolerance as a fraction of the image width
+  # (0.02 = ~38 px at 1920); not tuned on any validation split yet.
+  use_reenter: true
+  edge_margin: 0.02
+
+  # Scope: trajectories whose per-track modal role is here. Keep in step with
+  # modules/jersey_number_detect/jn_gsr.yaml `roles` (the audit checks what ran).
+  roles: [player, goalkeeper]
+
+  batch_size: 64      # crops per appearance forward pass
+
+  # Per-sequence sidecar (settings, embedder digest, merge/conflict/rejection
+  # log of both phases, per-cluster breakdown) read by the `audit` stage.
+  audit_dir: ${project_dir}/audit/traj_refine

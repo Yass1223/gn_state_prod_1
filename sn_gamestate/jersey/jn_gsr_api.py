@@ -46,6 +46,14 @@ keeps the same pipeline slot; ``MajorityVoteTracklet`` then votes over a per-tra
 constant, yielding the identical final ``jersey_number`` -- the GSR encoder and
 the eval are untouched.
 
+Two ADDITIVE columns feed the ``traj_refine`` stage (blob schema 2):
+``jersey_number_candidates`` -- every pooled label of the two recognisers as
+``[label, mx, conf_sum, votes]``, ranked by the maxconf score exp(mx) *
+conf_sum (fuse_jn.ranked_candidates; stats, not scores, so merged tracklets
+recombine exactly: mx = max, conf_sum/votes add) -- and
+``jersey_number_maxconf``, the assigned number's maxconf score (0.0 when
+unnumbered). The assigned number itself is still vote_pool, unchanged.
+
 Scope follows the package's validated setting: only tracklets whose ``role`` (the
 per-tracklet role assigned by the ``role_team`` stage, which runs before this one)
 is in ``roles`` (player, goalkeeper) are recognized; referees get (None, 0.0),
@@ -72,6 +80,7 @@ crash and never a fabricated value.
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -88,6 +97,11 @@ UNNUMBERED = "-1"
 # The build's one consolidation rule (jn_recognizer.RULE / predict_tracklets.
 # RULE); recorded in the cache key and checked against every shard's output.
 RULE = "vote_pool"
+
+# Worker blob schema this stage requires (predict_tracklets.SCHEMA). 2 adds
+# per-tracklet "candidates". Folded into the cache key (an old cache misses
+# and recomputes once) and checked on every shard and cached blob.
+SCHEMA = 2
 
 # Must match jn_recognizer's `parseq_ckpt` / `satrn_ckpt` defaults. They cannot
 # be imported: that module lives in the OTHER interpreter (python 3.10 /
@@ -114,7 +128,8 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
     """Tracklet-level jersey recognition via the vendored jn_pipeline_gsr package."""
 
     input_columns = ["track_id", "bbox_ltwh", "image_id", "role", "crop_single"]
-    output_columns = ["jersey_number_detection", "jersey_number_confidence"]
+    output_columns = ["jersey_number_detection", "jersey_number_confidence",
+                      "jersey_number_candidates", "jersey_number_maxconf"]
 
     def __init__(self, cfg, device, tracking_dataset=None):
         self.cfg = cfg
@@ -227,6 +242,7 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         without them serves stale results after exactly the edits this stage
         is most likely to receive."""
         payload = json.dumps({"tracklets": manifest, "rule": rule,
+                              "schema": SCHEMA,
                               "stride": stride,
                               "legibility_thr": self.legibility_thr,
                               "single_crops_only": self.single_crops_only,
@@ -291,6 +307,11 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                     log.error(f"[jn_gsr] {shard_file} was produced under rule "
                               f"{blob.get('rule')!r}, expected {self.rule!r}")
                     return None
+                if blob.get("schema") != SCHEMA:
+                    log.error(f"[jn_gsr] {shard_file} was produced under schema "
+                              f"{blob.get('schema')!r}, expected {SCHEMA} -- the "
+                              f"vendored worker predates the candidates output")
+                    return None
                 merged.update(blob["results"])
             except (OSError, json.JSONDecodeError, KeyError) as e:
                 log.error(f"[jn_gsr] could not read {shard_file}: {e}")
@@ -302,6 +323,8 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         detections = detections.copy()
         detections["jersey_number_detection"] = None
         detections["jersey_number_confidence"] = 0.0
+        detections["jersey_number_candidates"] = None
+        detections["jersey_number_maxconf"] = 0.0
         if len(detections) == 0 or "track_id" not in detections.columns \
                 or detections["track_id"].isna().all():
             return detections
@@ -322,7 +345,9 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         if self.use_cache and cache_file.is_file():
             try:
                 blob = json.loads(cache_file.read_text())
-                if blob.get("manifest_sha256") == mhash:  # exact-content match only
+                # exact-content match only, and only a blob of this schema
+                if blob.get("manifest_sha256") == mhash \
+                        and blob.get("schema") == SCHEMA:
                     results = blob["results"]
                     log.info(f"[jn_gsr] {seq}: cache hit ({cache_file.name})")
             except (OSError, json.JSONDecodeError, KeyError):
@@ -347,6 +372,7 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                           f"from worker output -- left unnumbered")
             cache_file.write_text(json.dumps({
                 "manifest_sha256": mhash, "rule": self.rule,
+                "schema": SCHEMA,
                 "stride": self.stride,
                 "legibility_thr": self.legibility_thr,
                 "single_crops_only": self.single_crops_only,
@@ -363,10 +389,21 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         for tid, res in results.items():
             number = res.get("number", UNNUMBERED)
             mask = tid_str == tid
+            cand = res.get("candidates") or []
+            if cand:
+                # one shared list object per tracklet; consumers treat it
+                # read-only (traj_refine copies the stats before combining)
+                detections.loc[mask, "jersey_number_candidates"] = \
+                    pd.Series([cand] * int(mask.sum()),
+                              index=detections.index[mask])
             if number != UNNUMBERED and str(number).isdigit():
                 detections.loc[mask, "jersey_number_detection"] = str(int(number))
                 detections.loc[mask, "jersey_number_confidence"] = \
                     float(res.get("confidence", 0.0))
+                entry = next((c for c in cand if str(c[0]) == str(number)), None)
+                if entry is not None:
+                    detections.loc[mask, "jersey_number_maxconf"] = \
+                        float(math.exp(float(entry[1])) * float(entry[2]))
                 n_numbered += 1
         log.info(f"[jn_gsr] {seq}: {n_numbered}/{len(manifest)} tracklets "
                  f"numbered ({skipped} skipped by role filter, "

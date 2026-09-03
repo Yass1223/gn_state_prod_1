@@ -153,6 +153,14 @@ class RunAudit(VideoLevelModule):
         self.pitch_gate_sidecar_dir = Path(str(d)) if d else None
         self.expected_pitch_gate = {str(k): v for k, v in
                                     (getattr(cfg, "expected_pitch_gate", {}) or {}).items()}
+        # Trajectory-refinement stage sidecar (sn_gamestate.refine.traj_refine_api)
+        # and the settings / checkpoint it must have run with. The refine stage
+        # relabels track_id AFTER pitch_gate/role_team/jersey, so those checks run
+        # on its per-row snapshots (track_id_prerefine, jersey snapshots).
+        d = getattr(cfg, "traj_refine_sidecar_dir", None)
+        self.traj_refine_sidecar_dir = Path(str(d)) if d else None
+        self.expected_traj_refine = {str(k): v for k, v in
+                                     (getattr(cfg, "expected_traj_refine", {}) or {}).items()}
         thr = getattr(cfg, "thresholds", None) or {}
         g = lambda k, d: float(thr[k]) if k in thr else d  # noqa: E731
         self.thr = {
@@ -665,8 +673,12 @@ class RunAudit(VideoLevelModule):
             c.set(FAIL, f"{n_rule_mismatch} rows whose pitch_gate_offpitch differs from the rule "
                         f"at margin {margin}")
 
-        # --- track_id changed exactly as the switch says
-        tid_now, tid_pre = det["track_id"], det["track_id_pregate"]
+        # --- track_id changed exactly as the switch says. The gate must be held
+        # to the ids as IT left them: when the traj_refine stage ran afterwards
+        # (and relabelled merged trajectories), those are in track_id_prerefine.
+        tid_now = (det["track_id_prerefine"] if "track_id_prerefine" in det.columns
+                   else det["track_id"])
+        tid_pre = det["track_id_pregate"]
         if enabled:
             off_with_id = int((got_off & tid_now.notna()).sum())
             kept = (~got_off) & tid_pre.notna()
@@ -684,7 +696,7 @@ class RunAudit(VideoLevelModule):
             if changed:
                 c.set(FAIL, f"gate disabled but track_id differs from track_id_pregate on {changed} rows")
 
-        # --- counts against the sidecar
+        # --- counts against the sidecar (on the same pre-refine ids)
         n_trk = len(per)
         n_off = sum(1 for p in per if p["off_pitch"])
         n_nopos = sum(1 for p in per if p["n_positions"] == 0)
@@ -801,11 +813,20 @@ class RunAudit(VideoLevelModule):
         return out
 
     def _check_jersey(self, seq, tracked):
+        """``tracked`` must hold the rows as the jersey stage saw them: pre-refine
+        ids, and -- through ``jn_col`` -- the pre-refine number/confidence snapshots
+        when the traj_refine stage ran afterwards (it reassigns conflicting
+        numbers and propagates merged ones, which is ITS contract, checked in
+        ``_check_traj_refine``)."""
         c = Check("jersey_number_detect",
                   f"per-sequence cache blob with rule={RULE}, real sha256 of both "
                   f"checkpoints, single_crops_only as configured, an answer for every "
                   f"eligible tracklet, no number on a tracklet without a single crop, "
                   f"per-track constant jersey_number_detection consistent with the blob")
+        jn_col = ("jersey_number_detection_prerefine"
+                  if "jersey_number_detection_prerefine" in tracked.columns
+                  else "jersey_number_detection")
+        c.observed["number_column"] = jn_col
         eligible = self._eligible_tids(tracked)
         c.observed["eligible_tracklets"] = len(eligible)
         c.observed["single_crops_only"] = self.jn_single_crops_only
@@ -826,13 +847,13 @@ class RunAudit(VideoLevelModule):
             return c
 
         # per-track constancy + coverage from the detection columns
-        bad = self._per_track_constant(tracked, "jersey_number_detection")
+        bad = self._per_track_constant(tracked, jn_col)
         c.observed["tracks_with_inconsistent_number"] = len(bad)
         if bad:
-            c.set(FAIL, f"{len(bad)} tracks with >1 jersey_number_detection value")
+            c.set(FAIL, f"{len(bad)} tracks with >1 {jn_col} value")
         numbered = set()
         for tid, grp in tracked.groupby("track_id"):
-            vals = [v for v in grp["jersey_number_detection"] if not _is_nan(v)]
+            vals = [v for v in grp[jn_col] if not _is_nan(v)]
             if vals:
                 numbered.add(_tid(tid))
         c.observed["eligible_numbered"] = len(numbered & eligible)
@@ -907,7 +928,7 @@ class RunAudit(VideoLevelModule):
             r = results.get(_tid(tid))
             if r is None:
                 continue
-            vals = {str(int(float(v))) for v in grp["jersey_number_detection"]
+            vals = {str(int(float(v))) for v in grp[jn_col]
                     if not _is_nan(v)}
             want = str(r.get("number"))
             want = str(int(want)) if want.isdigit() else None
@@ -953,6 +974,154 @@ class RunAudit(VideoLevelModule):
                     c.set(FAIL, "PARSeq checkpoint does not match upstream")
             except (OSError, json.JSONDecodeError) as e:
                 c.set(WARN, f"weights_provenance.json unreadable: {e}")
+        return c
+
+    def _check_traj_refine(self, seq, det, tracked, tracked_prerefine):
+        """Inputs, internals and outputs of the traj_refine stage.
+
+        Snapshots present; sidecar present with the settings and embedder digest
+        that ran equal to the configured ones and to split_merge's checkpoint pin;
+        the tracked-row set is unchanged (the stage only relabels); tracklets
+        after == tracklets before - merges; every accepted merge distance <= tau;
+        no (image_id, track_id) collision; number/team/role constant per final
+        track; counts equal the sidecar's; disabled => everything untouched."""
+        c = Check("traj_refine (label-aware trajectory refinement)",
+                  "track_id_prerefine + jersey snapshots on every row; sidecar with the "
+                  "settings and checkpoint that ran equal to the configured ones and to "
+                  "split_merge's pin; tracked rows only relabelled; tracklets_out == "
+                  "tracklets_in - merges; merge distances <= tau; one detection per frame "
+                  "per trajectory; number/team/role constant per final track; "
+                  "disabled => track_id and jersey columns untouched")
+        exp = self.expected_traj_refine
+        c.observed["expected"] = dict(exp)
+        for col in ("track_id_prerefine", "jersey_number_detection_prerefine",
+                    "jersey_number_confidence_prerefine"):
+            if col not in det.columns:
+                c.observed[col] = "column missing"
+                c.set(FAIL, f"{col} column missing")
+        if c.verdict == FAIL:
+            return c
+        data = self._read_sidecar(self.traj_refine_sidecar_dir, seq)
+        c.observed["sidecar"] = (str(self.traj_refine_sidecar_dir / f"{seq}.json")
+                                if self.traj_refine_sidecar_dir else None)
+        if data is None:
+            return c.set(FAIL, "no traj_refine sidecar for this sequence (stage did not "
+                               "run, audit_dir unset, or unwritable)")
+
+        # --- settings and checkpoint that ran
+        st = data.get("settings") or {}
+        emb = data.get("embedder") or {}
+        c.observed["ran"] = dict(st)
+        c.observed["ran_embedder_sha256"] = emb.get("sha256") if emb else None
+        want_enabled = exp.get("enabled")
+        ran_enabled = st.get("enabled")
+        if want_enabled is None or ran_enabled is None:
+            c.set(FAIL, "enabled not declared (config) or not recorded (sidecar)")
+        elif bool(want_enabled) != bool(ran_enabled):
+            c.set(FAIL, f"enabled that ran ({ran_enabled}) != configured ({want_enabled})")
+        for key in ("tau", "edge_margin"):
+            want, got = exp.get(key), st.get(key)
+            if want is None or got is None:
+                c.set(FAIL, f"{key} not declared (config) or not recorded (sidecar)")
+            elif abs(float(got) - float(want)) > 1e-9:
+                c.set(FAIL, f"{key} that ran ({got}) != configured ({want})")
+        want, got = exp.get("use_reenter"), st.get("use_reenter")
+        if want is not None and got is not None and bool(want) != bool(got):
+            c.set(FAIL, f"use_reenter that ran ({got}) != configured ({want})")
+        want_roles = exp.get("roles")
+        got_roles = st.get("roles")
+        if want_roles is not None and got_roles is not None \
+                and sorted(map(str, want_roles)) != sorted(map(str, got_roles)):
+            c.set(FAIL, f"roles that ran ({got_roles}) != configured ({want_roles})")
+
+        enabled = bool(ran_enabled)
+        tid_now, tid_pre = det["track_id"], det["track_id_prerefine"]
+        if not enabled or not data.get("ran", False):
+            changed = int((~((tid_now == tid_pre) | (tid_now.isna() & tid_pre.isna()))).sum())
+            c.observed["rows_with_changed_id"] = changed
+            if changed:
+                c.set(FAIL, f"stage disabled or not run but track_id differs from "
+                            f"track_id_prerefine on {changed} rows")
+            if "jersey_number_detection" in det.columns:
+                a = det["jersey_number_detection"].map(lambda v: None if _is_nan(v) else str(v))
+                b = det["jersey_number_detection_prerefine"].map(
+                    lambda v: None if _is_nan(v) else str(v))
+                n_diff = int((a != b).sum())
+                if n_diff:
+                    c.set(FAIL, f"stage disabled or not run but jersey_number_detection "
+                                f"differs from its snapshot on {n_diff} rows")
+            if not enabled:
+                return c.set(INFO, "stage disabled by configuration")
+            return c.set(FAIL, "the stage recorded that it did not run on this sequence")
+
+        # --- checkpoint pin: equal to its own config AND to split_merge's
+        want_sha = exp.get("ain_sha256")
+        want_sha_sm = exp.get("ain_sha256_split_merge")
+        if want_sha in (None, "", "None"):
+            c.set(FAIL, "ain_sha256 not pinned in the traj_refine config")
+        elif want_sha_sm not in (None, "", "None") and str(want_sha) != str(want_sha_sm):
+            c.set(FAIL, "traj_refine and split_merge configs pin different weights")
+        if not emb or not emb.get("sha256"):
+            c.set(FAIL, "sidecar records no embedder digest")
+        elif want_sha not in (None, "", "None") and str(emb.get("sha256")) != str(want_sha):
+            c.set(FAIL, f"embedder sha256 that ran ({emb.get('sha256')}) "
+                        f"!= configured ({want_sha})")
+
+        # --- the stage only relabels: same rows tracked before and after
+        n_pre_rows = int(tid_pre.notna().sum())
+        n_now_rows = int(tid_now.notna().sum())
+        moved = int((tid_pre.notna() != tid_now.notna()).sum())
+        c.observed.update(tracked_rows_before=n_pre_rows, tracked_rows_after=n_now_rows,
+                          rows_gaining_or_losing_id=moved)
+        if moved:
+            c.set(FAIL, f"{moved} row(s) gained or lost a track_id in the refine stage")
+
+        # --- merge arithmetic against the sidecar
+        outp = data.get("outputs") or {}
+        inp = data.get("inputs") or {}
+        n_trk_pre = int(tracked_prerefine["track_id"].nunique()) if len(tracked_prerefine) else 0
+        n_trk_now = int(tracked["track_id"].nunique()) if len(tracked) else 0
+        n_merges = int(outp.get("merges") or 0)
+        c.observed.update(tracklets_before=n_trk_pre, tracklets_after=n_trk_now,
+                          merges=n_merges, conflicts=outp.get("conflicts"),
+                          rejected_2a=outp.get("rejected_2a"),
+                          no_centroid=len(data.get("no_centroid") or []),
+                          out_of_scope=data.get("out_of_scope"))
+        if int(inp.get("tracklets") or 0) != n_trk_pre:
+            c.set(FAIL, f"sidecar received {inp.get('tracklets')} tracklets, the snapshot "
+                        f"holds {n_trk_pre}")
+        if int(outp.get("tracklets") or 0) != n_trk_now:
+            c.set(FAIL, f"sidecar reports {outp.get('tracklets')} tracklets, the state "
+                        f"holds {n_trk_now}")
+        if n_trk_now != n_trk_pre - n_merges:
+            c.set(FAIL, f"tracklets after ({n_trk_now}) != before ({n_trk_pre}) - "
+                        f"merges ({n_merges})")
+        tau = exp.get("tau")
+        dists = [m.get("distance") for m in (data.get("merge_log") or [])
+                 if m.get("distance") is not None]
+        if len(dists) != n_merges:
+            c.set(FAIL, f"{len(dists)} merge distances recorded for {n_merges} merges")
+        if dists:
+            c.observed["merge_distance_max"] = round(float(max(dists)), 4)
+            if tau is not None and max(dists) > float(tau) + 1e-6:
+                c.set(FAIL, f"a merge was accepted at distance {max(dists):.4f} > tau {tau}")
+        if int(outp.get("frame_collisions") or 0) or int(outp.get("clusters_incoherent") or 0):
+            c.set(FAIL, f"the stage reported {outp.get('frame_collisions')} frame "
+                        f"collision(s) and {outp.get('clusters_incoherent')} incoherent "
+                        f"cluster(s) in its own output")
+
+        # --- outputs, recomputed from the detections
+        if len(tracked):
+            coll = int(tracked.duplicated(subset=["image_id", "track_id"]).sum())
+            c.observed["frame_collisions_recomputed"] = coll
+            if coll:
+                c.set(FAIL, f"{coll} (image_id, track_id) collision(s) after refinement")
+            for col in ("jersey_number_detection", "team", "role"):
+                bad = self._per_track_constant(tracked, col)
+                if bad is None:
+                    c.set(FAIL, f"{col} column missing")
+                elif bad:
+                    c.set(FAIL, f"{col} varies within {len(bad)} refined tracks")
         return c
 
     def _check_tracklet_agg(self, tracked):
@@ -1148,6 +1317,15 @@ class RunAudit(VideoLevelModule):
             tracked_pregate["track_id"] = tracked_pregate["track_id_pregate"]
         else:
             tracked_pregate = tracked
+        # The ids as the pitch gate left them: the traj_refine stage relabels merged
+        # trajectories and keeps the incoming id in track_id_prerefine, so the
+        # team_embed / role_team / jersey checks (stages that ran BEFORE refine)
+        # compare against that column when the refine stage ran.
+        if "track_id_prerefine" in det.columns:
+            tracked_prerefine = det[det["track_id_prerefine"].notna()].copy()
+            tracked_prerefine["track_id"] = tracked_prerefine["track_id_prerefine"]
+        else:
+            tracked_prerefine = tracked
         checks = [
             self._check_detector(det, metadatas),
             self._check_track(det, tracked),
@@ -1156,9 +1334,10 @@ class RunAudit(VideoLevelModule):
             self._check_crop_filter(det, tracked_pregate),
             self._check_calibration(seq, tracked_pregate),
             self._check_pitch_gate(seq, det),
-            self._check_team_embed(seq, tracked),
-            self._check_role_team(seq, tracked),
-            self._check_jersey(seq, tracked),
+            self._check_team_embed(seq, tracked_prerefine),
+            self._check_role_team(seq, tracked_prerefine),
+            self._check_jersey(seq, tracked_prerefine),
+            self._check_traj_refine(seq, det, tracked, tracked_prerefine),
             self._check_tracklet_agg(tracked),
             self._check_visualization(det, tracked),
         ]
