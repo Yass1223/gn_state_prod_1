@@ -4,8 +4,8 @@ A single, rigorously-scoped GSR pipeline. One entry config, one path, no alterna
 backends: every file in this repository belongs to the active pipeline.
 
 ```
-bbox_detector -> track -> crop_filter -> tracklet_split -> calibration -> pitch_gate -> team_embed
-              -> role_team -> jersey_number_detect -> traj_refine -> tracklet_agg -> audit
+bbox_detector -> track -> crop_filter -> calibration -> pitch_gate -> tracklet_split
+              -> team_embed -> jersey_number_detect -> traj_refine -> role_team -> tracklet_agg -> audit
 ```
 
 | Stage | Implementation | Notes |
@@ -13,22 +13,24 @@ bbox_detector -> track -> crop_filter -> tracklet_split -> calibration -> pitch_
 | `bbox_detector` | YOLO11-L SoccerNet fine-tune | imgsz 1280, conf floor 0.1 (`>=`), RGB→BGR fix |
 | `track` | BoT-SORT · SOF + OSNet-AIN (boxmot) | calls boxmot's `BotSort` directly with injected embeddings and external SOF camera motion; per-frame diagnostics sidecar for the audit |
 | `crop_filter` | single / multi label per detection, tracked-only rule | rT ≤ 0.25, rB < 0.40; only boxes carrying a `track_id` may make another box multi; every detection gets `crop_single`/`crop_rT`/`crop_rB`/`crop_trigger`; no detection is removed |
-| `tracklet_split` | DBSCAN tracklet splitting (SPLIT ONLY) | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); per tracklet, DBSCAN over ALL detections; noise attaches to the nearest clean-only centroid; all-multi fragments dissolve into the nearest remaining fragment; `eps 0.2, min_samples 5`, deliberately NO merge threshold (the pipeline's one merge is `traj_refine`); every tracked detection stays assigned; the incoming id is kept in `track_id_presplit`; per-sequence sidecar for the audit |
+| `tracklet_split` | DBSCAN tracklet splitting (SPLIT ONLY), after the gate | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); runs on on-pitch tracklets only; per tracklet, DBSCAN over ALL detections; noise attaches to the nearest clean-only centroid; all-multi fragments dissolve into the nearest remaining fragment; `eps 0.2, min_samples 5`, deliberately NO merge threshold (the pipeline's one merge is `traj_refine`); every tracked detection stays assigned; the incoming id is kept in `track_id_presplit`; per-sequence sidecar for the audit |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
 | `pitch_gate` | off-pitch tracklet gate on the mean projected position | per final `track_id`, the mean of `bbox_pitch` (bottom-middle) over the rows with a finite projection; off-pitch iff `abs(mean_x) > 52.5 + margin_m` or `abs(mean_y) > 34 + margin_m`; the rows of an off-pitch tracklet lose their `track_id` (NaN, so no later stage and no export sees them), the original id stays in `track_id_pregate`; `enabled` switch (off = columns and sidecar still written, `track_id` untouched); `margin_m 3.5` untuned; a tracklet without a projection is kept; no detection is removed; per-sequence sidecar for the audit |
-| `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
-| `role_team` | notebook rule chain (`sn_gamestate/team/rules.py`) | per tracklet: role (player / goalkeeper / referee), team cluster, left/right side; k-means on the single-crop descriptors, position rules on `bbox_pitch`, appearance-outlier channels, keeper-cue naming; frozen parameters from the notebook's tuning split; per-sequence sidecar for the audit |
-| `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level, single crops only (`crop_single`): legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
-| `traj_refine` | label-aware trajectory refinement (the pipeline's ONE merge) | same OSNet-AIN pin as `tracklet_split` (audit-enforced); phase 2a merges same-team same-number fragments (clean frame sets disjoint, re-enter consistent, distance ≤ `tau 0.60`) and resolves same-time number conflicts; phase 2b merges agglomeratively under clean-frame disjointness, re-enter consistency and vacuous-when-unknown label agreement; stage 3 then enforces one detection per (frame, trajectory): clean wins, held multi crops are placed into the nearest in-scope trajectory with a free slot or unassigned (`track_id` NaN); snapshots in `track_id_prerefine` + jersey columns; per-sequence sidecar for the audit |
-| `tracklet_agg` | majority vote | `[jersey_number]` (role is per-tracklet from `role_team`) |
+| `team_embed` | `osnet_team` embeddings + TEAM CLUSTERING per fragment | OSNet x1.0 (128×64, 256-d, fp32 + flip TTA), ≤ 16 sampled SINGLE crops per fragment on the stride-5 grid (a fragment with no single crop gets no embedding); fragment descriptor = L2-normalised median; `kmeans2_threshold`: 2-means over the descriptors + robust MAD distance threshold (`outlier_k 3.25`) leaves kit outliers — referees, odd kits — UNCLUSTERED; writes `team_cluster` (anonymous 0/1 or NaN) and `team_cluster_nearest` (pre-threshold nearest centroid, the role stage's fallback); no left/right naming and no roles here |
+| `jersey_number_detect` | **jn_pipeline_gsr** | fragment-level, single crops only (`crop_single`); eligibility = at least one single crop, NO role filter (roles do not exist yet; the legibility filter discards referee crops): legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
+| `traj_refine` | cluster- and number-aware trajectory refinement (the pipeline's ONE merge) | same OSNet-AIN pin as `tracklet_split` (audit-enforced); labels per fragment: team CLUSTER id + jersey number, every fragment in scope; phase 2a merges same-number fragments with non-contradicting clusters (clean frame sets disjoint, re-enter consistent, distance ≤ `tau 0.60`) and resolves same-time number conflicts; phase 2b merges agglomeratively under clean-frame disjointness, re-enter consistency, cluster agreement and number agreement (each applying only when both sides know it; same-cluster different-known-numbers never merge); stage 3 then enforces one detection per (frame, trajectory): clean wins, held multi crops are placed into the nearest trajectory with a free slot — the receiving trajectory's centroid recomputed after every assignment — or unassigned (`track_id` NaN); snapshots in `track_id_prerefine` + jersey/cluster columns; per-sequence sidecar for the audit |
+| `role_team` | per-TRAJECTORY roles and sides, AFTER the merge (`sn_gamestate/team/role_team_api.py`) | on finished trajectories: assistants by the touchline rule (one per side), goalkeepers by penalty-area depth (one per half, unclustered near-equal-depth second confirmed), the MAIN referee = an unclustered trajectory whose sampled y-range stays inside the symmetric 0.9-band of the trajectory means (rule 2.14), nearest to the assistants; everyone else a player; the two clusters are named left/right by the keeper/quantile/mean cue chain over player mean-x; an unclustered player takes its nearest centroid's side, a no-embedding player its mean-x half (both flagged); "appearance outlier" = unclustered; geometry thresholds carried from the notebook's tuning, untuned on this pipeline; per-sequence sidecar for the audit |
+| `tracklet_agg` | majority vote | `[jersey_number]` (role/team are per-trajectory from the post-refine `role_team`) |
 | `audit` | per-component verdicts | read-only last stage: PASS/WARN/FAIL per component per sequence → `audit/<seq>.json`; `scripts/verify_run_integrity.py` refuses the run on any FAIL |
 
-The jersey stage recognises tracklets whose `role` is player or goalkeeper (referees carry
-no number) and, with `single_crops_only: true` (the default), hands the recognisers only the
-single crops of a tracklet (`crop_single`); overlapping crops are excluded and a tracklet with
+The jersey stage recognises every fragment holding at least one single crop — there is
+no role filter (roles are assigned after `traj_refine`; the legibility filter is what
+discards referee crops) — and, with `single_crops_only: true` (the default), hands the
+recognisers only the
+single crops of a fragment (`crop_single`); overlapping crops are excluded and a fragment with
 no single crop stays unnumbered. Team plays no part in it.
-The role/team stage ignores multi crops, as the notebook did. There is no `reid` (prtreid)
-stage: role and team come from `team_embed` + `role_team`, and the tracker, `tracklet_split`
+The refinement and role stages ignore multi crops until stage 3, as the notebook did. There is no `reid` (prtreid)
+stage: the team cluster comes from `team_embed`, roles and sides from the post-refine `role_team`, and the tracker, `tracklet_split`
 and `traj_refine` use OSNet-AIN. `interpolation` is kept as a module for tracking-only experiments but is not
 in the pipeline (synthesized rows would carry neither crop labels nor team embeddings).
 
@@ -43,8 +45,8 @@ fragments holding only multi-player detections are dissolved, detection by detec
 into the nearest remaining fragment. Fragments become the new trajectories; every tracked
 detection stays assigned and the incoming id is kept per row in `track_id_presplit`.
 There is deliberately no merging and no merge threshold in this stage: the pipeline's one
-merge is `traj_refine`, which runs after `role_team` and `jersey_number_detect` so every
-merge decision can use team and jersey-number evidence, and the run audit FAILS the run
+merge is `traj_refine`, which runs after `team_embed` and `jersey_number_detect` so every
+merge decision can use team-cluster and jersey-number evidence, and the run audit FAILS the run
 if merging evidence appears in the splitter's config or sidecar.
 
 `eps` and `min_samples` are the notebook splitter's operating point (the retired
@@ -67,16 +69,16 @@ The detector is a single-class person model and no stage before `calibration` ca
 a bench player, a steward or a photographer from an athlete, so without this stage every
 tracklet is exported and receives a role. `pitch_gate`
 (`sn_gamestate/pitch_gate/pitch_gate_api.py`) runs directly after `calibration` and
-before `team_embed`. Per final `track_id` it takes the mean of the projected bottom-middle
+BEFORE `tracklet_split`, so the splitter never works on off-pitch tracklets. Per incoming `track_id` it takes the mean of the projected bottom-middle
 points over the rows that carry a finite `bbox_pitch` and calls the tracklet off-pitch when
 `|mean_x| > 52.5 + margin_m` or `|mean_y| > 34 + margin_m` (105 x 68 m pitch, metres,
 centre at the origin). The tracklet mean is used rather than a per-frame test so that
 projection error at the far touchline cannot flicker single frames of an on-pitch player.
 With `enabled: true` the rows of an off-pitch tracklet get `track_id` NaN: the evaluation
-export drops them and `team_embed`, `role_team`, the jersey stage, `tracklet_agg` and the
-radar never see them, so the role rules run their k-means and outlier statistics on
+export drops them and the splitter, `team_embed`, the jersey stage, `traj_refine`, `role_team`, `tracklet_agg` and the
+radar never see them, so the team clustering and the role rules run on
 on-pitch tracklets only. With `enabled: false` `track_id` is untouched. Either way the stage
-writes `track_id_pregate` (the id `tracklet_split` left), `pitch_gate_offpitch` (the rule's
+writes `track_id_pregate` (the id the tracker left), `pitch_gate_offpitch` (the rule's
 outcome), `pitch_mean_x` / `pitch_mean_y` and a sidecar `audit/pitch_gate/<seq>.json`; no
 detection row is deleted and a tracklet without any projection is kept.
 

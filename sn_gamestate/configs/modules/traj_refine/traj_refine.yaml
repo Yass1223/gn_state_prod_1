@@ -59,9 +59,10 @@ cfg:
   use_reenter: true
   edge_margin: 0.02
 
-  # Scope: trajectories whose per-track modal role is here. Keep in step with
-  # modules/jersey_number_detect/jn_gsr.yaml `roles` (the audit checks what ran).
-  roles: [player, goalkeeper]
+  # Scope: EVERY fragment. Roles do not exist at this point (role_team runs
+  # after this stage), so there is no exemption; the merge conditions are the
+  # team cluster (team_embed) and the jersey number, each applying only when
+  # both sides know it.
 
   batch_size: 64      # crops per appearance forward pass
 

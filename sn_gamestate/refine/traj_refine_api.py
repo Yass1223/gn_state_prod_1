@@ -1,56 +1,57 @@
 """Label-aware trajectory refinement as a pipeline stage (``traj_refine``).
 
-Runs after ``jersey_number_detect`` and before ``tracklet_agg``: the merges it
-performs need the team side (``role_team``), the jersey number with its pooled
-maxconf candidate statistics (``jn_gsr_api``), and the exit/entry geometry --
-evidence that does not exist at ``split_merge``'s position. The algorithm is in
-``sn_gamestate/refine/traj_refine.py``; this module supplies its inputs and
-applies its output:
+Runs after ``jersey_number_detect`` and before ``role_team``: the pipeline's
+ONE merge, deciding on the team CLUSTER id (``team_embed``), the jersey number
+with its pooled maxconf candidate statistics (``jn_gsr_api``), and the
+exit/entry geometry. Team sides and roles do not exist yet -- they are assigned
+after this stage, on the finished trajectories, where the evidence is
+strongest. The algorithm is in ``sn_gamestate/refine/traj_refine.py``; this
+module supplies its inputs and applies its output:
 
 1. Appearance: one OSNet-AIN embedding per tracked detection, from the same
-   shared module and checkpoint pin as the tracker and ``split_merge``
+   shared module and checkpoint pin as the tracker and ``tracklet_split``
    (``sn_gamestate/reid/osnet_ain``), so ``tau`` keeps the cosine-distance
    scale it was tuned on. A degenerate box or unreadable frame keeps an
    all-zero feature; a trajectory with no usable embedding never merges.
-2. Per-trajectory labels: ``team`` (first non-null; per-track constant by the
-   role_team contract), ``jersey_number_detection`` (idem), the jersey stage's
+2. Per-fragment labels: ``team_cluster`` (the team_embed stage's cluster id;
+   NaN = unclustered, which imposes no merge condition),
+   ``jersey_number_detection`` (first non-null), and the jersey stage's
    ``jersey_number_candidates`` (pooled ``[label, mx, conf_sum, votes]``
-   stats), and scope = per-track modal ``role`` in ``cfg.roles``.
+   stats). Every fragment is in scope -- there is no role to exempt anyone.
 3. Chronology: the dataset's frame index (``team_embed_api.frame_index``), so
    frame equality and time order are the dataset's, not ``image_id`` order.
    The image width for the re-enter test is read off the first frame the
    feature extraction loads.
-4. Refine: phase 2a (same-team same-number merges in descending pair maxconf;
-   overlap conflicts resolved by maxconf, the loser walking down its candidate
-   list) then phase 2b (agglomerative merging under time-disjointness,
-   re-enter consistency and vacuous-when-unknown team/number agreement),
-   both within ``tau``.
+4. Refine: phase 2a (same-number merges with non-contradicting clusters, in
+   descending pair maxconf; overlap conflicts resolved by maxconf, the loser
+   walking down its candidate list) then phase 2b (agglomerative merging under
+   clean-frame disjointness, re-enter consistency, cluster agreement and
+   number agreement -- each label condition applying only when both sides
+   know it; two same-cluster fragments with two different known numbers never
+   merge), both within ``tau``.
 5. Apply: rows of a merged cluster take the smallest constituent ``track_id``.
-   For every in-scope cluster the resolved number, its vote share and its
-   maxconf score are written to ALL member rows (so the downstream majority
-   vote cannot be flipped by row counts); a merged cluster additionally
-   unifies ``team`` (the known side), ``role`` (row majority, tie -> player)
-   and ``team_cluster`` (modal non-null value). Referee trajectories and
-   unassigned rows are untouched.
+   For every cluster the resolved number, its vote share and its maxconf
+   score are written to ALL member rows (so the downstream majority vote
+   cannot be flipped by row counts); a merged cluster additionally unifies
+   ``team_cluster`` (the known id, or NaN). Unassigned rows are untouched.
 
-Snapshots for the audit: the incoming ids, jersey columns AND the role/team
-labels are kept in ``track_id_prerefine``,
-``jersey_number_detection_prerefine``, ``jersey_number_confidence_prerefine``,
-``role_prerefine``, ``team_prerefine`` and ``team_cluster_prerefine`` (the
-pattern ``pitch_gate`` uses with ``track_id_pregate``), so every earlier stage
-can still be audited against the state it actually produced -- necessary
-because this stage rewrites team/role/number on merged clusters and on rows
-stage 3b moves between trajectories, so the live columns grouped by the
-pre-refine ids no longer equal role_team's output. With ``cfg.enabled: false``
-the stage only writes the snapshots and its sidecar -- the attribution switch
-for A/B metric runs.
+Snapshots for the audit: the incoming ids, jersey columns and the cluster id
+are kept in ``track_id_prerefine``, ``jersey_number_detection_prerefine``,
+``jersey_number_confidence_prerefine`` and ``team_cluster_prerefine`` (the
+pattern ``pitch_gate`` uses with ``track_id_pregate``), so the earlier stages
+can still be audited against the state they actually produced. Role/team
+snapshots are gone with the columns themselves: roles and sides are assigned
+AFTER this stage. With ``cfg.enabled: false`` the stage only writes the
+snapshots and its sidecar -- the attribution switch for A/B metric runs.
 
 Stage 3 (duplicate-frame resolution) runs inside this stage after the merger:
 merging requires disjointness of CLEAN frames only (multi-player detections
 are ignored until here), so multi rows can collide; 3a keeps one detection per
 (frame, trajectory) -- the clean one when present, else the multi nearest the
-clean-first centroid -- and 3b places the held rows into the nearest in-scope
-trajectory with a free frame slot, unassigning (track_id -> NaN) the rest. The
+clean-first centroid -- and 3b places the held rows into the nearest
+trajectory with a free frame slot -- the receiving trajectory's centroid is
+recomputed over all its detections after every assignment -- unassigning
+(track_id -> NaN) the rest. The
 output therefore holds at most one detection per (``image_id``, ``track_id``)
 over ALL detections; the stage checks this and per-cluster label constancy on
 its own output and logs an error if either fails. Tracked rows out = tracked
@@ -93,16 +94,14 @@ def _is_null(v):
 
 class TrajRefine(VideoLevelModule):
     input_columns = ["track_id", "bbox_ltwh", "image_id", "crop_single",
-                     "role", "team", "jersey_number_detection",
+                     "team_cluster", "jersey_number_detection",
                      "jersey_number_confidence", "jersey_number_candidates"]
     output_columns = ["track_id", "track_id_prerefine",
                       "jersey_number_detection", "jersey_number_confidence",
                       "jersey_number_maxconf",
                       "jersey_number_detection_prerefine",
                       "jersey_number_confidence_prerefine",
-                      "role_prerefine", "team_prerefine",
-                      "team_cluster_prerefine",
-                      "role", "team", "team_cluster"]
+                      "team_cluster_prerefine", "team_cluster"]
 
     def __init__(self, cfg, device, tracking_dataset=None, **kwargs):
         super().__init__()
@@ -112,7 +111,6 @@ class TrajRefine(VideoLevelModule):
         self.tau = float(cfg.tau)
         self.use_reenter = bool(getattr(cfg, "use_reenter", True))
         self.edge_margin = float(getattr(cfg, "edge_margin", 0.02))
-        self.roles = [str(r) for r in getattr(cfg, "roles", ["player", "goalkeeper"])]
         self.batch_size = int(getattr(cfg, "batch_size", 64))
         if not (0.0 <= self.tau <= 2.0):
             raise ValueError(f"[traj_refine] tau must be in [0, 2], got {self.tau}")
@@ -122,13 +120,14 @@ class TrajRefine(VideoLevelModule):
         self.audit_dir = Path(str(cfg.audit_dir)) if getattr(cfg, "audit_dir", None) else None
         if self.audit_dir:
             self.audit_dir.mkdir(parents=True, exist_ok=True)
-        # Same appearance model, pin and arithmetic as track / split_merge; a
-        # pin mismatch against split_merge is a run-audit FAIL. Built lazily so
-        # a disabled stage costs nothing.
+        # Same appearance model, pin and arithmetic as track / tracklet_split; a
+        # pin mismatch against tracklet_split is a run-audit FAIL. Built lazily
+        # so a disabled stage costs nothing.
         self._embedder = None
         log.info(f"[traj_refine] enabled {self.enabled}, tau {self.tau}, "
-                 f"use_reenter {self.use_reenter}, edge_margin {self.edge_margin}, "
-                 f"roles {self.roles}")
+                 f"use_reenter {self.use_reenter}, edge_margin {self.edge_margin}; "
+                 f"labels = team cluster + jersey number (roles/sides are assigned "
+                 f"after this stage)")
 
     def _model(self):
         if self._embedder is None:
@@ -197,22 +196,26 @@ class TrajRefine(VideoLevelModule):
 
     # --------------------------------------------------------------- tracks --
     def _track_info(self, work: pd.DataFrame, record: dict):
+        """Per-fragment labels for the merge: the TEAM CLUSTER id written by the
+        team_embed stage (a float, NaN = unclustered) and the jersey evidence.
+        Roles and team sides do not exist yet -- they are assigned after this
+        stage, on finished trajectories -- so every fragment is in scope."""
         tracks = {}
         for tid, grp in work.groupby("_tid"):
-            role_mode = grp["role"].mode() if "role" in grp.columns else pd.Series(dtype=object)
-            role = role_mode.iloc[0] if len(role_mode) else None
-            teams = [v for v in grp["team"] if not _is_null(v)] if "team" in grp.columns else []
+            cl = [v for v in grp["team_cluster"] if not _is_null(v)] \
+                if "team_cluster" in grp.columns else []
             numbers = [v for v in grp["jersey_number_detection"] if not _is_null(v)]
             cand = next((v for v in grp["jersey_number_candidates"]
                          if isinstance(v, (list, tuple)) and len(v)), None)
             tracks[int(tid)] = dict(
-                team=str(teams[0]) if teams else None,
+                cluster=float(cl[0]) if cl else None,
                 number=str(numbers[0]) if numbers else None,
                 cand=cand or [],
-                scope=role in self.roles)
-        record["inputs"]["in_scope"] = sum(1 for t in tracks.values() if t["scope"])
+                scope=True)
+        record["inputs"]["in_scope"] = len(tracks)
         record["inputs"]["numbered"] = sum(1 for t in tracks.values() if t["number"])
-        record["inputs"]["with_team"] = sum(1 for t in tracks.values() if t["team"])
+        record["inputs"]["clustered"] = sum(1 for t in tracks.values()
+                                            if t["cluster"] is not None)
         return tracks
 
     # ------------------------------------------------------------------ main --
@@ -225,8 +228,6 @@ class TrajRefine(VideoLevelModule):
         out["track_id_prerefine"] = out["track_id"]
         out["jersey_number_detection_prerefine"] = out["jersey_number_detection"]
         out["jersey_number_confidence_prerefine"] = out["jersey_number_confidence"]
-        out["role_prerefine"] = out["role"]
-        out["team_prerefine"] = out["team"]
         out["team_cluster_prerefine"] = (out["team_cluster"]
                                          if "team_cluster" in out.columns else np.nan)
         if "jersey_number_maxconf" not in out.columns:
@@ -235,8 +236,7 @@ class TrajRefine(VideoLevelModule):
         record = dict(sequence=seq, ran=False,
                       settings=dict(enabled=self.enabled, tau=self.tau,
                                     use_reenter=self.use_reenter,
-                                    edge_margin=self.edge_margin,
-                                    roles=list(self.roles)),
+                                    edge_margin=self.edge_margin),
                       embedder=None,
                       inputs=dict(detections=int(len(detections)), tracked=0,
                                   tracklets=0),
@@ -254,7 +254,7 @@ class TrajRefine(VideoLevelModule):
                         f"column; nothing to do")
             self._write(record)
             return out
-        for col in ("crop_single", "role", "team", "jersey_number_detection",
+        for col in ("crop_single", "team_cluster", "jersey_number_detection",
                     "jersey_number_candidates"):
             if col not in detections.columns:
                 raise RuntimeError(f"[traj_refine] {seq}: {col} column missing - "
@@ -300,22 +300,14 @@ class TrajRefine(VideoLevelModule):
             n_relabel += changed
             if changed or len(res["tids"]) > 1:
                 out.loc[rows, "track_id"] = float(key)
-            if not tracks[min(res["tids"])]["scope"]:
-                continue                      # out of scope: rows untouched
             merged = len(res["tids"]) > 1 or changed > 0
             out.loc[rows, "jersey_number_detection"] = res["number"]
             out.loc[rows, "jersey_number_confidence"] = res["confidence"]
             out.loc[rows, "jersey_number_maxconf"] = res["maxconf"]
             if merged:
-                if res["team"] is not None:
-                    out.loc[rows, "team"] = res["team"]
-                roles = out.loc[rows, "role"].mode()
-                role = roles.iloc[0] if len(roles) == 1 else "player"
-                out.loc[rows, "role"] = role
-                tc = out.loc[rows, "team_cluster"]
-                tc = tc[tc.notna()]
-                out.loc[rows, "team_cluster"] = (float(tc.mode().iloc[0])
-                                                 if len(tc) else np.nan)
+                out.loc[rows, "team_cluster"] = (float(res["cluster"])
+                                                 if res["cluster"] is not None
+                                                 else np.nan)
 
         # ------------------------------------------------------ self-checks --
         tracked_out = out[out["track_id"].notna()]
@@ -326,7 +318,7 @@ class TrajRefine(VideoLevelModule):
                       f"condition, so the bookkeeping is broken")
         n_incoherent = 0
         for tid, grp in tracked_out.groupby("track_id"):
-            for col in ("jersey_number_detection", "team", "role"):
+            for col in ("jersey_number_detection", "team_cluster"):
                 vals = {str(v) for v in grp[col] if not _is_null(v)}
                 if len(vals) > 1:
                     n_incoherent += 1
@@ -359,7 +351,7 @@ class TrajRefine(VideoLevelModule):
             frame_collisions=coll, clusters_incoherent=n_incoherent)
         record["per_cluster"] = [
             dict(track_id=int(k), source_track_ids=res["tids"],
-                 n_rows=int((new_tid == k).sum()), team=res["team"],
+                 n_rows=int((new_tid == k).sum()), team_cluster=res["cluster"],
                  number=res["number"],
                  confidence=round(res["confidence"], 6),
                  maxconf=round(res["maxconf"], 6))

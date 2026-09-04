@@ -4,10 +4,13 @@ The detector is a single-class person model and no upstream stage removes a
 detection, so a tracklet standing on the bench, behind the goal or among the
 photographers is exported as an athlete and receives a role from ``role_team``
 like everybody else. Pitch coordinates exist only after ``calibration``
-(``bbox_pitch``), so this stage runs directly after it and before ``team_embed``:
-every later stage groups by ``track_id``, and a gated tracklet must be invisible
-to all of them (team embedding, role/team rules, jersey recognition, voting,
-evaluation export, radar).
+(``bbox_pitch``), so this stage runs directly after it and BEFORE
+``tracklet_split``: every later stage groups by ``track_id``, a gated tracklet
+must be invisible to all of them (splitting, team embedding/clustering, jersey
+recognition, refinement, role/side rules, voting, evaluation export, radar),
+and gating first means the splitter never works on off-pitch tracklets. The
+splitter rewrites ``track_id`` afterwards and keeps this stage's output per
+row in ``track_id_presplit``.
 
 Rule, per final ``track_id``: the mean of the projected bottom-middle points
 (``bbox_pitch['x_bottom_middle']`` / ``['y_bottom_middle']``, metres, pitch
@@ -59,7 +62,7 @@ log = logging.getLogger(__name__)
 
 
 def sequence_name(metadatas: pd.DataFrame) -> str:
-    """Same rule as the audit, split_merge and team_embed (``SNGS-xxx`` from the
+    """Same rule as the audit, tracklet_split and team_embed (``SNGS-xxx`` from the
     frame path when available, else ``video_id``), so the sidecar name matches."""
     if len(metadatas) and "file_path" in metadatas.columns:
         return Path(str(metadatas["file_path"].iloc[0])).parent.parent.name
@@ -151,8 +154,8 @@ class PitchGate(VideoLevelModule):
         seq = sequence_name(metadatas)
         out = detections.copy()
         if "track_id" not in out.columns:
-            raise RuntimeError(f"[pitch_gate] {seq}: track_id column missing - the track and "
-                               f"split_merge stages must run before pitch_gate")
+            raise RuntimeError(f"[pitch_gate] {seq}: track_id column missing - the track "
+                               f"stage must run before pitch_gate")
         if "bbox_pitch" not in out.columns:
             raise RuntimeError(f"[pitch_gate] {seq}: bbox_pitch column missing - the calibration "
                                f"stage must run before pitch_gate")

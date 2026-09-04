@@ -1,16 +1,30 @@
-"""Team-appearance embeddings of sampled crops per tracklet (``team_embed`` stage).
+"""Team-appearance embeddings and TEAM CLUSTERS per fragment (``team_embed`` stage).
 
-For every tracklet (final ``track_id``, after ``split_merge``) the rows on the position
-grid (every ``POS_STRIDE``-th frame) are taken and at most ``CROPS_PER_TRK`` of
-them, evenly spaced in time, are embedded with ``osnet_team`` — single and multi
-crops alike, exactly as the notebook embedded every sampled crop and applied the
-single filter afterwards from the stored ratios. The role/team stage then keeps
-the single ones (``crop_single``) and falls back to the lowest-rT ones.
+Runs after ``tracklet_split``: the tracklets it sees are the splitter's
+fragments. For every fragment, its SINGLE crops (``crop_single``) on the
+position grid (every ``POS_STRIDE``-th frame, at most ``CROPS_PER_TRK`` evenly
+spaced) are embedded with ``osnet_team``; a fragment with no single crop gets
+no embedding. The fragment descriptor is the L2-normalised median of its
+embedded crops (float32, the notebook's convention).
 
-Output column ``team_embedding``: a float32 vector on the sampled rows, None
-elsewhere. Sampling is ``rules.sample_tracklet_rows`` — the same function the
-role/team stage uses to decide which rows carry a position — so the two stages
-cannot disagree about which crops belong to a tracklet.
+The fragment descriptors of the sequence are then clustered into TEAM CLUSTERS
+-- anonymous kit ids, no left/right naming and no roles (those are assigned
+after ``traj_refine``, on finished trajectories). ``team_cluster_nearest``
+additionally records every embedded fragment's nearest centroid BEFORE the
+threshold -- the role/side stage's fallback for unclustered trajectories.
+Method ``kmeans2_threshold``:
+2-means (the notebook's seeded k-means), then the robust distance rule -- with
+``d`` each fragment's Euclidean distance to its nearest centroid, ``m`` the
+median of ``d`` and ``s`` its MAD, a fragment is UNCLUSTERED when
+``s >= 0.05*m`` (the scale is meaningful) and ``d > m + outlier_k*s``; so
+referees and other kit outliers get no cluster. Fragments without an embedding
+are unclustered too. ``cluster_method`` is a config switch so alternative
+clusterings can be compared.
+
+Output columns: ``team_embedding`` (float32 vector on the sampled single rows,
+None elsewhere) and ``team_cluster`` (0.0/1.0 on every row of a clustered
+fragment, NaN otherwise). Sampling is ``rules.sample_tracklet_rows`` on the
+fragment's single rows.
 
 A per-sequence sidecar ``<audit_dir>/<sequence>.json`` records what ran: the
 checkpoint digest and source, input size, crops sampled and embedded, crops that
@@ -53,8 +67,8 @@ def frame_index(metadatas: pd.DataFrame) -> pd.Series:
 
 
 class TeamEmbedding(VideoLevelModule):
-    input_columns = ["track_id", "bbox_ltwh", "image_id"]
-    output_columns = ["team_embedding"]
+    input_columns = ["track_id", "bbox_ltwh", "image_id", "crop_single"]
+    output_columns = ["team_embedding", "team_cluster", "team_cluster_nearest"]
 
     def __init__(self, cfg, device, tracking_dataset=None, **kwargs):
         super().__init__()
@@ -63,6 +77,11 @@ class TeamEmbedding(VideoLevelModule):
         self.stride = int(getattr(cfg, "pos_stride", rules.POS_STRIDE))
         self.crops_per_track = int(getattr(cfg, "crops_per_track", rules.CROPS_PER_TRK))
         self.batch_size = int(getattr(cfg, "batch_size", 128))
+        self.cluster_method = str(getattr(cfg, "cluster_method", "kmeans2_threshold"))
+        if self.cluster_method not in ("kmeans2_threshold",):
+            raise ValueError(f"[team_embed] unknown cluster_method "
+                             f"{self.cluster_method!r}")
+        self.outlier_k = float(getattr(cfg, "outlier_k", 3.25))
         self.audit_dir = Path(str(cfg.audit_dir)) if getattr(cfg, "audit_dir", None) else None
         if self.audit_dir:
             self.audit_dir.mkdir(parents=True, exist_ok=True)
@@ -79,8 +98,10 @@ class TeamEmbedding(VideoLevelModule):
         out = detections.copy()
         out["team_embedding"] = None
         record = dict(sequence=seq, stride=self.stride, crops_per_track=self.crops_per_track,
-                      tracklets=0, tracklets_off_grid=0, crops_sampled=0, crops_embedded=0,
-                      crops_empty=0, frames_read=0, embedder=None)
+                      tracklets=0, tracklets_off_grid=0, fragments_no_single=0,
+                      crops_sampled=0, crops_embedded=0,
+                      crops_empty=0, frames_read=0, embedder=None,
+                      cluster=dict(method=self.cluster_method, outlier_k=self.outlier_k))
         tracked = out.dropna(subset=["track_id"])
         if len(tracked) == 0:
             log.warning(f"[team_embed] {seq}: no tracked detection; nothing embedded")
@@ -93,14 +114,18 @@ class TeamEmbedding(VideoLevelModule):
         # which rows to embed, per tracklet
         rows_by_image = {}
         for tid, grp in tracked.groupby("track_id"):
-            frames = fidx.reindex(grp["image_id"].to_numpy()).to_numpy()
+            record["tracklets"] += 1
+            sgrp = grp[grp["crop_single"].astype(bool)]
+            if len(sgrp) == 0:
+                record["fragments_no_single"] += 1
+                continue                       # no single crop -> no embedding
+            frames = fidx.reindex(sgrp["image_id"].to_numpy()).to_numpy()
             if np.isnan(frames.astype(float)).any():
                 raise RuntimeError(f"[team_embed] {seq}: detection image_id without frame metadata")
             _, crop_rows, off_grid = rules.sample_tracklet_rows(frames, self.stride, self.crops_per_track)
-            record["tracklets"] += 1
             record["tracklets_off_grid"] += int(off_grid)
-            for r in grp.index[crop_rows]:
-                rows_by_image.setdefault(grp.at[r, "image_id"], []).append(r)
+            for r in sgrp.index[crop_rows]:
+                rows_by_image.setdefault(sgrp.at[r, "image_id"], []).append(r)
         record["crops_sampled"] = sum(len(v) for v in rows_by_image.values())
         # embed frame by frame (RGB, as loaded)
         emb_col = {}
@@ -130,9 +155,60 @@ class TeamEmbedding(VideoLevelModule):
         out["team_embedding"] = col.where(col.notna(), None)
         bad = sum(1 for e in emb_col.values() if not np.isfinite(e).all() or not np.any(e))
         record["embeddings_nonfinite_or_zero"] = int(bad)
-        log.info(f"[team_embed] {seq}: {record['tracklets']} tracklets, {record['crops_embedded']} crops "
-                 f"embedded from {record['frames_read']} frames "
-                 f"({record['crops_empty']} empty, {record['tracklets_off_grid']} off-grid tracklets)")
+
+        # ------------------------------------------------- team clustering --
+        # Fragment descriptor: L2-normalised median of its embedded single
+        # crops. 2-means over the descriptors; the robust distance rule leaves
+        # kit outliers (referees etc.) UNCLUSTERED.
+        out["team_cluster"] = np.nan
+        # nearest centroid id BEFORE thresholding: the role/side stage's
+        # fallback for trajectories left unclustered (player, nearest kit)
+        out["team_cluster_nearest"] = np.nan
+        frag_ids, descs = [], []
+        for tid, grp in out[out["track_id"].notna()].groupby("track_id"):
+            es = [e for e in grp["team_embedding"]
+                  if isinstance(e, np.ndarray) and e.size and np.isfinite(e).all()
+                  and np.any(e)]
+            if not es:
+                continue
+            e = np.median(np.asarray(es, dtype=np.float32), axis=0)
+            n = float(np.linalg.norm(e))
+            if n < 1e-9:
+                continue
+            frag_ids.append(tid)
+            descs.append((e / n).astype(np.float32))
+        clus = record["cluster"]
+        clus.update(fragments=int(record["tracklets"]), embedded=len(frag_ids),
+                    clustered=0, unclustered_threshold=0, s_ok=None,
+                    m=None, s=None, sizes=[0, 0])
+        if len(frag_ids) >= 2:
+            E = np.stack(descs)
+            km = rules.kmeans2(E)
+            d_all = np.linalg.norm(E[:, None] - km.cluster_centers_[None], axis=2)
+            lab = d_all.argmin(1)
+            d = d_all.min(1)
+            m = float(np.median(d))
+            s = float(np.median(np.abs(d - m)))
+            s_ok = s >= 0.05 * m
+            outlier = (d > m + self.outlier_k * s) if s_ok else np.zeros(len(d), bool)
+            for tid, l, is_out in zip(frag_ids, lab, outlier):
+                out.loc[out["track_id"] == tid, "team_cluster_nearest"] = float(l)
+                if not is_out:
+                    out.loc[out["track_id"] == tid, "team_cluster"] = float(l)
+            clus.update(clustered=int((~outlier).sum()),
+                        unclustered_threshold=int(outlier.sum()),
+                        s_ok=bool(s_ok), m=round(m, 6), s=round(s, 6),
+                        sizes=[int(((lab == c) & ~outlier).sum()) for c in (0, 1)],
+                        centroid_gap=round(float(np.linalg.norm(
+                            km.cluster_centers_[0] - km.cluster_centers_[1])), 6))
+        n_unclustered = int(record["tracklets"]) - int(clus["clustered"])
+        log.info(f"[team_embed] {seq}: {record['tracklets']} fragments, "
+                 f"{record['crops_embedded']} single crops embedded from "
+                 f"{record['frames_read']} frames ({record['crops_empty']} empty, "
+                 f"{record['fragments_no_single']} fragment(s) without a single crop); "
+                 f"clusters {clus['sizes']}, {n_unclustered} unclustered "
+                 f"({self.cluster_method}, k {self.outlier_k}); no sides, no roles "
+                 f"here - they are assigned after traj_refine")
         self._write(record)
         return out
 

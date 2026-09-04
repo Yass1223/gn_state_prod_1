@@ -1,7 +1,13 @@
-# Team-appearance embeddings (osnet_team) of <= 16 crops per tracklet, sampled on
-# the stride-5 frame grid; single and multi crops are both embedded (the role stage
-# applies the single filter afterwards, as the notebook did). Runs after
-# calibration, before role_team.
+# Team-appearance embeddings (osnet_team) of <= 16 SINGLE crops per fragment,
+# sampled on the stride-5 frame grid, plus the sequence's TEAM CLUSTERING:
+# fragment descriptor = L2-normalised median of its embedded single crops;
+# 2-means over the descriptors; the robust distance rule (d > median + outlier_k
+# * MAD to the nearest centroid, active when the spread is meaningful) leaves
+# kit outliers -- referees, odd kits -- UNCLUSTERED (team_cluster NaN).
+# team_cluster_nearest records every embedded fragment's nearest centroid before
+# the threshold: the post-refine role_team stage's fallback for unclustered
+# players. No left/right naming and no roles here -- those are assigned after
+# traj_refine. Runs after tracklet_split, before jersey_number_detect.
 #
 # Checkpoint: Ynniss/osnet_team / osnet_team_best.pt — the notebook's model
 # (OSNet x1.0, 128x64 crops on grey 110, 256-d, fp32 + flip TTA). Widths and the
@@ -21,4 +27,8 @@ cfg:
   pos_stride: 5             # frames between sampled crops / positions (notebook POS_STRIDE)
   crops_per_track: 16       # crops embedded per tracklet (notebook CROPS_PER_TRK)
   batch_size: 128           # crops per forward pass
+  # Team clustering (config switch so alternative methods can be compared):
+  #   kmeans2_threshold  2-means + robust distance threshold (the default)
+  cluster_method: kmeans2_threshold
+  outlier_k: 3.25           # unclustered when d > median + outlier_k * MAD (notebook's k)
   audit_dir: ${project_dir}/audit/team_embed

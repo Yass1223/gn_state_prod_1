@@ -173,7 +173,7 @@ def test_stages():
         assert g["role"].nunique() == 1 and g["team"].astype(str).nunique() == 1
     print("role_team:", tracked.groupby("track_id")[["role", "team"]].first().to_dict("index"))
     rec = (tmp / "audit_role" / "SNGS-000.json").read_text()
-    assert '"per_tracklet"' in rec and '"cues"' in rec
+    assert '"per_trajectory"' in rec and '"cues"' in rec
     print("role_team: contract ok, sidecar written")
 
 

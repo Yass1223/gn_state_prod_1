@@ -26,9 +26,11 @@ det = te.process(det, meta)
 det = RoleTeamAssignment(SimpleNamespace(params=dict(rules.FROZEN_PARAMS), audit_dir=str(tmp / "audit/role_team"), pos_stride=5, crops_per_track=16)).process(det, meta)
 det["jersey_number_detection"] = None; det["jersey_number_confidence"] = 0.0; det["jersey_number"] = np.nan
 cfg = SimpleNamespace(out_dir=str(tmp / "audit"), jn_cache_dir=str(tmp / "jn"), calib_dir=str(tmp / "calib"), models_dir=str(tmp / "models"),
-                      jn_roles=["player", "goalkeeper"], thresholds={}, track_sidecar_dir=None, expected_tracker={},
+                      thresholds={}, track_sidecar_dir=None, expected_tracker={},
                       expected_crop_filter=dict(thr_target=0.25, thr_other=0.40, contam_mode="tracked"),
-                      team_embed_sidecar_dir=str(tmp / "audit/team_embed"), expected_team_embed=dict(sha256=None, pos_stride=5, crops_per_track=16),
+                      team_embed_sidecar_dir=str(tmp / "audit/team_embed"),
+                      expected_team_embed=dict(sha256=None, pos_stride=5, crops_per_track=16,
+                                               cluster_method="kmeans2_threshold", outlier_k=3.25),
                       role_team_sidecar_dir=str(tmp / "audit/role_team"), expected_role_team=dict(params=dict(rules.FROZEN_PARAMS)),
                       pitch_gate_sidecar_dir=str(tmp / "audit/pitch_gate"), expected_pitch_gate=dict(enabled=True, margin_m=5.0))
 audit = RunAudit(cfg)
@@ -36,45 +38,40 @@ import json
 audit.process(det, meta)
 rep = json.loads((tmp / "audit" / "SNGS-000.json").read_text())
 by = {c["component"]: c for c in rep["checks"]}
-for name in ("crop_filter", "pitch_gate", "team_embed (osnet_team)", "role_team"):
+TE_NAME = "team_embed (osnet_team + team clustering)"
+RT_NAME = "role_team (per-trajectory roles + sides, after traj_refine)"
+for name in ("crop_filter", "pitch_gate", TE_NAME, RT_NAME):
     print(f"{by[name]['verdict']:4} {name}: {by[name]['note'] or 'ok'}")
 assert by["crop_filter"]["verdict"] == "PASS"
 assert by["pitch_gate"]["verdict"] == "PASS" and by["pitch_gate"]["observed"]["tracklets_gated"] == 0
-assert by["team_embed (osnet_team)"]["verdict"] == "PASS" and "not pinned" in by["team_embed (osnet_team)"]["note"]
-assert by["role_team"]["verdict"] in ("PASS", "WARN")   # WARN = degenerate spread, legitimate on random-noise frames
+assert by[TE_NAME]["verdict"] in ("PASS", "WARN") and "not pinned" in by[TE_NAME]["note"]
+assert by[RT_NAME]["verdict"] in ("PASS", "WARN")   # WARN = half fallback / one team, legitimate on random-noise frames
 # negative controls: a wrong parameter, a missing embedding, a wrong threshold
 cfg.expected_role_team = dict(params=dict(rules.FROZEN_PARAMS, k=2.5))
 assert RunAudit(cfg)._check_role_team("SNGS-000", det.dropna(subset=["track_id"])).verdict == "FAIL"
 cfg.expected_role_team = dict(params=dict(rules.FROZEN_PARAMS))
 cfg.expected_crop_filter = dict(thr_target=0.99, thr_other=0.999, contam_mode="tracked")  # would relabel the multi crops
 assert RunAudit(cfg)._check_crop_filter(det, det.dropna(subset=["track_id"])).verdict == "FAIL"
-cfg.expected_team_embed = dict(sha256="0" * 64, pos_stride=5, crops_per_track=16)
+cfg.expected_team_embed = dict(sha256="0" * 64, pos_stride=5, crops_per_track=16,
+                               cluster_method="kmeans2_threshold", outlier_k=3.25)
 assert RunAudit(cfg)._check_team_embed("SNGS-000", det.dropna(subset=["track_id"])).verdict == "FAIL"
 d2 = det.copy(); d2.loc[d2.track_id == 2.0, "role"] = None
-cfg.expected_team_embed = dict(sha256=None, pos_stride=5, crops_per_track=16)
+cfg.expected_team_embed = dict(sha256=None, pos_stride=5, crops_per_track=16,
+                               cluster_method="kmeans2_threshold", outlier_k=3.25)
 assert RunAudit(cfg)._check_role_team("SNGS-000", d2.dropna(subset=["track_id"])).verdict == "FAIL"
 cfg.expected_pitch_gate = dict(enabled=False, margin_m=5.0)   # switch that ran != configured
 assert RunAudit(cfg)._check_pitch_gate("SNGS-000", det).verdict == "FAIL"
 cfg.expected_pitch_gate = dict(enabled=True, margin_m=5.0)
-# role_team on the pre-refine snapshots: when traj_refine wrote them, the check
-# must audit role_team's OWN output, not the live columns traj_refine rewrote
-# on stage-3b-adopted rows (the run-7 false FAIL "team varies within N tracks").
+# role_team audits the FINAL trajectories directly (the stage is the last
+# labelling stage in this architecture; there are no role/team snapshots):
+# genuine per-trajectory variance must FAIL.
 d3 = det.dropna(subset=["track_id"]).copy()
-d3["role_prerefine"] = d3["role"]
-d3["team_prerefine"] = d3["team"]
-d3["team_cluster_prerefine"] = d3["team_cluster"]
 counts = d3[d3["team"].isin(["left", "right"])].groupby("track_id").size()
 tids2 = counts[counts >= 2].index
 assert len(tids2), "fixture must hold a track with >= 2 team-labelled rows"
 r = d3.index[(d3["track_id"] == tids2[0]) & d3["team"].isin(["left", "right"])][0]
-d3.loc[r, "team"] = "right" if d3.loc[r, "team"] == "left" else "left"  # 3b adoption
-c_snap = RunAudit(cfg)._check_role_team("SNGS-000", d3)
-assert c_snap.observed["columns_audited"] == "prerefine snapshots"
-assert c_snap.observed["team_inconsistent_tracks"] == 0, c_snap.note
-c_live = RunAudit(cfg)._check_role_team("SNGS-000", d3.drop(
-    columns=["role_prerefine", "team_prerefine", "team_cluster_prerefine"]))
+d3.loc[r, "team"] = "right" if d3.loc[r, "team"] == "left" else "left"
+c_live = RunAudit(cfg)._check_role_team("SNGS-000", d3)
 assert c_live.verdict == "FAIL" and "team varies" in str(c_live.note)
-d3.loc[r, "team_prerefine"] = d3.loc[r, "team"]   # now role_team ITSELF is wrong
-assert "team varies" in str(RunAudit(cfg)._check_role_team("SNGS-000", d3).note)
-print("audit: positives PASS, five negative controls FAIL, role_team snapshot "
-      "preference verified (live-rewrite tolerated, genuine variance still FAILs)")
+print("audit: positives PASS, six negative controls FAIL (wrong param, wrong "
+      "thresholds, wrong pin, missing role, wrong gate switch, team variance)")

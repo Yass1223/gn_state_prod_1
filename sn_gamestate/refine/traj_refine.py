@@ -171,7 +171,7 @@ class _Cluster:
     """Mutable merge state of one (possibly merged) trajectory."""
 
     __slots__ = ("tids", "rows", "sum_clean", "n_clean", "sum_any", "n_any",
-                 "clean_frames", "team", "number", "cand", "scope",
+                 "clean_frames", "cluster", "number", "cand", "scope",
                  "first_row", "last_row", "banned")
 
     def __init__(self, tid, rows, E, single, frames, info):
@@ -192,7 +192,8 @@ class _Cluster:
         afr = np.asarray(frames, dtype=np.int64)[anchor]
         self.first_row = int(anchor[int(np.argmin(afr))])
         self.last_row = int(anchor[int(np.argmax(afr))])
-        self.team = info.get("team") or None
+        cl = info.get("cluster")
+        self.cluster = None if cl is None or (isinstance(cl, float) and np.isnan(cl)) else float(cl)
         number = info.get("number")
         self.number = str(number) if number not in (None, "", "-1") else None
         self.cand = {str(c[0]): [float(c[1]), float(c[2]), int(c[3])]
@@ -228,7 +229,7 @@ class _Cluster:
             self.first_row = other.first_row
         if int(frames[other.last_row]) > int(frames[self.last_row]):
             self.last_row = other.last_row
-        self.team = self.team or other.team
+        self.cluster = self.cluster if self.cluster is not None else other.cluster
         self.number = self.number or other.number
         self.cand = combine_cand(self.cand, other.cand)
         self.banned |= other.banned
@@ -267,10 +268,14 @@ def _reenter_ok(a, b, frames, boxes, img_w, margin_frac, record=None):
 
 
 def _labels_ok(a, b):
-    """C4 (2b): teams agree when both known, numbers agree when both known."""
-    if a.team and b.team and a.team != b.team:
+    """Label agreement for a merge: the team CLUSTER ids must not contradict
+    (equal when both known; one or both unknown imposes no condition) and the
+    jersey numbers must not contradict (equal when both known; unknown imposes
+    no condition). Two same-cluster fragments with two different known numbers
+    are two different players and never merge."""
+    if a.cluster is not None and b.cluster is not None and a.cluster != b.cluster:
         return False
-    if a.number and b.number and a.number != b.number:
+    if a.number is not None and b.number is not None and a.number != b.number:
         return False
     return True
 
@@ -287,11 +292,14 @@ def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
         pairs = []
         for i, ka in enumerate(live):
             a = clusters[ka]
-            if not a.scope or a.number is None or a.team is None:
+            if not a.scope or a.number is None:
                 continue
             for kb in live[i + 1:]:
                 b = clusters[kb]
-                if not b.scope or b.number != a.number or b.team != a.team:
+                if not b.scope or b.number != a.number:
+                    continue
+                if (a.cluster is not None and b.cluster is not None
+                        and a.cluster != b.cluster):
                     continue
                 if (ka, kb) in aside:
                     continue
@@ -388,7 +396,8 @@ def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
         a, b = clusters[ka], clusters[kb]
         report["merges"].append(dict(
             phase="2b", pair=[ka, kb], distance=round(float(sub[min(i, j), max(i, j)]), 4),
-            team=a.team or b.team, number=a.number or b.number))
+            cluster=(a.cluster if a.cluster is not None else b.cluster),
+            number=a.number or b.number))
         a.absorb(b, frames)
         del clusters[kb]
         alive[j] = False
@@ -409,8 +418,9 @@ def _stage3(clusters, E, single, frames, new_tid, report):
     re-placed there is impossible by construction, move to another in-scope
     cluster with a free slot, or become unassigned (-1). Returns the stage-3
     report dict. Centroids used: 3a keeps/holds against the cluster's
-    clean-first centroid; 3b places against centroids recomputed over ALL
-    remaining detections, fixed for the whole pass."""
+    clean-first centroid; 3b places against centroids over ALL of a
+    trajectory's detections, recomputed every time the trajectory receives a
+    held detection."""
     E = np.asarray(E, dtype=np.float32)
     single = np.asarray(single, dtype=bool)
     frames = np.asarray(frames, dtype=np.int64)
@@ -444,14 +454,20 @@ def _stage3(clusters, E, single, frames, new_tid, report):
             held.extend(r for r in rr if r != keep)
         kept_rows[key] = remaining
 
-    # centroid over ALL remaining detections (single and multi), 3b's metric
+    # centroid over ALL remaining detections (single and multi), 3b's metric.
+    # Recomputed for a trajectory EVERY time it receives a held detection, so
+    # each assignment uses centroids that include everything assigned so far.
     mu_all = {}
     occupied = {}
-    for key, rows in kept_rows.items():
+
+    def _mu(rows):
         rows = np.asarray(rows, dtype=np.int64)
-        occupied[key] = set(int(frames[r]) for r in rows)
         nz = np.linalg.norm(E[rows], axis=1) > 1e-6
-        mu_all[key] = E[rows[nz]].mean(axis=0) if nz.any() else None
+        return E[rows[nz]].mean(axis=0) if nz.any() else None
+
+    for key, rows in kept_rows.items():
+        occupied[key] = set(int(frames[r]) for r in rows)
+        mu_all[key] = _mu(rows)
 
     placed = 0
     unassigned = []
@@ -483,6 +499,8 @@ def _stage3(clusters, E, single, frames, new_tid, report):
         pending.remove(r)
         new_tid[r] = key
         occupied[key].add(f)
+        kept_rows[key].append(int(r))
+        mu_all[key] = _mu(kept_rows[key])   # dynamic: the trajectory grew
         placed += 1
 
     report["stage3"] = dict(collided_frames=n_coll, held=len(held),
@@ -562,7 +580,7 @@ def refine_video(E, single, frames, boxes, tids, tracks, img_w,
         conf = (c.cand[number][2] / total_votes
                 if number and number in c.cand and total_votes else 0.0)
         resolved[key] = dict(
-            tids=sorted(c.tids), team=c.team, number=number,
+            tids=sorted(c.tids), cluster=c.cluster, number=number,
             confidence=float(conf),
             maxconf=float(score_of(c.cand, number)) if number else 0.0)
     # Output invariant: one detection per (frame, cluster) over ALL detections.

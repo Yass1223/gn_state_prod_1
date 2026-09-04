@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             d.startswith("sn_gamestate.reid.osnet_ain") for d, _, _ in failures):
         from sn_gamestate.reid.osnet_ain import build_backbone
         # osnet_x1_0 is the team-appearance backbone (sn_gamestate/reid/osnet_team.py);
-        # the same factory must carry both, or the role_team stage cannot embed a crop.
+        # the same factory must carry both, or the team_embed stage cannot embed a crop.
         for name in ("osnet_ain_x1_0", "osnet_x1_0"):
             try:
                 _, factory = build_backbone(name)

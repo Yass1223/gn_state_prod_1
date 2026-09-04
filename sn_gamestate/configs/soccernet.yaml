@@ -9,29 +9,35 @@
 #                   for cache notes)
 #   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
 #   crop_filter    single/multi label, tracked-only rule      -> crop_single, crop_rT, crop_rB, crop_trigger
-#   tracklet_split DBSCAN tracklet split (SPLIT ONLY)         -> track_id, track_id_presplit
-#                  (same OSNet-AIN as the tracker; reads crop_single)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
 #   pitch_gate     off-pitch tracklets (mean bbox_pitch outside  -> track_id NaN on their rows,
 #                  105x68 m + margin_m; on/off switch)             track_id_pregate, pitch_gate_offpitch
-#   team_embed     osnet_team on <= 16 sampled crops/tracklet  -> team_embedding
-#   role_team      notebook rules: role, cluster, side        -> role, team_cluster, team
-#   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU
-#                  + per-tracklet maxconf candidate stats  -> jersey_number_candidates, jersey_number_maxconf
-#   traj_refine    label-aware trajectory refinement: same-team same-number
-#                  merges + number-conflict resolution (phase 2a), then
-#                  agglomerative merging under time/re-enter/label conditions
-#                  (phase 2b); the pipeline's ONE merge; same OSNet-AIN as track /
-#                  tracklet_split; duplicate-frame resolution (stage 3) after it
-#                  -> track_id (refined), track_id_prerefine + jersey snapshots
+#   tracklet_split DBSCAN tracklet split (SPLIT ONLY), on-pitch  -> track_id (fragments), track_id_presplit
+#                  tracklets only (same OSNet-AIN as the tracker; reads crop_single)
+#   team_embed     osnet_team on sampled SINGLE crops/fragment  -> team_embedding,
+#                  + 2-means TEAM CLUSTERING with a robust           team_cluster (0/1 or NaN),
+#                  distance threshold (kit outliers unclustered)    team_cluster_nearest
+#   jersey_number  jn_pipeline_gsr (legibility -> DBNet++ -> PARSeq + SATRN -> vote_pool), multi-GPU;
+#                  eligibility = at least one single crop (NO role filter)
+#                  + per-fragment maxconf candidate stats  -> jersey_number_candidates, jersey_number_maxconf
+#   traj_refine    the pipeline's ONE merge, on CLUSTER + number evidence:
+#                  same-number merges + number-conflict resolution (phase 2a), then
+#                  agglomerative merging under clean-frame disjointness, re-enter
+#                  consistency and non-contradicting cluster/number labels
+#                  (phase 2b); duplicate-frame resolution with dynamic centroids
+#                  (stage 3); same OSNet-AIN as track / tracklet_split
+#                  -> track_id (trajectories), track_id_prerefine + jersey/cluster snapshots
+#   role_team      per-TRAJECTORY roles and sides, AFTER the merge: assistants,
+#                  goalkeepers, main referee (rule 2.14), cluster -> left/right
+#                  naming, fallbacks for unclustered players  -> role, team
 #   tracklet_agg   majority vote over [jersey_number]
 #   audit          per-component PASS/WARN/FAIL verdicts -> audit/<seq>.json (read-only)
 #
 # There is NO `pitch` stage: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 # detectors internally and emits camera parameters directly.
-# There is NO `reid` (prtreid) stage any more: role and team come from `role_team`,
-# which reads the team_embed descriptors and bbox_pitch; the tracker and the
-# tracklet_split stage use OSNet-AIN. `interpolation` is kept as a module but is NOT in
+# There is NO `reid` (prtreid) stage any more: the team CLUSTER comes from
+# `team_embed`, roles and sides from the post-refine `role_team` (bbox_pitch);
+# the tracker and the tracklet_split stage use OSNet-AIN. `interpolation` is kept as a module but is NOT in
 # the pipeline: it synthesizes rows that carry neither crop labels nor team embeddings.
 #
 # First-time provisioning (both are Docker-free, Kaggle/Lightning friendly):
@@ -71,26 +77,26 @@ defaults:
 
 # Pipeline definition. Order is load-bearing:
 #   * crop_filter right after track: the tracked-only rule needs track_id, and every
-#     later stage reads the same crop_single label; tracklet_split reads it too;
-#   * tracklet_split BEFORE everything that depends on final track ids (team_embed,
-#     role_team and jersey recognition are tracklet-level; tracklet_agg votes per track_id);
-#   * calibration before role_team (it consumes bbox_pitch);
-#   * pitch_gate right after calibration (it needs bbox_pitch) and before team_embed:
-#     a gated tracklet loses its track_id, and every later stage groups by track_id;
-#   * team_embed before role_team, role_team before jersey_number_detect (the jersey
-#     stage reads `role` to skip referees);
+#     later stage reads the same crop_single label;
+#   * calibration then pitch_gate BEFORE tracklet_split: the gate needs bbox_pitch,
+#     and gating first means the splitter never works on off-pitch tracklets;
+#   * tracklet_split before team_embed/jersey (both are fragment-level);
+#   * team_embed (embedding + TEAM CLUSTER) and jersey_number_detect before
+#     traj_refine: the one merge decides on cluster + number evidence;
+#   * role_team AFTER traj_refine: roles and sides are assigned once, on the
+#     finished trajectories, where the evidence is strongest;
 #   * audit LAST: it reads every column the other stages produce and writes none.
 pipeline:
   - bbox_detector
   - track
   - crop_filter
-  - tracklet_split
   - calibration
   - pitch_gate
+  - tracklet_split
   - team_embed
-  - role_team
   - jersey_number_detect
   - traj_refine
+  - role_team
   - tracklet_agg
   - audit
 

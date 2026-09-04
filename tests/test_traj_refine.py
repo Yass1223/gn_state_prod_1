@@ -53,8 +53,13 @@ def cand(*entries):
     return [[lab, math.log(p), votes * p, votes] for lab, p, votes in entries]
 
 
+CLU = {None: None, "left": 0.0, "right": 1.0}
+
+
 def track(team=None, number=None, c=None, scope=True):
-    return dict(team=team, number=number, cand=c or [], scope=scope)
+    """Helper kept call-compatible with the old team-string tests: "left"/"right"
+    map to team-cluster ids 0.0/1.0, None stays unclustered."""
+    return dict(cluster=CLU.get(team, team), number=number, cand=c or [], scope=scope)
 
 
 def run(trajs, tracks, tau=0.6, use_reenter=True, edge_margin=0.02, img_w=W):
@@ -106,7 +111,7 @@ def test_2a_merge_disjoint_same_team_number():
               2: track("left", "7", cand(("7", .8, 4)))}
     new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
-    assert res[1]["number"] == "7" and res[1]["team"] == "left"
+    assert res[1]["number"] == "7" and res[1]["cluster"] == 0.0
     assert [m["phase"] for m in rep["merges"]] == ["2a"]
     # combined confidence: 5+4 votes on "7" of 9 pooled -> 1.0
     assert abs(res[1]["confidence"] - 1.0) < 1e-12
@@ -263,7 +268,7 @@ def test_2b_team_no_number_attaches():
               2: track("left", None)}
     new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
-    assert res[1]["number"] == "7" and res[1]["team"] == "left"
+    assert res[1]["number"] == "7" and res[1]["cluster"] == 0.0
     assert rep["merges"][0]["phase"] == "2b"
 
 
@@ -274,7 +279,7 @@ def test_2b_number_no_team_attaches():
               2: track(None, "7", cand(("7", .5, 2)))}
     new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
-    assert res[1]["team"] == "left" and res[1]["number"] == "7"
+    assert res[1]["cluster"] == 0.0 and res[1]["number"] == "7"
 
 
 def test_2b_no_number_no_team_distance_only():
@@ -283,7 +288,7 @@ def test_2b_no_number_no_team_distance_only():
     tracks = {1: track(None, None), 2: track(None, None)}
     new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
-    assert res[1]["team"] is None and res[1]["number"] is None
+    assert res[1]["cluster"] is None and res[1]["number"] is None
 
 
 def test_2b_blocks():
@@ -327,6 +332,72 @@ def test_2b_average_linkage_and_inherited_number_gates_later_merges():
     new, res, rep = run([t1, t2, t3], tracks)
     assert res[1]["tids"] == [1, 2] and 3 in res
     assert res[1]["number"] == "7" and res[3]["number"] == "9"
+
+
+# ------------------------------------------------------ cluster-label rules ----
+
+def test_same_cluster_different_numbers_never_merge():
+    # two same-cluster fragments with two DIFFERENT known numbers are two
+    # different players: no merge in 2a (numbers differ) nor 2b (number veto),
+    # at any distance
+    t1 = rows_for(1, 0, range(0, 6))
+    t2 = rows_for(2, 0, range(10, 16))
+    tracks = {1: track("left", "7", cand(("7", .9, 5))),
+              2: track("left", "9", cand(("9", .9, 5)))}
+    new, res, rep = run([t1, t2], tracks)
+    assert rep["merges"] == [] and set(new.tolist()) == {1, 2}
+
+
+def test_unclustered_numbered_merges_on_same_number():
+    # an UNCLUSTERED numbered fragment merges with a clustered fragment of the
+    # same number (cluster imposes no condition when either side is unknown)
+    t1 = rows_for(1, 0, range(0, 6))
+    t2 = rows_for(2, 0, range(10, 16))
+    tracks = {1: track("left", "7", cand(("7", .9, 5))),
+              2: track(None, "7", cand(("7", .8, 4)))}
+    new, res, rep = run([t1, t2], tracks)
+    assert rep["merges"] and rep["merges"][0]["phase"] == "2a"
+    assert set(new.tolist()) == {1}
+    assert res[1]["cluster"] == 0.0        # the known cluster survives the merge
+
+
+def test_unclustered_unnumbered_merges_on_distance_alone():
+    # an unclustered, unnumbered fragment merges purely on distance <= tau (2b)
+    t1 = rows_for(1, 0, range(0, 6))
+    t2 = rows_for(2, 0, range(10, 16))
+    tracks = {1: track(None, None), 2: track(None, None)}
+    new, res, rep = run([t1, t2], tracks)
+    assert rep["merges"] and rep["merges"][0]["phase"] == "2b"
+    assert set(new.tolist()) == {1}
+
+
+def test_stage3b_dynamic_centroid_reassignment():
+    # After each 3b assignment the receiving trajectory's centroid is
+    # recomputed over ALL its detections. Construction: held m1 (0.6*u0+0.8*u2)
+    # joins T_a (a single clean u0 row) first; T_a's centroid then leans toward
+    # u2, so held m2 (0.3*u1+0.954*u2) lands in T_a (d ~0.62) instead of T_b
+    # (d 0.7), which a static centroid would have chosen.
+    import numpy as np
+    w = 0.6 * unit(0) + 0.8 * unit(2)
+    w = (w / np.linalg.norm(w)).astype(np.float32)
+    v = 0.3 * unit(1) + 0.954 * unit(2)
+    v = (v / np.linalg.norm(v)).astype(np.float32)
+    t1 = rows_for(1, 3, range(0, 6)) + [
+        (w, False, 20, [900.0, 400.0, 40.0, 80.0], 1),
+        (v, False, 21, [900.0, 400.0, 40.0, 80.0], 1)]
+    t2 = rows_for(2, 3, range(20, 26))          # clean 20-25 -> collisions at 20, 21
+    t3 = [(unit(0), True, 30, [900.0, 400.0, 40.0, 80.0], 3)]      # T_a
+    t4 = rows_for(4, 1, range(40, 46))                              # T_b
+    tracks = {1: track(None, None), 2: track(None, None),
+              3: track("left", None), 4: track("right", None)}
+    new, res, rep = run([t1, t2, t3, t4], tracks)
+    s3 = rep["stage3"]
+    assert s3["held"] == 2 and s3["placed"] == 2 and s3["unassigned"] == 0
+    E, single, frames, boxes, tids = build(t1, t2, t3, t4)
+    for f, vec in ((20, w), (21, v)):
+        m = [i for i in range(len(frames)) if frames[i] == f and not single[i]]
+        assert len(m) == 1 and new[m[0]] == 3, (f, new[m[0]])   # BOTH land in T_a
+    check_invariants(frames, new)
 
 
 # ------------------------------------------------------------------ stage 3 ----

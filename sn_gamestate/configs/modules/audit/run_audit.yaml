@@ -50,9 +50,8 @@ cfg:
   models_dir: ${project_dir}/plugins/jn_gsr/models
   parseq_ckpt: parseq_gsr_ft_s1.ckpt
   satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
-  # Roles the jersey stage recognises (jn_gsr.yaml `roles`); tracklets whose role
-  # (from the role_team stage) is elsewhere are not expected to carry a number.
-  jn_roles: [player, goalkeeper]
+  # Jersey eligibility is single-crop presence only (no role filter -- roles are
+  # assigned after traj_refine).
   # Whether the jersey stage hands only single crops (crop_single) to the
   # recognisers. Resolved from jn_gsr.yaml; the blob must record the same value,
   # and with true a tracklet without a single crop is not expected to carry a
@@ -97,6 +96,8 @@ cfg:
     sha256: ${modules.team_embed.cfg.team_sha256}
     pos_stride: ${modules.team_embed.cfg.pos_stride}
     crops_per_track: ${modules.team_embed.cfg.crops_per_track}
+    cluster_method: ${modules.team_embed.cfg.cluster_method}
+    outlier_k: ${modules.team_embed.cfg.outlier_k}
   role_team_sidecar_dir: ${modules.role_team.cfg.audit_dir}
   expected_role_team:
     params: ${modules.role_team.cfg.params}
@@ -119,7 +120,6 @@ cfg:
     tau: ${modules.traj_refine.cfg.tau}
     use_reenter: ${modules.traj_refine.cfg.use_reenter}
     edge_margin: ${modules.traj_refine.cfg.edge_margin}
-    roles: ${modules.traj_refine.cfg.roles}
     ain_sha256: ${modules.traj_refine.cfg.ain_sha256}
     ain_sha256_tracklet_split: ${modules.tracklet_split.cfg.ain_sha256}
 

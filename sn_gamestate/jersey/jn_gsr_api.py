@@ -54,11 +54,11 @@ recombine exactly: mx = max, conf_sum/votes add) -- and
 ``jersey_number_maxconf``, the assigned number's maxconf score (0.0 when
 unnumbered). The assigned number itself is still vote_pool, unchanged.
 
-Scope follows the package's validated setting: only tracklets whose ``role`` (the
-per-tracklet role assigned by the ``role_team`` stage, which runs before this one)
-is in ``roles`` (player, goalkeeper) are recognized; referees get (None, 0.0),
-exactly like MMOCR's no-digit outcome. Team plays no part here. Every crop of a
-tracklet is used, single or multi: the crop filter's label is not consulted.
+Scope: every fragment holding at least one single crop is recognized -- there
+is no role filter, because roles do not exist yet (``role_team`` runs AFTER
+``traj_refine`` in this architecture); the legibility filter inside the workers
+is what naturally discards referee and backs-turned crops, exactly like MMOCR's
+no-digit outcome. Team plays no part here.
 
 Caching, rigorously
 -------------------
@@ -127,7 +127,7 @@ def detect_gpus():
 class JNGsrTrackletRecognizer(VideoLevelModule):
     """Tracklet-level jersey recognition via the vendored jn_pipeline_gsr package."""
 
-    input_columns = ["track_id", "bbox_ltwh", "image_id", "role", "crop_single"]
+    input_columns = ["track_id", "bbox_ltwh", "image_id", "crop_single"]
     output_columns = ["jersey_number_detection", "jersey_number_confidence",
                       "jersey_number_candidates", "jersey_number_maxconf"]
 
@@ -154,7 +154,6 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         self.satrn_ckpt = str(getattr(cfg, "satrn_ckpt", "") or SATRN_CKPT)
         self._ckpt_ids = {}                       # memoised; see _ckpt_id()
         self.fp16 = bool(getattr(cfg, "fp16", True))
-        self.roles = set(getattr(cfg, "roles", ["player", "goalkeeper"]))
         # Single crops only: hand the recognisers the detections the crop filter
         # labelled crop_single (one person in the box); overlapping crops are
         # excluded from the manifest. A tracklet with no single crop is left
@@ -167,11 +166,10 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
 
     # ------------------------------------------------------------- manifest --
     def _build_manifest(self, detections, metadatas):
-        """{tid: [[frame_path, [l,t,w,h]], ...]} chronological; role-filtered and,
-        with single_crops_only, restricted to crop_single detections.
-        Returns (manifest, stats) with stats = dict(tracklets_skipped_role,
-        tracklets_skipped_no_single, frames_excluded_multi, manifest_tracklets,
-        manifest_frames)."""
+        """{tid: [[frame_path, [l,t,w,h]], ...]} chronological; with
+        single_crops_only, restricted to crop_single detections. Returns
+        (manifest, stats) with stats = dict(tracklets_skipped_no_single,
+        frames_excluded_multi, manifest_tracklets, manifest_frames)."""
         if self.single_crops_only and "crop_single" not in detections.columns:
             raise RuntimeError("[jn_gsr] crop_single column missing - the crop_filter "
                                "stage must run before jersey_number_detect")
@@ -179,15 +177,13 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         order = {idx: Path(p).name for idx, p in id2path.items()}
         tracked = detections.dropna(subset=["track_id"])
         manifest = {}
-        stats = dict(tracklets_skipped_role=0, tracklets_skipped_no_single=0,
+        stats = dict(tracklets_skipped_no_single=0,
                      frames_excluded_multi=0, manifest_tracklets=0, manifest_frames=0)
         for tid, grp in tracked.groupby("track_id"):
-            if "role" in grp.columns:
-                majority_role = grp["role"].mode()
-                role = majority_role.iloc[0] if len(majority_role) else None
-                if role not in self.roles:
-                    stats["tracklets_skipped_role"] += 1
-                    continue
+            # Eligibility is single-crop presence only: roles do not exist yet
+            # (role_team runs AFTER traj_refine in this architecture); the
+            # legibility filter inside the workers is what naturally discards
+            # referee crops.
             if self.single_crops_only:
                 keep = grp["crop_single"].astype(bool)
                 stats["frames_excluded_multi"] += int((~keep).sum())
@@ -332,11 +328,9 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
         seq = Path(str(metadatas["file_path"].iloc[0])).parent.parent.name \
             if len(metadatas) else "unknown"
         manifest, stats = self._build_manifest(detections, metadatas)
-        skipped = stats["tracklets_skipped_role"]
         if not manifest:
             log.warning(f"[jn_gsr] {seq}: no eligible tracklets "
-                        f"({skipped} skipped by role filter, "
-                        f"{stats['tracklets_skipped_no_single']} with no single crop)")
+                        f"({stats['tracklets_skipped_no_single']} with no single crop)")
             return detections
         mhash = self._manifest_hash(manifest, self.rule, self.stride)
         cache_file = self.cache_dir / f"{seq}.{mhash[:12]}.json"
@@ -406,7 +400,7 @@ class JNGsrTrackletRecognizer(VideoLevelModule):
                         float(math.exp(float(entry[1])) * float(entry[2]))
                 n_numbered += 1
         log.info(f"[jn_gsr] {seq}: {n_numbered}/{len(manifest)} tracklets "
-                 f"numbered ({skipped} skipped by role filter, "
+                 f"numbered (no role filter - roles are assigned after refine; "
                  f"{stats['tracklets_skipped_no_single']} with no single crop, "
                  f"{stats['frames_excluded_multi']} overlapping crops excluded, "
                  f"single_crops_only={self.single_crops_only}, "

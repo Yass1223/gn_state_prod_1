@@ -58,8 +58,9 @@ cfg:
   parseq_ckpt: parseq_gsr_ft_s1.ckpt
   satrn_ckpt: recog2/best_recog_word_acc_epoch_10.pth
 
-  # --- scope: recognize tracklets whose `role` (from the role_team stage) is here ---
-  roles: [player, goalkeeper]
+  # --- scope: every fragment with at least one single crop; NO role filter
+  # (roles are assigned after traj_refine, so they do not exist here; the
+  # legibility filter is what naturally discards referee crops) ---
   # Only single crops (crop_filter's crop_single: one person in the box) are handed
   # to the recognisers; overlapping crops are excluded from the manifest and a
   # tracklet with no single crop stays unnumbered. `stride` then steps over the

@@ -1,37 +1,35 @@
-# Role (player / goalkeeper / referee), team cluster and side (left / right) per
-# tracklet: the notebook's rule chain (sn_gamestate/team/rules.py, a verbatim port
-# of role-team-gt-tracks-3.ipynb run_sequence) at the parameters it froze on the
-# tuning split. Runs after team_embed, before jersey_number_detect (the jersey
-# stage reads `role` to skip referees).
+# Role (player / goalkeeper / referee) and team SIDE (left / right) per FINAL
+# trajectory. Runs AFTER traj_refine -- the whole point of the position: roles
+# and sides are decided once, on complete trajectories with full temporal and
+# positional evidence, and never gate the merge. "Appearance outlier" in this
+# architecture MEANS "unclustered by team_embed"; there is no separate
+# distance/DBSCAN outlier machinery here any more.
 #
-# Notebook results at these values (ground-truth tracklets, YOLO11-L boxes, one
-# tracklet = one count): valid three-class macro-F1 0.947, test 0.926; referee
-# recall/precision on test 0.879/0.888; team split 1.000; naming 0.908 (four
-# test clips mirrored under every cue).
+# Rules (sn_gamestate/team/role_team_api.py): assistants by the touchline
+# geometry (one per side); goalkeepers by penalty-area depth (one per half, an
+# unclustered near-equal-depth second candidate confirmed); the MAIN referee =
+# among the remaining unclustered trajectories, those whose sampled y-range
+# stays inside the symmetric 90% band of the trajectory means (rule 2.14:
+# max(y_ref) <= band * max_i(mean_y_i) and min(y_ref) >= band * min_i(mean_y_i)),
+# the candidate nearest the assistants; everyone else a player. Sides: the two
+# team clusters are named by the cue chain over player mean-x (side_rule);
+# an unclustered player takes its NEAREST centroid's side
+# (team_cluster_nearest, a flagged fallback); a player with no embedding takes
+# its mean-x half.
 #
-# Positions are bbox_pitch at stride 5; tau_n counts those sampled positions.
-# Tuned on ground-truth track ids and annotation-derived homographies; the
-# per-clip caps (one keeper per half, one assistant per side, max_ref referees)
-# assume one tracklet per identity. UNTUNED on this pipeline's tracklets and
-# BroadTrack projections: sweep later, once the run is clean.
+# Geometry thresholds carried over from the notebook's tuned operating point
+# (tau_n/tau_a/tau_a_sy/tau_m/confirm/side_rule); band and gk_depth_m are this
+# stage's own. UNTUNED on this pipeline's trajectories: sweep on valid later.
 _target_: sn_gamestate.team.RoleTeamAssignment
 cfg:
   pos_stride: 5
-  crops_per_track: 16
   audit_dir: ${project_dir}/audit/role_team
   params:
-    k: 3.25               # distance rule d > m + k*s
-    dbscan_min: 4         # DBSCAN min_samples
-    dbscan_scale: 1.5     # scale on the knee eps
     tau_n: 5              # min sampled positions before any non-player role
-    tau_a: 0.85           # assistant: |y| >= tau_a * clip max |y|
+    tau_a: 0.85           # assistant: |mean y| >= tau_a * clip max |mean y|
     tau_a_sy: 3.0         # assistant: max y std (m)
-    tau_r: 2.0            # centre referee: movement-range margin above typical
-    tau_m: 0.30           # position margin that accepts an unconfirmed candidate
-    confirm: outlier      # geometry | outlier
-    extra_ref: strong     # none | both | rule | strong
-    k_strong: 4.0         # z threshold of the strong variant
-    extra_pool: all       # nogk | all (rejected keeper candidates may become referees)
-    centre_confirm: outlier   # margin | outlier
-    max_ref: 3            # cap on referees per sequence
-    side_rule: keeper     # sign | mean | quantile | vote | centroid | keeper | vote2
+    tau_m: 0.30           # position margin that accepts a clustered candidate
+    confirm: outlier      # outlier (= unclustered) | geometry
+    side_rule: keeper     # keeper | vote (others fall back to vote)
+    band: 0.9             # the symmetric 90% band of rule 2.14
+    gk_depth_m: 4.0       # second-keeper confirmation depth window (m)
