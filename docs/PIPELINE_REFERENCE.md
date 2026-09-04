@@ -6,7 +6,9 @@ Kaggle run on one test sequence (see §7 findings and `docs/KAGGLE_GUIDE.md`). E
 2026-09-03 with the `traj_refine` stage, the jersey candidate output (blob schema 2),
 and the second detector (YOLOv11L_HM, now the default) — first exercised on Kaggle the
 same day (run 5, §7): full pipeline exit 0, RUN INTEGRITY OK, all 13 audit checks PASS;
-the detector-default decision is pending an A/B (§7 item 9, §9). Restructured
+the detector-default decision is pending an A/B (§7 item 9, §9). Amended 2026-09-04 after run 7 (the first conformant run): role/team
+pre-refine snapshots added and the role_team audit check repointed at them
+(§7 item 17, §8 batch 6); a full rerun is required for a clean integrity chain. Restructured
 2026-09-04 to the split-only architecture: `split_merge` retired, replaced by
 `tracklet_split` (Stage 1, split only) with the pipeline's ONE merge in `traj_refine`
 (Stage 2 + stage-3 duplicate-frame resolution); not yet exercised on Kaggle (§8 batch 5,
@@ -99,9 +101,9 @@ must be launched from the repository root; outputs go to `outputs/sn-gamestate/<
 | `team_embed` | `sn_gamestate.team.TeamEmbedding` | osnet_team (OSNet x1.0, 128×64, 256-d) from HF `Ynniss/osnet_team/osnet_team_best.pt`; ≤ 16 crops/tracklet on the stride-5 grid; fp32 + flip TTA; `team_sha256` currently **null** (recorded, not enforced — pin after first verified run); sidecar `audit/team_embed/` |
 | `role_team` | `sn_gamestate.team.RoleTeamAssignment` | notebook rule chain (`team/rules.py`): role player/goalkeeper/referee, team k-means on single-crop descriptors, side; frozen params (k 3.25, tau_n 5, max_ref 3, side_rule keeper, …), untuned on this pipeline's tracklets/BroadTrack projections; sidecar `audit/role_team/` |
 | `jersey_number_detect` | `sn_gamestate.jersey.jn_gsr_api.JNGsrTrackletRecognizer` | subprocess workers in the 3.10 venv; roles [player, goalkeeper]; `single_crops_only: true`; legibility > 0.72 → DBNet++ ROI → PARSeq + SATRN → `vote_pool` (the only rule); stride 5; fp16; GPU sharding auto via nvidia-smi (2 workers on Kaggle 2×T4); content-hash cache `jn_cache/`. Since 2026-09-03 (blob **schema 2**): two ADDITIVE columns for `traj_refine` — `jersey_number_candidates` (every pooled label of the two recognisers as `[label, mx, conf_sum, votes]`, ranked by the maxconf score exp(mx)·conf_sum; stats, not scores, so merged tracklets recombine exactly: mx=max, conf_sum/votes add) and `jersey_number_maxconf` (assigned number's score). The schema is folded into the cache key (old caches miss and recompute once) and checked on every shard and cached blob; the assigned number stays `vote_pool`, byte-identical |
-| `traj_refine` | `sn_gamestate.refine.traj_refine_api.TrajRefine` | NEW 2026-09-03, extended 2026-09-04. The pipeline's ONE merge (Stage 2) plus stage-3 duplicate-frame resolution, between jersey and the vote: phase 2a merges in-scope (player/goalkeeper) cluster pairs with equal team AND equal number, in descending JOINT pooled maxconf (exp(max mx)·Σconf_sum over the pair's clean-detection stats — the maxconf the merged cluster would carry; changed 2026-09-03 from the sum of the two separate scores), when CLEAN frame sets are disjoint ∧ re-enter consistent ∧ distance ≤ tau; a pair claiming one number at the same time (clean-frame overlap) is a conflict — the lower-maxconf side walks to its best candidate not previously lost (banned set; cascades walk down the list; "-1"/exhaustion → unnumbered); phase 2b merges agglomeratively (average linkage, the splitter's distance convention) under clean-frames-disjoint ∧ re-enter ∧ vacuous-when-unknown team/number agreement. Multi-player detections are ignored until stage 3 (no part in centroids, distances or disjointness; re-enter endpoints are clean-anchored). Stage 3, in-scope clusters only, after the merger: 3a keeps one detection per (frame, trajectory) — clean wins (a second clean is a counted anomaly), else the multi nearest the clean-first centroid — and holds the rest; centroids are then recomputed over ALL remaining detections (3b's metric, fixed); 3b places held detections in ascending distance to the nearest in-scope trajectory with that frame free (occupancy grows; no distance cap by specification) and unassigns the rest (`track_id` NaN — the ONLY way any refinement stage drops a row). Same OSNet-AIN pin as track/tracklet_split (audit-enforced; tau 0.60 inherited from the retired split_merge operating point, untuned for this stage; edge_margin 0.02 untuned). Role is NOT a merge condition (merged rows → row-majority role); referees untouched; no-centroid trajectories never merge; rows adopted in 3b take the target cluster's labels. Snapshots written unconditionally: `track_id_prerefine`, `jersey_number_detection_prerefine`, `jersey_number_confidence_prerefine`; `enabled: false` = snapshots + sidecar only (the A/B switch). Output invariant: one detection per (image_id, track_id) over ALL detections; tracked rows out = in − unassigned. Sidecar `audit/traj_refine/` (incl. `stage3` block and `rows_unassigned`); algorithm in `refine/traj_refine.py` (pure numpy, 22 unit tests in `tests/test_traj_refine.py`) |
+| `traj_refine` | `sn_gamestate.refine.traj_refine_api.TrajRefine` | NEW 2026-09-03, extended 2026-09-04. The pipeline's ONE merge (Stage 2) plus stage-3 duplicate-frame resolution, between jersey and the vote: phase 2a merges in-scope (player/goalkeeper) cluster pairs with equal team AND equal number, in descending JOINT pooled maxconf (exp(max mx)·Σconf_sum over the pair's clean-detection stats — the maxconf the merged cluster would carry; changed 2026-09-03 from the sum of the two separate scores), when CLEAN frame sets are disjoint ∧ re-enter consistent ∧ distance ≤ tau; a pair claiming one number at the same time (clean-frame overlap) is a conflict — the lower-maxconf side walks to its best candidate not previously lost (banned set; cascades walk down the list; "-1"/exhaustion → unnumbered); phase 2b merges agglomeratively (average linkage, the splitter's distance convention) under clean-frames-disjoint ∧ re-enter ∧ vacuous-when-unknown team/number agreement. Multi-player detections are ignored until stage 3 (no part in centroids, distances or disjointness; re-enter endpoints are clean-anchored). Stage 3, in-scope clusters only, after the merger: 3a keeps one detection per (frame, trajectory) — clean wins (a second clean is a counted anomaly), else the multi nearest the clean-first centroid — and holds the rest; centroids are then recomputed over ALL remaining detections (3b's metric, fixed); 3b places held detections in ascending distance to the nearest in-scope trajectory with that frame free (occupancy grows; no distance cap by specification) and unassigns the rest (`track_id` NaN — the ONLY way any refinement stage drops a row). Same OSNet-AIN pin as track/tracklet_split (audit-enforced; tau 0.60 inherited from the retired split_merge operating point, untuned for this stage; edge_margin 0.02 untuned). Role is NOT a merge condition (merged rows → row-majority role); referees untouched; no-centroid trajectories never merge; rows adopted in 3b take the target cluster's labels. Snapshots written unconditionally: `track_id_prerefine`, `jersey_number_detection_prerefine`, `jersey_number_confidence_prerefine`, and (since 2026-09-04, run-7 fix) `role_prerefine`, `team_prerefine`, `team_cluster_prerefine`; `enabled: false` = snapshots + sidecar only (the A/B switch). Output invariant: one detection per (image_id, track_id) over ALL detections; tracked rows out = in − unassigned. Sidecar `audit/traj_refine/` (incl. `stage3` block and `rows_unassigned`); algorithm in `refine/traj_refine.py` (pure numpy, 22 unit tests in `tests/test_traj_refine.py`) |
 | `tracklet_agg` | `tracklab.wrappers.MajorityVoteTracklet` | majority vote over `[jersey_number]` only (role is per-tracklet from role_team) |
-| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs tracklet_split checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL. Since 2026-09-04: `_check_tracklet_split` replaces `_check_split_merge` (sidecar present; eps/min_samples/digest ran == configured; FAIL on any merge threshold or merge/pass evidence anywhere; per-tracklet fragment counts sum to the total; every tracked row assigned — the splitter never drops or merges; fragments == trajectories in the state; no (image_id, track_id) collision; every fragment from exactly one source tracklet via `track_id_presplit`; fragments-without-clean recomputed == sidecar, a consistency check, not a standalone FAIL). The `traj_refine` check now does row accounting (rows losing an id == sidecar `rows_unassigned`, no row may gain one, tracked_after == tracked_before − unassigned) with the pin-equality key `ain_sha256_tracklet_split`; the pitch_gate / team_embed / role_team / jersey checks audit against the pre-refine snapshots (`track_id_prerefine`, jersey snapshot columns) so every earlier stage is held to the state it actually produced |
+| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs tracklet_split checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL. Since 2026-09-04: `_check_tracklet_split` replaces `_check_split_merge` (sidecar present; eps/min_samples/digest ran == configured; FAIL on any merge threshold or merge/pass evidence anywhere; per-tracklet fragment counts sum to the total; every tracked row assigned — the splitter never drops or merges; fragments == trajectories in the state; no (image_id, track_id) collision; every fragment from exactly one source tracklet via `track_id_presplit`; fragments-without-clean recomputed == sidecar, a consistency check, not a standalone FAIL). The `traj_refine` check now does row accounting (rows losing an id == sidecar `rows_unassigned`, no row may gain one, tracked_after == tracked_before − unassigned) with the pin-equality key `ain_sha256_tracklet_split`; the pitch_gate / team_embed / role_team / jersey checks audit against the pre-refine snapshots (`track_id_prerefine`, jersey snapshot columns; role_team additionally reads `role/team/team_cluster_prerefine` when present — run-7 fix, since traj_refine rewrites those live columns on merged clusters and 3b-adopted rows) so every earlier stage is held to the state it actually produced |
 
 Not in the pipeline **[verified]**: no `pitch` stage (BroadTrack runs NBJW keypoints and
 TVCalib lines internally); no `reid`/prtreid stage; `interpolation` (dti.yaml) exists as a
@@ -279,6 +281,22 @@ Discrepancies found in this analysis:
     merge is the label-aware Stage 2. Resolved by the split-only restructuring (§8
     batch 5): `tracklet_split` splits and never merges (audit-enforced), `traj_refine`
     holds the pipeline's one merge plus stage-3 duplicate-frame resolution.
+17. RESOLVED 2026-09-04 (found by run 7): a false role_team audit FAIL ("team varies
+    within 8 tracks") introduced by stage 3. The role_team check grouped rows by
+    `track_id_prerefine` but read the LIVE team column, which `traj_refine`
+    legitimately rewrites on rows stage 3b moves between trajectories (adopted rows
+    take the target cluster's team) — so role_team's output was no longer what the
+    check was reading. The jersey check was immune (it audits the jersey PREREFINE
+    snapshots); role happened to stay constant (all moved rows were players). Fix,
+    mirroring the jersey design: `traj_refine` now snapshots `role_prerefine`,
+    `team_prerefine`, `team_cluster_prerefine` unconditionally, and
+    `_check_role_team` audits those when present (recorded in
+    `observed.columns_audited`; falls back to the live columns on states without the
+    snapshots). Verified by a check-level reproduction test (the exact run-7 message
+    without snapshots, PASS with them, genuine role_team variance still FAILs) and by
+    the extended `process()` harness (snapshots equal pre-refine values on every row,
+    including 3b-moved and unassigned ones). Run 7's metrics remain refused by the
+    integrity gate until a rerun passes clean.
 
 Kaggle findings so far (runs 1-3, 2026-09-02): environment recipe, TrackLab patch, and
 all 22 stage imports work on the current image (host Python 3.12.13, provisioned 3.9.25);
@@ -335,17 +353,35 @@ split-only restructuring (§7 item 16, §8 batch 5). The in-run evaluation table
 not in the captured stdout (they went to the session's `reference_metrics/summary.md`,
 not retrieved).
 
-Still **[unverified]** after run 6 and the 2026-09-04 restructuring: full-split behavior and
+Run 7 (2026-09-04 09-05-21, T4 x2, FIRST CONFORMANT RUN — HM detector,
+`tracklet_split` + `traj_refine` with stage 3): full pipeline on test/SNGS-116, exit 0.
+The splitter: 52 tracklets → 64 fragments (7 split, 187 noise attached, 7 all-multi
+dissolved, 7 fragments without a clean detection — left unnumbered by the jersey stage
+by design), `_check_tracklet_split` PASS. `traj_refine`, active for the first time:
+64 trajectories → 32 (9 2a + 23 2b merges, 1 number conflict resolved, 2 2a pairs
+rejected, 3 out of scope; stage 3: 249 held, 249 placed, 0 unassigned), its audit check
+PASS. In-run evaluation (pitch, attributes on): GS-HOTA 62.396, DetA 51.93, AssA 74.97,
+LocA 70.6, MOTA 44.86, IDF1 70.65, IDSW 4, MT 15 / PT 7 / ML 4 of 26 GT ids, 10200
+predicted detections vs 10567 GT, 32 predicted ids — vs pre-conformance run 5 (same HM
+detector): AssA 64.06→74.97, MOTA 30.21→44.86, IDF1 64.49→70.65, MT 8→15. HOWEVER the
+audit reported PASS=12 FAIL=1 (`role_team: team varies within 8 tracks`) and
+`verify_run_integrity.py` correctly refused the run — diagnosed as a stale check
+design, not a pipeline defect (§7 item 17), fixed in §8 batch 6. **These metrics are
+provisional and unreportable until a rerun passes RUN INTEGRITY OK.** The sidecar-dump,
+reference-metrics and conversion-check cells were not executed in that session.
+
+Still **[unverified]** after run 7 and the batch-6 fix: full-split behavior and
 runtime; the HF dataset fallback's actual network path (code path tested synthetically,
 never against a live server failure; KAUST served `test.zip` again in run 5 at
 ~15 MiB/s); the EVS git-lfs weights path and its automatic
 fallback (runs pinned `BT_WEIGHTS_REPO`); the HF mirror zip's internal layout (§5); the
 line-by-line behavior of files verified only at the config/contract level
-(`broadtrack_api.py`, the jersey worker); the ENTIRE conformant pipeline live —
-`tracklet_split` (12 unit tests + a stubbed `process()` harness, never run in the
-pipeline), the `traj_refine` merge/conflict paths and stage 3 on real sequences (22 unit
-tests + a stubbed `process()` harness; the pre-conformance stage ran live in runs 5–6
-but had nothing to merge), per-fragment jersey quality and runtime (§7 item 13); and the
+(`broadtrack_api.py`, the jersey worker); a conformant run with RUN INTEGRITY OK —
+run 7 exercised `tracklet_split` and `traj_refine` (incl. stage 3) live with both
+stage checks PASS, but the run as a whole was refused on the role_team false FAIL,
+so every run-7 metric is provisional and the batch-6 snapshot fix itself has not run
+live yet; per-fragment jersey quality and runtime (§7 item 13; run 7 observed 7
+unnumbered no-clean fragments); and the
 snft-vs-HM A/B on a shared calibration (the pending detector-default decision, to be
 re-based on post-conformance baselines per §7 item 15).
 
@@ -494,32 +530,58 @@ method specification; in the local tree, pending push; motivated by the run-6 fi
     accounting); repo-wide reference sweep — the only remaining `split_merge` strings
     in live files are historical-provenance comments marked "retired".
 
+Batch 6 (2026-09-04, after run 7; in the local tree, pending push — the run-7
+role_team false-FAIL fix, §7 item 17):
+
+23. `sn_gamestate/refine/traj_refine_api.py`: three snapshot columns written
+    unconditionally before any mutation — `role_prerefine`, `team_prerefine`,
+    `team_cluster_prerefine` (missing `team_cluster` column → NaN); `output_columns`
+    extended; docstring updated.
+24. `sn_gamestate/audit/run_audit_api.py` `_check_role_team`: audits the three
+    snapshot columns when all are present (on a copied frame — the caller shares
+    `tracked_prerefine` with the team_embed and jersey checks), records the source in
+    `observed.columns_audited`, falls back to the live columns otherwise (so
+    pre-batch-6 states and the synthetic test fixture keep their behavior); check
+    description updated.
+25. `tests/test_audit.py`: snapshot-preference case appended (live-team flip on a
+    multi-row track tolerated through the snapshots, the exact run-7 failure message
+    reproduced without them, genuine snapshot-level variance still FAILs).
+26. Verification (batch 6): all three installed files byte-identical (sha256) to the
+    sandbox-verified copies; `process()` harness extended and green (snapshots equal
+    pre-refine values on every row, including the 3b-adopted row — live team "right",
+    snapshot "left" — and the unassigned row); a check-level reproduction test green
+    (PASS with snapshots / run-7 FAIL message without / genuine variance FAILs / the
+    shared frame is not mutated); the untouched suites re-confirmed (22 + 12).
+
 Verification performed per edit (2026-09-02 batches): `bash -n` on every touched script; the zip-validity
 fallback trigger exercised against missing/empty/truncated/valid zips (all four correct);
 the clone retry→tarball chain exercised with stubs; the codeload endpoint for
 `evs-broadcast/BroadTrack` probed live (`main` = HTTP 200); every edited region re-read
 in its final on-disk state.
 
-## 9. Plan of record — 2026-09-04, after the split-only restructuring
+## 9. Plan of record — 2026-09-04, after run 7 and the batch-6 fix
 
-The conformant pipeline (batch 5) is installed and fully verified offline but has never
-run live; every pre-conformance metric (runs 4–6) is void as a baseline (§7 item 15).
-Current steps: **(1) push batch 5** — before committing, run
+Run 7 proved the conformant architecture live: the splitter split only (52→64,
+0 merges), `traj_refine` did the pipeline's one merge (64→32) plus stage 3
+(249 placed, 0 unassigned), both new audit checks PASS, and every headline metric
+improved over the pre-conformance run on the same detector (GS-HOTA 55.07→62.40,
+AssA +10.9, MOTA +14.6, IDF1 +6.2, MT 8→15). The run was nonetheless refused by the
+integrity gate on a role_team false FAIL — a stale check design exposed by stage-3 row
+movement, fixed in batch 6 (§7 item 17) — so those numbers are provisional. Current
+steps: **(1) push batches 5+6 together** — before committing, run
 `git rm -r _deleted_pending_git_rm` and remove the empty
-`configs/modules/split_merge/` directory (§8 item 18); **(2) one Kaggle session of the
-conformant pipeline** on test/SNGS-116 via `docs/kaggle_one_sequence_test.ipynb`
-(fail-fast cell already checks the new files). Expectations for that run: the
-`tracklet_split` log should show ~52 tracklets → ~67 fragments with 0 merges;
-`traj_refine` receives the fragments and should finally show real 2a/2b/stage-3
-activity; the jersey stage recomputes its ENTIRE cache at fragment level (more, shorter
-tracklets — expect a longer jersey phase and possibly more unnumbered tracklets, §7
-item 13); the audit runs `_check_tracklet_split` and the row-accounting `traj_refine`
-check for the first time live. Read the sidecars (`audit/tracklet_split/`,
-`audit/traj_refine/` incl. the `stage3` block) and the in-run metrics as the FIRST
-post-conformance baseline. **(3) Then the detector A/B** (`RUN_DET_AB=1`, snft vs HM on
-a shared calibration cache) re-based on post-conformance numbers, and the detector
-default decided (one line in `soccernet.yaml`; the pre-conformance evidence — snft
-58.4–59.4 vs HM 55.07 — favored snft but is no longer directly applicable). After the
-first accepted configuration: pin `team_sha256` (§7 item 3), replace the SATRN digest
-prefix (§7 item 4), and tune `traj_refine` tau/edge_margin on `valid` if merging looks
-off (§7 item 7) — tau is now the pipeline's only merge threshold.
+`configs/modules/split_merge/` directory (§8 item 18); **(2) rerun the notebook
+unchanged** — a fresh Kaggle session recomputes everything (the run-7 jersey and
+calibration caches live only in that session's outputs), so expect a similar duration
+to run 7 unless its outputs are attached as a dataset; expect 13 PASS, RUN INTEGRITY OK,
+and `role_team.observed.columns_audited == "prerefine snapshots"`; that run's metrics
+become the first reportable post-conformance baseline (run-7 values are the expected
+ballpark). Also execute the sidecar-dump / reference-metrics / conversion-check cells
+this time. **(3) Then the detector A/B** (`RUN_DET_AB=1`, snft vs HM on a shared
+calibration cache) on post-conformance baselines, and the detector default decided
+(one line in `soccernet.yaml`; the pre-conformance evidence favored snft but run 7
+suggests the conformant refinement changes the picture — decide on the A/B, not on
+history). After the first accepted configuration: pin `team_sha256` (§7 item 3),
+replace the SATRN digest prefix (§7 item 4), and tune `traj_refine` tau/edge_margin on
+`valid` if merging looks off (§7 item 7) — tau is now the pipeline's only merge
+threshold.

@@ -56,4 +56,25 @@ assert RunAudit(cfg)._check_role_team("SNGS-000", d2.dropna(subset=["track_id"])
 cfg.expected_pitch_gate = dict(enabled=False, margin_m=5.0)   # switch that ran != configured
 assert RunAudit(cfg)._check_pitch_gate("SNGS-000", det).verdict == "FAIL"
 cfg.expected_pitch_gate = dict(enabled=True, margin_m=5.0)
-print("audit: positives PASS, five negative controls FAIL")
+# role_team on the pre-refine snapshots: when traj_refine wrote them, the check
+# must audit role_team's OWN output, not the live columns traj_refine rewrote
+# on stage-3b-adopted rows (the run-7 false FAIL "team varies within N tracks").
+d3 = det.dropna(subset=["track_id"]).copy()
+d3["role_prerefine"] = d3["role"]
+d3["team_prerefine"] = d3["team"]
+d3["team_cluster_prerefine"] = d3["team_cluster"]
+counts = d3[d3["team"].isin(["left", "right"])].groupby("track_id").size()
+tids2 = counts[counts >= 2].index
+assert len(tids2), "fixture must hold a track with >= 2 team-labelled rows"
+r = d3.index[(d3["track_id"] == tids2[0]) & d3["team"].isin(["left", "right"])][0]
+d3.loc[r, "team"] = "right" if d3.loc[r, "team"] == "left" else "left"  # 3b adoption
+c_snap = RunAudit(cfg)._check_role_team("SNGS-000", d3)
+assert c_snap.observed["columns_audited"] == "prerefine snapshots"
+assert c_snap.observed["team_inconsistent_tracks"] == 0, c_snap.note
+c_live = RunAudit(cfg)._check_role_team("SNGS-000", d3.drop(
+    columns=["role_prerefine", "team_prerefine", "team_cluster_prerefine"]))
+assert c_live.verdict == "FAIL" and "team varies" in str(c_live.note)
+d3.loc[r, "team_prerefine"] = d3.loc[r, "team"]   # now role_team ITSELF is wrong
+assert "team varies" in str(RunAudit(cfg)._check_role_team("SNGS-000", d3).note)
+print("audit: positives PASS, five negative controls FAIL, role_team snapshot "
+      "preference verified (live-rewrite tolerated, genuine variance still FAILs)")

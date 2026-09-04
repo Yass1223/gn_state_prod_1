@@ -1214,13 +1214,30 @@ class RunAudit(VideoLevelModule):
         c = Check("role_team", "every tracked row has a role in {player, goalkeeper, referee}; players "
                                "and goalkeepers have team in {left, right}, referees none; role and "
                                "team constant per track; both teams present; parameters that ran "
-                               "equal the configured ones; per-clip caps respected")
+                               "equal the configured ones; per-clip caps respected; audited on the "
+                               "pre-refine role/team snapshots when traj_refine wrote them")
         for col in ("role", "team", "team_cluster"):
             if col not in tracked.columns:
                 c.observed[col] = "column missing"
                 c.set(FAIL, f"{col} column missing")
         if c.verdict == FAIL:
             return c
+        # Audit role_team's OWN output. traj_refine later rewrites team/role/
+        # team_cluster on merged clusters and on rows stage 3b moves between
+        # trajectories, so once its snapshots exist the live columns grouped by
+        # the pre-refine ids no longer equal what this stage produced (run-7
+        # false FAIL: "team varies within 8 tracks" from 3b-adopted rows).
+        # Read the snapshots instead; copy first -- the caller shares this
+        # frame with the team_embed and jersey checks.
+        snap = ("role_prerefine", "team_prerefine", "team_cluster_prerefine")
+        if all(s in tracked.columns for s in snap):
+            tracked = tracked.copy()
+            tracked["role"] = tracked["role_prerefine"]
+            tracked["team"] = tracked["team_prerefine"]
+            tracked["team_cluster"] = tracked["team_cluster_prerefine"]
+            c.observed["columns_audited"] = "prerefine snapshots"
+        else:
+            c.observed["columns_audited"] = "live (no role/team snapshots in the state)"
         role = tracked["role"]
         bad_role = int((~role.isin(["player", "goalkeeper", "referee"])).sum())
         c.observed["rows_without_valid_role"] = bad_role

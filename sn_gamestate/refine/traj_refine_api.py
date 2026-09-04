@@ -33,12 +33,17 @@ applies its output:
    and ``team_cluster`` (modal non-null value). Referee trajectories and
    unassigned rows are untouched.
 
-Snapshots for the audit: the incoming ids and jersey columns are kept in
-``track_id_prerefine``, ``jersey_number_detection_prerefine`` and
-``jersey_number_confidence_prerefine`` (the pattern ``pitch_gate`` uses with
-``track_id_pregate``), so every earlier stage can still be audited against the
-state it actually produced. With ``cfg.enabled: false`` the stage only writes
-the snapshots and its sidecar -- the attribution switch for A/B metric runs.
+Snapshots for the audit: the incoming ids, jersey columns AND the role/team
+labels are kept in ``track_id_prerefine``,
+``jersey_number_detection_prerefine``, ``jersey_number_confidence_prerefine``,
+``role_prerefine``, ``team_prerefine`` and ``team_cluster_prerefine`` (the
+pattern ``pitch_gate`` uses with ``track_id_pregate``), so every earlier stage
+can still be audited against the state it actually produced -- necessary
+because this stage rewrites team/role/number on merged clusters and on rows
+stage 3b moves between trajectories, so the live columns grouped by the
+pre-refine ids no longer equal role_team's output. With ``cfg.enabled: false``
+the stage only writes the snapshots and its sidecar -- the attribution switch
+for A/B metric runs.
 
 Stage 3 (duplicate-frame resolution) runs inside this stage after the merger:
 merging requires disjointness of CLEAN frames only (multi-player detections
@@ -95,6 +100,8 @@ class TrajRefine(VideoLevelModule):
                       "jersey_number_maxconf",
                       "jersey_number_detection_prerefine",
                       "jersey_number_confidence_prerefine",
+                      "role_prerefine", "team_prerefine",
+                      "team_cluster_prerefine",
                       "role", "team", "team_cluster"]
 
     def __init__(self, cfg, device, tracking_dataset=None, **kwargs):
@@ -218,6 +225,10 @@ class TrajRefine(VideoLevelModule):
         out["track_id_prerefine"] = out["track_id"]
         out["jersey_number_detection_prerefine"] = out["jersey_number_detection"]
         out["jersey_number_confidence_prerefine"] = out["jersey_number_confidence"]
+        out["role_prerefine"] = out["role"]
+        out["team_prerefine"] = out["team"]
+        out["team_cluster_prerefine"] = (out["team_cluster"]
+                                         if "team_cluster" in out.columns else np.nan)
         if "jersey_number_maxconf" not in out.columns:
             out["jersey_number_maxconf"] = 0.0
 
