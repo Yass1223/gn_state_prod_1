@@ -40,10 +40,16 @@ Snapshots for the audit: the incoming ids and jersey columns are kept in
 state it actually produced. With ``cfg.enabled: false`` the stage only writes
 the snapshots and its sidecar -- the attribution switch for A/B metric runs.
 
-By construction the output holds at most one detection per (``image_id``,
-``track_id``): phase compatibility requires disjointness on every occupied
-frame. The stage checks this and per-cluster label constancy on its own output
-and logs an error if either fails.
+Stage 3 (duplicate-frame resolution) runs inside this stage after the merger:
+merging requires disjointness of CLEAN frames only (multi-player detections
+are ignored until here), so multi rows can collide; 3a keeps one detection per
+(frame, trajectory) -- the clean one when present, else the multi nearest the
+clean-first centroid -- and 3b places the held rows into the nearest in-scope
+trajectory with a free frame slot, unassigning (track_id -> NaN) the rest. The
+output therefore holds at most one detection per (``image_id``, ``track_id``)
+over ALL detections; the stage checks this and per-cluster label constancy on
+its own output and logs an error if either fails. Tracked rows out = tracked
+rows in minus the unassigned count -- the ONLY way this stage drops a row.
 
 Audit sidecar: ``<audit_dir>/<sequence>.json`` with the settings and embedder
 digest that ran, input counts, the merge/conflict/rejection log of both
@@ -225,7 +231,8 @@ class TrajRefine(VideoLevelModule):
                                   tracklets=0),
                       outputs=dict(tracklets=0, merges=0, merges_2a=0,
                                    merges_2b=0, conflicts=0, rejected_2a=0,
-                                   rows_relabelled=0, frame_collisions=0))
+                                   rows_relabelled=0, rows_unassigned=0,
+                                   frame_collisions=0))
         if not self.enabled:
             log.info(f"[traj_refine] {seq}: disabled; snapshots written, "
                      f"nothing changed")
@@ -274,14 +281,17 @@ class TrajRefine(VideoLevelModule):
 
         # ----------------------------------------------------------- apply --
         n_relabel = 0
+        un_rows = work.index[new_tid < 0]
+        out.loc[un_rows, "track_id"] = np.nan          # stage-3b unassigned
         for key, res in resolved.items():
-            rows = work.index[new_tid == key]
-            merged = len(res["tids"]) > 1
-            if merged:
-                n_relabel += int((work.loc[rows, "_tid"] != key).sum())
+            rows = work.index[new_tid == key]          # incl. rows adopted in 3b
+            changed = int((work.loc[rows, "_tid"] != key).sum())
+            n_relabel += changed
+            if changed or len(res["tids"]) > 1:
                 out.loc[rows, "track_id"] = float(key)
             if not tracks[min(res["tids"])]["scope"]:
                 continue                      # out of scope: rows untouched
+            merged = len(res["tids"]) > 1 or changed > 0
             out.loc[rows, "jersey_number_detection"] = res["number"]
             out.loc[rows, "jersey_number_confidence"] = res["confidence"]
             out.loc[rows, "jersey_number_maxconf"] = res["maxconf"]
@@ -313,9 +323,11 @@ class TrajRefine(VideoLevelModule):
         if n_incoherent:
             log.error(f"[traj_refine] {seq}: {n_incoherent} cluster(s) with a "
                       f"non-constant number/team/role after propagation")
-        if int(tracked_out["track_id"].notna().sum()) != len(work):
-            log.error(f"[traj_refine] {seq}: tracked row count changed - the "
-                      f"stage must only relabel")
+        n_unassigned = int((new_tid < 0).sum())
+        if int(tracked_out["track_id"].notna().sum()) != len(work) - n_unassigned:
+            log.error(f"[traj_refine] {seq}: tracked rows out "
+                      f"({int(tracked_out['track_id'].notna().sum())}) != tracked in "
+                      f"({len(work)}) - stage-3 unassigned ({n_unassigned})")
 
         merges_2a = sum(1 for m in rep["merges"] if m["phase"] == "2a")
         merges_2b = sum(1 for m in rep["merges"] if m["phase"] == "2b")
@@ -324,6 +336,7 @@ class TrajRefine(VideoLevelModule):
                                  conflict_log=rep["conflicts"],
                                  rejected_log=rep["rejected_2a"])
         record["phase2b"] = dict(merges=merges_2b)
+        record["stage3"] = dict(rep["stage3"])
         record["merge_log"] = rep["merges"]
         record["no_centroid"] = rep["no_centroid"]
         record["out_of_scope"] = rep["out_of_scope"]
@@ -331,8 +344,8 @@ class TrajRefine(VideoLevelModule):
             tracklets=int(tracked_out["track_id"].nunique()),
             merges=len(rep["merges"]), merges_2a=merges_2a, merges_2b=merges_2b,
             conflicts=len(rep["conflicts"]), rejected_2a=len(rep["rejected_2a"]),
-            rows_relabelled=int(n_relabel), frame_collisions=coll,
-            clusters_incoherent=n_incoherent)
+            rows_relabelled=int(n_relabel), rows_unassigned=n_unassigned,
+            frame_collisions=coll, clusters_incoherent=n_incoherent)
         record["per_cluster"] = [
             dict(track_id=int(k), source_track_ids=res["tids"],
                  n_rows=int((new_tid == k).sum()), team=res["team"],
@@ -347,7 +360,9 @@ class TrajRefine(VideoLevelModule):
                  f"{len(rep['conflicts'])} number conflict(s) resolved, "
                  f"{len(rep['rejected_2a'])} 2a pair(s) rejected, "
                  f"{len(rep['no_centroid'])} without a centroid, "
-                 f"{rep['out_of_scope']} out of scope)")
+                 f"{rep['out_of_scope']} out of scope; stage 3: "
+                 f"{rep['stage3']['held']} held, {rep['stage3']['placed']} placed, "
+                 f"{rep['stage3']['unassigned']} unassigned)")
         self._write(record)
         return out
 

@@ -177,7 +177,7 @@ def audit_columns(det, img):
     checks.append(col_check("bbox_ltwh", everyrow, "bbox_detector", elem_ok=is_ltwh))
     checks.append(col_check("bbox_conf", everyrow, "bbox_detector"))
     # track_id: expected on *some* rows; FAIL only if zero tracked
-    c = Check("column:track_id", "written by track+split_merge; some detections tracked")
+    c = Check("column:track_id", "written by track+tracklet_split (refined by traj_refine); some detections tracked")
     if "track_id" not in det.columns:
         c.set(FAIL, "column missing")
     else:
@@ -194,7 +194,7 @@ def audit_columns(det, img):
     # pitch_gate: pre-gate id and off-pitch flag on every row; with the gate enabled
     # no off-pitch row may still carry a track_id
     checks.append(col_check("pitch_gate_offpitch", everyrow, "pitch_gate"))
-    c = Check("column:track_id_pregate", "written by pitch_gate; the id split_merge left, on every pre-gate tracked row")
+    c = Check("column:track_id_pregate", "written by pitch_gate; the id tracklet_split left, on every pre-gate tracked row")
     if "track_id_pregate" not in det.columns or "pitch_gate_offpitch" not in det.columns:
         c.set(FAIL, "column missing")
     else:

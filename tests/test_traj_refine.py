@@ -66,6 +66,8 @@ def run(trajs, tracks, tau=0.6, use_reenter=True, edge_margin=0.02, img_w=W):
 def check_invariants(frames_arr, new_tid):
     seen = set()
     for f, t in zip(frames_arr, new_tid):
+        if int(t) < 0:
+            continue                     # unassigned by stage 3b
         assert (int(f), int(t)) not in seen, "frame collision"
         seen.add((int(f), int(t)))
 
@@ -325,6 +327,65 @@ def test_2b_average_linkage_and_inherited_number_gates_later_merges():
     new, res, rep = run([t1, t2, t3], tracks)
     assert res[1]["tids"] == [1, 2] and 3 in res
     assert res[1]["number"] == "7" and res[3]["number"] == "9"
+
+
+# ------------------------------------------------------------------ stage 3 ----
+
+def test_stage3_clean_disjoint_multi_overlap_resolved():
+    # t1 clean frames 0-5 plus MULTI rows on frames 10,11; t2 clean 10-15.
+    # Clean frame sets are disjoint -> 2b merges them; the multi rows collide
+    # with t2's clean rows on 10 and 11 -> 3a keeps the clean ones; with no
+    # other trajectory to accept the two multis, they are unassigned.
+    t1 = rows_for(1, 0, range(0, 6)) + rows_for(1, 0, [10, 11], singles=[False, False])
+    t2 = rows_for(2, 0, range(10, 16))
+    tracks = {1: track("left", None), 2: track("left", None)}
+    new, res, rep = run([t1, t2], tracks)
+    assert set(new.tolist()) == {1, -1}
+    assert rep["merges"] and rep["merges"][0]["phase"] == "2b"
+    s3 = rep["stage3"]
+    assert s3["collided_frames"] == 2 and s3["held"] == 2
+    assert s3["placed"] == 0 and s3["unassigned"] == 2
+    check_invariants(build(t1, t2)[2], new)
+    # the kept detections in frames 10 and 11 are the clean ones
+    E, single, frames, boxes, tids = build(t1, t2)
+    for f in (10, 11):
+        kept = [i for i in range(len(frames)) if frames[i] == f and new[i] >= 0]
+        assert len(kept) == 1 and single[kept[0]]
+
+
+def test_stage3_among_multi_keeps_nearest_and_places_rest():
+    # One cluster (t1+t2 merged on clean disjointness) holds TWO multi rows in
+    # frame 20: identity-0 (near the cluster) and identity-1 (far). 3a keeps
+    # the near one. The far one is placed by 3b into t3 (identity 1, frame 20
+    # free, in scope).
+    t1 = rows_for(1, 0, range(0, 6)) + [
+        (unit(0), False, 20, [900.0, 400.0, 40.0, 80.0], 1),
+        (unit(1), False, 20, [900.0, 400.0, 40.0, 80.0], 1)]
+    t2 = rows_for(2, 0, range(10, 16))
+    t3 = rows_for(3, 1, range(30, 36))
+    tracks = {1: track("left", None), 2: track("left", None),
+              3: track("right", None)}
+    new, res, rep = run([t1, t2, t3], tracks)
+    s3 = rep["stage3"]
+    assert s3["collided_frames"] == 1 and s3["held"] == 1
+    assert s3["placed"] == 1 and s3["unassigned"] == 0
+    E, single, frames, boxes, tids = build(t1, t2, t3)
+    kept = [i for i in range(len(frames)) if frames[i] == 20 and new[i] == 1]
+    moved = [i for i in range(len(frames)) if frames[i] == 20 and new[i] == 3]
+    assert len(kept) == 1 and E[kept[0]][0] == 1.0     # identity-0 stays
+    assert len(moved) == 1 and E[moved[0]][1] == 1.0   # identity-1 -> t3
+    check_invariants(frames, new)
+
+
+def test_stage3_no_op_without_collisions():
+    t1 = rows_for(1, 0, range(0, 6))
+    t2 = rows_for(2, 0, range(10, 16))
+    tracks = {1: track("left", "7", cand(("7", .9, 5))),
+              2: track("left", "7", cand(("7", .8, 4)))}
+    new, res, rep = run([t1, t2], tracks)
+    s3 = rep["stage3"]
+    assert s3 == dict(collided_frames=0, held=0, clean_anomaly=0, placed=0,
+                      unassigned=0, unassigned_rows=[])
 
 
 # ------------------------------------------------------------- scope/centroid --

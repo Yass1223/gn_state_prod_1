@@ -1,5 +1,5 @@
 # Label-aware trajectory refinement, run between `jersey_number_detect` and
-# `tracklet_agg`: it consumes evidence that does not exist at split_merge's
+# `tracklet_agg`: it consumes evidence that does not exist at tracklet_split's
 # position in the pipeline -- the team side (role_team), the jersey number with
 # its pooled maxconf candidate statistics (jn_gsr_api), and exit/entry geometry.
 #
@@ -10,7 +10,7 @@
 # pair claiming one number at the SAME time is a conflict, resolved by
 # reassigning the lower-maxconf side to its best remaining jersey candidate
 # (or leaving it unnumbered). Phase 2b then merges agglomeratively (average
-# linkage, split_merge's distance convention) under time-disjointness,
+# linkage, the splitter's distance convention) under time-disjointness,
 # re-enter consistency and vacuous-when-unknown label agreement: teams must
 # agree when both are known, numbers must agree when both are known -- so a
 # fragment with only a team, only a number, or neither can still attach.
@@ -26,13 +26,13 @@
 #
 # Appearance: the tracker's OSNet-AIN, built from the shared module
 # sn_gamestate/reid/osnet_ain.py with the SAME checkpoint pin as
-# modules/track/botsort_ain.yaml and modules/split_merge/split_merge.yaml, so
-# tau keeps the cosine-distance scale split_merge's tau was tuned on. The run
-# audit fails the run on any pin mismatch against split_merge.
+# modules/track/botsort_ain.yaml and modules/tracklet_split/tracklet_split.yaml, so
+# tau keeps the cosine-distance scale that operating point was tuned on. The run
+# audit fails the run on any pin mismatch against tracklet_split.
 _target_: sn_gamestate.refine.traj_refine_api.TrajRefine
 cfg:
   # OSNet-AIN checkpoint -- SAME coordinates and digest as modules/track/botsort_ain.yaml
-  # and modules/split_merge/split_merge.yaml.
+  # and modules/tracklet_split/tracklet_split.yaml.
   ain_repo: Ynniss/osnet_ain
   ain_file: best_ain_full.zip
   ain_revision: d78f65ded828f0cbd8dff2a06dcbff4fc6835dfe
@@ -46,9 +46,10 @@ cfg:
   enabled: true
 
   # Merge acceptance threshold on the appearance distance (1 - dot of mean unit
-  # vectors over clean detections), both phases. Same convention and value as
-  # split_merge's tau (0.60, its notebook-validated operating point); NOT
-  # re-tuned for this stage on any validation split yet.
+  # vectors over clean detections), both phases. The pipeline's ONLY merge
+  # threshold (the splitter never merges). 0.60 is inherited from the retired
+  # split_merge stage's notebook-validated operating point; NOT re-tuned for
+  # this stage on any validation split yet.
   tau: 0.60
 
   # Re-enter condition (C3): when one trajectory ends before the other begins

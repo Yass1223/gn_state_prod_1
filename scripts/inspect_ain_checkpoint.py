@@ -1,6 +1,6 @@
 """Report what the OSNet-AIN checkpoint contains and which factory can build it.
 
-Answers the two questions the tracker and split_merge stages depend on:
+Answers the two questions the tracker and tracklet_split stages depend on:
 
   1. What is in the checkpoint — backbone name, input size, embedding width, number of
      training identities, number of role classes, tensor count.

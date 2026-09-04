@@ -4,8 +4,8 @@ A single, rigorously-scoped GSR pipeline. One entry config, one path, no alterna
 backends: every file in this repository belongs to the active pipeline.
 
 ```
-bbox_detector -> track -> crop_filter -> split_merge -> calibration -> pitch_gate -> team_embed
-              -> role_team -> jersey_number_detect -> tracklet_agg -> audit
+bbox_detector -> track -> crop_filter -> tracklet_split -> calibration -> pitch_gate -> team_embed
+              -> role_team -> jersey_number_detect -> traj_refine -> tracklet_agg -> audit
 ```
 
 | Stage | Implementation | Notes |
@@ -13,12 +13,13 @@ bbox_detector -> track -> crop_filter -> split_merge -> calibration -> pitch_gat
 | `bbox_detector` | YOLO11-L SoccerNet fine-tune | imgsz 1280, conf floor 0.1 (`>=`), RGB→BGR fix |
 | `track` | BoT-SORT · SOF + OSNet-AIN (boxmot) | calls boxmot's `BotSort` directly with injected embeddings and external SOF camera motion; per-frame diagnostics sidecar for the audit |
 | `crop_filter` | single / multi label per detection, tracked-only rule | rT ≤ 0.25, rB < 0.40; only boxes carrying a `track_id` may make another box multi; every detection gets `crop_single`/`crop_rT`/`crop_rB`/`crop_trigger`; no detection is removed |
-| `split_merge` | DBSCAN tracklet splitting + agglomerative fragment merging on appearance | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); clusters and merges on `crop_single` detections only; `eps 0.2, min_samples 5, tau 0.60`; one detection per trajectory and frame; a detection that cannot be placed gets `track_id` NaN; per-sequence sidecar for the audit |
+| `tracklet_split` | DBSCAN tracklet splitting (SPLIT ONLY) | same OSNet-AIN as the tracker (shared module, same checkpoint pin and precision, audit-enforced); per tracklet, DBSCAN over ALL detections; noise attaches to the nearest clean-only centroid; all-multi fragments dissolve into the nearest remaining fragment; `eps 0.2, min_samples 5`, deliberately NO merge threshold (the pipeline's one merge is `traj_refine`); every tracked detection stays assigned; the incoming id is kept in `track_id_presplit`; per-sequence sidecar for the audit |
 | `calibration` | **BroadTrack** (EVS, WACV'25) | temporal camera tracking + image-to-pitch; replaces pitch localization, camera calibration and projection in one stage |
 | `pitch_gate` | off-pitch tracklet gate on the mean projected position | per final `track_id`, the mean of `bbox_pitch` (bottom-middle) over the rows with a finite projection; off-pitch iff `abs(mean_x) > 52.5 + margin_m` or `abs(mean_y) > 34 + margin_m`; the rows of an off-pitch tracklet lose their `track_id` (NaN, so no later stage and no export sees them), the original id stays in `track_id_pregate`; `enabled` switch (off = columns and sidecar still written, `track_id` untouched); `margin_m 3.5` untuned; a tracklet without a projection is kept; no detection is removed; per-sequence sidecar for the audit |
 | `team_embed` | `osnet_team` (OSNet x1.0, 128×64, 256-d) on ≤ 16 crops per tracklet | the appearance model of the role/team notebook; fp32 + flip TTA; sampled on the stride-5 frame grid; single and multi crops embedded, the filter is applied afterwards |
 | `role_team` | notebook rule chain (`sn_gamestate/team/rules.py`) | per tracklet: role (player / goalkeeper / referee), team cluster, left/right side; k-means on the single-crop descriptors, position rules on `bbox_pitch`, appearance-outlier channels, keeper-cue naming; frozen parameters from the notebook's tuning split; per-sequence sidecar for the audit |
 | `jersey_number_detect` | **jn_pipeline_gsr** | tracklet-level, single crops only (`crop_single`): legibility → DBNet++ ROI → PARSeq + SATRN on the same crops → vote_pool (pooled per-frame majority vote); multi-GPU workers |
+| `traj_refine` | label-aware trajectory refinement (the pipeline's ONE merge) | same OSNet-AIN pin as `tracklet_split` (audit-enforced); phase 2a merges same-team same-number fragments (clean frame sets disjoint, re-enter consistent, distance ≤ `tau 0.60`) and resolves same-time number conflicts; phase 2b merges agglomeratively under clean-frame disjointness, re-enter consistency and vacuous-when-unknown label agreement; stage 3 then enforces one detection per (frame, trajectory): clean wins, held multi crops are placed into the nearest in-scope trajectory with a free slot or unassigned (`track_id` NaN); snapshots in `track_id_prerefine` + jersey columns; per-sequence sidecar for the audit |
 | `tracklet_agg` | majority vote | `[jersey_number]` (role is per-tracklet from `role_team`) |
 | `audit` | per-component verdicts | read-only last stage: PASS/WARN/FAIL per component per sequence → `audit/<seq>.json`; `scripts/verify_run_integrity.py` refuses the run on any FAIL |
 
@@ -27,32 +28,35 @@ no number) and, with `single_crops_only: true` (the default), hands the recognis
 single crops of a tracklet (`crop_single`); overlapping crops are excluded and a tracklet with
 no single crop stays unnumbered. Team plays no part in it.
 The role/team stage ignores multi crops, as the notebook did. There is no `reid` (prtreid)
-stage: role and team come from `team_embed` + `role_team`, and the tracker and `split_merge`
-use OSNet-AIN. `interpolation` is kept as a module for tracking-only experiments but is not
+stage: role and team come from `team_embed` + `role_team`, and the tracker, `tracklet_split`
+and `traj_refine` use OSNet-AIN. `interpolation` is kept as a module for tracking-only experiments but is not
 in the pipeline (synthesized rows would carry neither crop labels nor team embeddings).
 
-### The `split_merge` stage
+### The `tracklet_split` stage
 
-Port of the production part of `splitter-plus-merger-final.ipynb`
-(`sn_gamestate/track/split_merge.py`, algorithm; `split_merge_api.py`, stage). Per
-tracklet, DBSCAN (`eps 0.2`, `min_samples 5`, precomputed cosine distance) on the clean
+Stage 1 of the refinement method and split only
+(`sn_gamestate/track/tracklet_split.py`, algorithm; `tracklet_split_api.py`, stage). Per
+tracklet, DBSCAN (`eps 0.2`, `min_samples 5`, precomputed cosine distance) over ALL its
 detections breaks a tracklet holding more than one identity into fragments; noise points
-and overlapping detections are attached to the nearest cluster centroid. Per video,
-fragments holding at least one clean detection are merged agglomeratively on appearance
-(1 minus the dot product of the mean unit vectors over clean rows) while their clean frame
-sets are disjoint and the distance is at most `tau 0.60`. Pass 1 keeps one detection per
-trajectory and frame (clean wins, else nearest to the trajectory mean); pass 2 places the
-set-aside detections and the detections of clean-less fragments into the nearest trajectory
-with a free frame slot; the rest get `track_id` NaN. No spatial or motion constraint.
+-- single or multi crop -- attach to the fragment with the nearest clean-only centroid;
+fragments holding only multi-player detections are dissolved, detection by detection,
+into the nearest remaining fragment. Fragments become the new trajectories; every tracked
+detection stays assigned and the incoming id is kept per row in `track_id_presplit`.
+There is deliberately no merging and no merge threshold in this stage: the pipeline's one
+merge is `traj_refine`, which runs after `role_team` and `jersey_number_detect` so every
+merge decision can use team and jersey-number evidence, and the run audit FAILS the run
+if merging evidence appears in the splitter's config or sidecar.
 
-The parameters are the notebook's final configuration, tuned on the embeddings held in the
-notebook's Kaggle export. Whether that export was produced by the checkpoint pinned in
-`modules/split_merge/split_merge.yaml` (`Ynniss/osnet_ain/best_ain_full.zip`) cannot be
-verified from this repository; if it was not, `eps` and `tau` do not transfer and must be
-re-tuned. The stage writes `audit/split_merge/<seq>.json` (settings, embedder digest,
-split/merge/pass counts, per-trajectory breakdown); the audit stage checks it against the
-config and against the detections (one detection per frame per trajectory, a clean
-detection in every trajectory, unassigned share).
+`eps` and `min_samples` are the notebook splitter's operating point (the retired
+split_merge stage ran the same split with these values), tuned on the embeddings held in
+the notebook's Kaggle export. Whether that export was produced by the checkpoint pinned in
+`modules/tracklet_split/tracklet_split.yaml` (`Ynniss/osnet_ain/best_ain_full.zip`) cannot
+be verified from this repository; if it was not, `eps` (and `traj_refine`'s `tau`, which
+lives on the same cosine-distance scale) do not transfer and must be re-tuned. The stage
+writes `audit/tracklet_split/<seq>.json` (settings, embedder digest, per-tracklet split
+report, output counts); the audit stage checks it against the config and against the
+detections (every tracked row assigned, one detection per frame per fragment, every
+fragment from exactly one source tracklet via `track_id_presplit`).
 
 There is **no `pitch` stage**: BroadTrack runs its own keypoint (NBJW) and line (TVCalib)
 detectors internally and emits camera parameters directly.
@@ -72,7 +76,7 @@ With `enabled: true` the rows of an off-pitch tracklet get `track_id` NaN: the e
 export drops them and `team_embed`, `role_team`, the jersey stage, `tracklet_agg` and the
 radar never see them, so the role rules run their k-means and outlier statistics on
 on-pitch tracklets only. With `enabled: false` `track_id` is untouched. Either way the stage
-writes `track_id_pregate` (the id `split_merge` left), `pitch_gate_offpitch` (the rule's
+writes `track_id_pregate` (the id `tracklet_split` left), `pitch_gate_offpitch` (the rule's
 outcome), `pitch_mean_x` / `pitch_mean_y` and a sidecar `audit/pitch_gate/<seq>.json`; no
 detection row is deleted and a tracklet without any projection is kept.
 
@@ -117,7 +121,7 @@ JN_SRC=/path/to/jn_pipeline_gsr bash scripts/setup_jn_gsr.sh   # python 3.10 ven
 ```
 
 Everything else downloads at runtime: the detector from Hugging Face (`${hf:...}`
-resolver), the tracker/split_merge OSNet-AIN checkpoint from Hugging Face with an enforced
+resolver), the tracker/tracklet_split/traj_refine OSNet-AIN checkpoint from Hugging Face with an enforced
 sha256 pin (`sn_gamestate/reid/osnet_ain.py`; export `HF_TOKEN` if a repo is private),
 and the team-appearance checkpoint `Ynniss/osnet_team/osnet_team_best.pt`
 (`sn_gamestate/reid/osnet_team.py`; `team_sha256` in `modules/team_embed/osnet_team.yaml`
@@ -178,12 +182,12 @@ bash scripts/lightning_eval.sh             # end-to-end runner (download + setup
 ```
 
 Numerical precision: fp16, baked in (no switch). The detector runs ultralytics `half`,
-and the OSNet-AIN embedder in `track` + `split_merge` runs under torch autocast on CUDA with
+and the OSNet-AIN embedder in `track` + `tracklet_split` + `traj_refine` runs under torch autocast on CUDA with
 fp32 outputs; the `team_embed` stage runs fp32 with flip TTA, as the notebook it reproduces. Validated against fp32 on the Kaggle
 5-sequence test run: tracking HOTA 71.61 (fp16) vs 71.08 (fp32), GS-HOTA 64.98 vs
 64.70, calibration bit-identical - deltas inside the observed run-to-run noise (measured
-with the former GTA-Link stage in the `split_merge` slot). The audit fails any run in
-which `track` and `split_merge` pin different checkpoints.
+with the former GTA-Link stage in the tracklet-refinement slot). The audit fails any run in
+which `track`, `tracklet_split` and `traj_refine` pin different checkpoints.
 
 GPU use: the jersey stage auto-detects GPUs via `nvidia-smi` and shards tracklets across
 all of them (2 workers on Kaggle 2×T4, 4 on Lightning 4×T4, 1 otherwise). BroadTrack and
@@ -202,8 +206,10 @@ The jersey consolidation rule is fixed to `vote_pool` (see
 | detector + tracker conf floor | `0.1` / `0.1` | lowering **both** to `0.05` is the only way to make BoT-SORT's BYTE low band non-empty; an A/B, not a code change | `bbox_detector` `min_confidence` + `track_low_thresh` |
 
 The GTA-Link tuning tool (`scripts/tune_gta_kaggle.py`) was removed with the GTA-Link
-stage. `split_merge` has three parameters (`eps`, `min_samples`, `tau` in
-`configs/modules/split_merge/split_merge.yaml`); re-tuning them means re-running the
+stage. `tracklet_split` has two parameters (`eps`, `min_samples` in
+`configs/modules/tracklet_split/tracklet_split.yaml`) and `traj_refine` carries the
+pipeline's only merge threshold (`tau` in `configs/modules/traj_refine/traj_refine.yaml`);
+re-tuning them means re-running the
 notebook's sweep on embeddings produced by the pinned checkpoint, on the **valid** split.
 `test` is reserved for the frozen production run.
 
@@ -219,13 +225,14 @@ was observed, and a verdict. Neither BroadTrack nor the jersey stage aborts on f
 so without this a run can finish with empty pitch coordinates or empty jersey numbers and
 still print plausible metrics. The crop filter, team-embedding and role/team stages are
 checked against what their configs declare: labels must agree with the stored overlap
-ratios at the configured thresholds, the `split_merge` sidecar must record the configured
-`eps`/`min_samples`/`tau` and checkpoint digest, its split/merge/pass counts must be
-consistent with each other and with the final `track_id`s (one detection per frame per
-trajectory, a clean detection in every trajectory), the `pitch_gate` sidecar must record
+ratios at the configured thresholds, the `tracklet_split` sidecar must record the configured
+`eps`/`min_samples` and checkpoint digest with NO merge threshold anywhere, its per-tracklet
+split counts must be
+consistent with each other and with the final `track_id`s (every tracked row assigned, one
+detection per frame per fragment, every fragment from one source tracklet), the `pitch_gate` sidecar must record
 the configured switch and margin, its mean positions and off-pitch flags must equal the
 ones recomputed from `bbox_pitch`, and `track_id` must have been cleared on off-pitch
-tracklets if and only if the gate is enabled (the split_merge, crop_filter and calibration
+tracklets if and only if the gate is enabled (the tracklet_split, crop_filter and calibration
 checks compare against the pre-gate ids in `track_id_pregate`), every tracklet must carry a team embedding, the
 checkpoint digest and the rule parameters that ran (per-sequence sidecars under
 `audit/team_embed/`, `audit/role_team/`) must equal the configured ones, every tracked
@@ -277,7 +284,7 @@ python scripts/reference_metrics.py \
 | `calibration` | JaC5, JaC10, MRE, MedRE, CR | official sn-calibration protocol at 960×540, mirror-aware |
 
 Pass several `--state/--label` pairs to get a comparison table (`summary.md`) — that is how
-per-stage contributions (e.g. with/without `split_merge`) are attributed.
+per-stage contributions (e.g. `traj_refine` enabled vs disabled) are attributed.
 
 ## Layout
 
@@ -285,8 +292,9 @@ per-stage contributions (e.g. with/without `split_merge`) are attributed.
 sn_gamestate/
   bbox_detector/yolo_snft_api.py
   crop_filter/crop_filter_api.py         # single/multi label, tracked-only rule
-  reid/osnet_ain.py, osnet_team.py       # tracker/split_merge embedder; team-appearance model
-  track/bot_sort.py, split_merge.py, split_merge_api.py, hf_resolver.py
+  reid/osnet_ain.py, osnet_team.py       # tracker/tracklet_split/traj_refine embedder; team-appearance model
+  track/bot_sort.py, tracklet_split.py, tracklet_split_api.py, hf_resolver.py
+  refine/traj_refine.py, traj_refine_api.py  # the pipeline's one merge + stage-3 resolution
   calibration/broadtrack_api.py          # calibration + image-to-pitch
   pitch_gate/pitch_gate_api.py           # off-pitch tracklet gate (mean bbox_pitch, on/off switch)
   team/rules.py, team_embed_api.py, role_team_api.py   # notebook rules; the two stages

@@ -6,21 +6,22 @@
 # those files and exits non-zero on any FAIL, so metrics from a run in which a
 # stage silently produced nothing cannot be reported.
 #
-# Components checked: bbox_detector, track+split_merge, track internals (BoT-SORT
+# Components checked: bbox_detector, track+tracklet_split, track internals (BoT-SORT
 # sidecar: frame coverage, camera-motion identity rate, clipped crops, zero
-# embeddings, ran-vs-declared settings/checkpoint, and track==split_merge checkpoint
-# pin equality), split_merge (sidecar: settings and embedder digest that ran vs
-# configured, inputs it received - clean/overlapping labels, zero embeddings -,
-# split/merge/pass counts consistent with each other and with the detections,
-# output invariants: one detection per frame per trajectory, a clean detection in
-# every trajectory, unassigned share), crop_filter (labels on every detection,
+# embeddings, ran-vs-declared settings/checkpoint, and track==tracklet_split checkpoint
+# pin equality), tracklet_split (sidecar: settings and embedder digest that ran vs
+# configured, NO merge threshold anywhere, inputs it received - clean/overlapping
+# labels, zero embeddings -, per-tracklet split counts consistent with each other
+# and with the detections, output invariants: every tracked row stays assigned,
+# one detection per frame per fragment, every fragment from exactly one source
+# tracklet), crop_filter (labels on every detection,
 # labels consistent with the stored ratios at the configured thresholds, every
-# multi label has a trigger box, vetoes by boxes split_merge later left
+# multi label has a trigger box, vetoes by boxes later left
 # unassigned), calibration (bbox_pitch + camera
 # JSON), pitch_gate (columns on every row, sidecar: switch and margin that ran vs
 # configured, mean position and off-pitch rule recomputed from bbox_pitch vs the
 # stored columns, track_id cleared on off-pitch tracklets iff the gate is enabled,
-# counts vs sidecar; the split_merge / crop_filter / calibration checks use the
+# counts vs sidecar; the tracklet_split / crop_filter / calibration checks use the
 # pre-gate ids in track_id_pregate), team_embed (embedding on every tracklet, sidecar: checkpoint digest that
 # ran vs configured, empty/zero embeddings, off-grid tracklets), role_team (valid
 # role on every tracked row, team on every player/keeper, none on referees,
@@ -30,7 +31,8 @@
 # every eligible tracklet answered, detection columns consistent with the blob,
 # provisioning provenance of SATRN and PARSeq), traj_refine (snapshots present,
 # sidecar: settings and embedder digest that ran vs configured and vs
-# split_merge's pin, rows only relabelled, tracklets_out == tracklets_in -
+# tracklet_split's pin, row accounting out == in - stage-3b unassigned,
+# tracklets_out == tracklets_in -
 # merges, merge distances <= tau, no frame collision, number/team/role constant
 # per refined track, disabled => untouched; the team_embed / role_team / jersey
 # checks use the pre-refine ids in track_id_prerefine and the jersey snapshot
@@ -60,28 +62,29 @@ cfg:
   # Tracker diagnostics sidecars written by the track stage (must equal the track
   # module's audit_dir), and the declared tracker/embedder configuration to hold the
   # run against. Everything below resolves through OmegaConf interpolation from the
-  # track and split_merge module configs, so the audit compares what RAN (the
+  # track and tracklet_split module configs, so the audit compares what RAN (the
   # sidecar) against what the composed config DECLARES, and fails on any
   # disagreement — including the two stages pinning different weights.
   track_sidecar_dir: ${modules.track.cfg.audit_dir}
   expected_tracker:
     ain_sha256_track: ${modules.track.cfg.ain_sha256}
-    ain_sha256_split_merge: ${modules.split_merge.cfg.ain_sha256}
+    ain_sha256_tracklet_split: ${modules.tracklet_split.cfg.ain_sha256}
     ain_file_track: ${modules.track.cfg.ain_file}
-    ain_file_split_merge: ${modules.split_merge.cfg.ain_file}
+    ain_file_tracklet_split: ${modules.tracklet_split.cfg.ain_file}
     ain_revision_track: ${modules.track.cfg.ain_revision}
-    ain_revision_split_merge: ${modules.split_merge.cfg.ain_revision}
+    ain_revision_tracklet_split: ${modules.tracklet_split.cfg.ain_revision}
     appearance_thresh: ${modules.track.cfg.hyperparams.appearance_thresh}
     sof_scale: ${modules.track.cfg.sof_scale}
 
-  # Split/merge stage: sidecar location (must equal the module's audit_dir) and
-  # the settings and checkpoint it must have run with.
-  split_merge_sidecar_dir: ${modules.split_merge.cfg.audit_dir}
-  expected_split_merge:
-    eps: ${modules.split_merge.cfg.eps}
-    min_samples: ${modules.split_merge.cfg.min_samples}
-    tau: ${modules.split_merge.cfg.tau}
-    ain_sha256: ${modules.split_merge.cfg.ain_sha256}
+  # Splitter stage: sidecar location (must equal the module's audit_dir) and
+  # the settings and checkpoint it must have run with. Deliberately NO tau:
+  # the splitter must not merge (the pipeline's one merge is traj_refine) and
+  # the audit FAILS if a merge threshold appears here or in the sidecar.
+  tracklet_split_sidecar_dir: ${modules.tracklet_split.cfg.audit_dir}
+  expected_tracklet_split:
+    eps: ${modules.tracklet_split.cfg.eps}
+    min_samples: ${modules.tracklet_split.cfg.min_samples}
+    ain_sha256: ${modules.tracklet_split.cfg.ain_sha256}
 
   # Crop filter, team-embedding and role/team stages: sidecar locations (must equal
   # those modules' audit_dir) and the configuration they must have run with.
@@ -107,7 +110,7 @@ cfg:
 
   # Trajectory-refinement stage: sidecar location (must equal the module's
   # audit_dir) and the settings / checkpoint it must have run with. The stage's
-  # embedder pin must ALSO equal split_merge's: tau is on split_merge's
+  # embedder pin must ALSO equal tracklet_split's: tau lives on this embedder's
   # cosine-distance scale, so different weights would silently change what the
   # threshold means.
   traj_refine_sidecar_dir: ${modules.traj_refine.cfg.audit_dir}
@@ -118,7 +121,7 @@ cfg:
     edge_margin: ${modules.traj_refine.cfg.edge_margin}
     roles: ${modules.traj_refine.cfg.roles}
     ain_sha256: ${modules.traj_refine.cfg.ain_sha256}
-    ain_sha256_split_merge: ${modules.split_merge.cfg.ain_sha256}
+    ain_sha256_tracklet_split: ${modules.tracklet_split.cfg.ain_sha256}
 
   # WARN thresholds (shares in [0,1]); FAIL conditions are structural (absent, empty,
   # inconsistent) and not tunable. Raw counts are always in the JSON.
@@ -134,8 +137,7 @@ cfg:
     cmc_identity_warn: 0.02            # frames falling back to an identity warp (ref notebook)
     crop_clipped_warn: 0.001           # high-conf crops clipping to nothing (ref notebook)
     zero_emb_warn: 0.01                # high-conf detections with an all-zero embedding
-    split_merge_unassigned_warn: 0.05  # tracked detections split_merge could not place (track_id -> NaN)
-    split_merge_zero_emb_warn: 0.01    # tracked detections with an all-zero split_merge embedding
+    tracklet_split_zero_emb_warn: 0.01 # tracked detections with an all-zero splitter embedding
     pitch_gate_gated_warn: 0.50        # tracklets off-pitch at the configured margin, above this = WARN (calibration suspect)
     pitch_gate_no_position_warn: 0.05  # tracklets with no finite bbox_pitch (kept, could not be gated)
     calib_lost_frames_warn: 0.10       # camera-JSON frames below min_score (tracking lost -> last camera reused)

@@ -1,0 +1,42 @@
+# Tracklet SPLITTING, run as its own pipeline stage right after `track` and
+# `crop_filter`; it writes the track_id every later stage groups by.
+#
+# This stage is Stage 1 of the refinement method and SPLIT ONLY. The pipeline's
+# one and only merge is the label-aware `traj_refine` stage (which runs after
+# role_team and jersey_number_detect, so every merge decision can use team and
+# jersey-number evidence). There is deliberately NO merge threshold here; the
+# run audit FAILS the run if one appears.
+#
+# Method (sn_gamestate/track/tracklet_split.py): per tracklet, DBSCAN over the
+# cosine distances of ALL its detections (clean and multi-player); noise points
+# -- single or multi crop -- attach to the nearest fragment centroid; fragments
+# holding only multi-player detections are dissolved, detection by detection,
+# into the nearest remaining fragment; centroids are computed from clean
+# detections only. Fragments become the new trajectories; the incoming id is
+# kept per row in `track_id_presplit`.
+#
+# eps / min_samples are the notebook splitter's operating point (the retired
+# split_merge stage ran the same split with these values).
+#
+# Appearance: the tracker's OSNet-AIN, built from the shared module
+# sn_gamestate/reid/osnet_ain.py with the SAME checkpoint pin as
+# modules/track/botsort_ain.yaml, fp16 autocast on CUDA with fp32 outputs. The
+# run audit fails the run on any pin mismatch between the two configs, and on a
+# pin mismatch with traj_refine (tau lives on this embedder's distance scale).
+_target_: sn_gamestate.track.tracklet_split_api.TrackletSplit
+cfg:
+  # OSNet-AIN checkpoint — SAME coordinates and digest as modules/track/botsort_ain.yaml.
+  ain_repo: Ynniss/osnet_ain
+  ain_file: best_ain_full.zip
+  ain_revision: d78f65ded828f0cbd8dff2a06dcbff4fc6835dfe
+  ain_sha256: a0a7e42676edad0cbc3a4ba0f7d0f8ded75612443ef7a9eabb57cb9e5e245293
+  # As in the track config: set this to read the checkpoint from disk instead of the
+  # Hub. Keep it in step with the tracker's value, or the two stages embed the same
+  # crop with two different models.
+  ain_local_path: null
+  eps: 0.2            # DBSCAN eps on cosine distance, per tracklet, over ALL detections
+  min_samples: 5      # DBSCAN min_samples; a smaller tracklet is one fragment
+  batch_size: 64      # crops per appearance forward pass
+  # Per-sequence sidecar (settings, embedder digest, per-tracklet split report,
+  # output counts) read by the `audit` stage.
+  audit_dir: ${project_dir}/audit/tracklet_split

@@ -9,7 +9,7 @@
 #                   for cache notes)
 #   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
 #   crop_filter    single/multi label, tracked-only rule      -> crop_single, crop_rT, crop_rB, crop_trigger
-#   split_merge    DBSCAN tracklet split + appearance merge   -> track_id (final)
+#   tracklet_split DBSCAN tracklet split (SPLIT ONLY)         -> track_id, track_id_presplit
 #                  (same OSNet-AIN as the tracker; reads crop_single)
 #   calibration    BroadTrack (EVS, WACV'25) + image-to-pitch -> parameters, bbox_pitch
 #   pitch_gate     off-pitch tracklets (mean bbox_pitch outside  -> track_id NaN on their rows,
@@ -21,7 +21,8 @@
 #   traj_refine    label-aware trajectory refinement: same-team same-number
 #                  merges + number-conflict resolution (phase 2a), then
 #                  agglomerative merging under time/re-enter/label conditions
-#                  (phase 2b); same OSNet-AIN as track / split_merge
+#                  (phase 2b); the pipeline's ONE merge; same OSNet-AIN as track /
+#                  tracklet_split; duplicate-frame resolution (stage 3) after it
 #                  -> track_id (refined), track_id_prerefine + jersey snapshots
 #   tracklet_agg   majority vote over [jersey_number]
 #   audit          per-component PASS/WARN/FAIL verdicts -> audit/<seq>.json (read-only)
@@ -30,7 +31,7 @@
 # detectors internally and emits camera parameters directly.
 # There is NO `reid` (prtreid) stage any more: role and team come from `role_team`,
 # which reads the team_embed descriptors and bbox_pitch; the tracker and the
-# split_merge stage use OSNet-AIN. `interpolation` is kept as a module but is NOT in
+# tracklet_split stage use OSNet-AIN. `interpolation` is kept as a module but is NOT in
 # the pipeline: it synthesizes rows that carry neither crop labels nor team embeddings.
 #
 # First-time provisioning (both are Docker-free, Kaggle/Lightning friendly):
@@ -56,7 +57,7 @@ defaults:
   - modules/bbox_detector: yolo_ultralytics_snft_hm
   - modules/track: botsort_ain
   - modules/crop_filter: overlap_tracked
-  - modules/split_merge: split_merge
+  - modules/tracklet_split: tracklet_split
   - modules/interpolation: dti
   - modules/calibration: broadtrack
   - modules/pitch_gate: pitch_gate
@@ -70,8 +71,8 @@ defaults:
 
 # Pipeline definition. Order is load-bearing:
 #   * crop_filter right after track: the tracked-only rule needs track_id, and every
-#     later stage reads the same crop_single label; split_merge reads it too;
-#   * split_merge BEFORE everything that depends on final track ids (team_embed,
+#     later stage reads the same crop_single label; tracklet_split reads it too;
+#   * tracklet_split BEFORE everything that depends on final track ids (team_embed,
 #     role_team and jersey recognition are tracklet-level; tracklet_agg votes per track_id);
 #   * calibration before role_team (it consumes bbox_pitch);
 #   * pitch_gate right after calibration (it needs bbox_pitch) and before team_embed:
@@ -83,7 +84,7 @@ pipeline:
   - bbox_detector
   - track
   - crop_filter
-  - split_merge
+  - tracklet_split
   - calibration
   - pitch_gate
   - team_embed
@@ -107,7 +108,7 @@ use_tensorrt: false
 trt_dir: "${model_dir}/trt"
 
 # Numerical precision: the YOLO11 detector (ultralytics half) and the OSNet-AIN
-# embedder in `track` + `split_merge` (torch autocast on CUDA, fp32 outputs) run fp16,
+# embedder in `track` + `tracklet_split` (torch autocast on CUDA, fp32 outputs) run fp16,
 # baked in after the Kaggle fp16/fp32 validation (tracking HOTA 71.61 vs 71.08,
 # GS-HOTA 64.98 vs 64.70, calibration bit-identical; deltas inside run-to-run noise).
 # The team_embed stage runs fp32 with flip TTA, exactly as the notebook it

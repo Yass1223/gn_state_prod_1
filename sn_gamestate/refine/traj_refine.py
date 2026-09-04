@@ -41,10 +41,11 @@ order of the pair's JOINT pooled maxconf -- the maxconf the merged cluster
 would carry, recomputed from the pooled (clean-detection) statistics as if
 merged: ``exp(max(mx_F, mx_G)) * (conf_sum_F + conf_sum_G)``:
 
-  * frame sets disjoint AND re-enter consistent AND distance <= tau -> merge;
-  * frame sets disjoint but re-enter or tau fails -> the pair is set aside
-    (re-examined if either side later changes through a merge);
-  * frame sets overlap -> two trajectories claiming one shirt at the same
+  * CLEAN frame sets disjoint AND re-enter consistent AND distance <= tau ->
+    merge;
+  * clean frame sets disjoint but re-enter or tau fails -> the pair is set
+    aside (re-examined if either side later changes through a merge);
+  * clean frame sets overlap -> two trajectories claiming one shirt at the same
     time: the one with the LOWER maxconf for that number is reassigned to its
     best-ranked candidate not yet lost in a conflict (labels it lost on are
     banned, so a cascade of conflicts walks strictly down its candidate list);
@@ -58,7 +59,9 @@ Phase 2b -- distance-based agglomerative merging (average linkage, as in
 split_merge: group distance = 1 minus the dot product of the two mean unit
 vectors over clean detections).  Compatible(F, G) holds iff ALL of:
 
-    C2  time overlap: the frame sets are disjoint (every occupied frame);
+    C2  time overlap: the CLEAN frame sets are disjoint (multi-player
+        detections are ignored until Stage 3, so they take no part in this
+        test; collisions among them are expected and resolved there);
     C3  re-enter: when one cluster ends before the other begins and BOTH the
         earlier cluster's last box and the later cluster's first box touch a
         lateral image edge (within ``edge_margin`` * width), the two sides
@@ -82,8 +85,26 @@ Determinism: every choice breaks ties on explicit keys ending in the cluster
 key (the smallest source trajectory id), so the output is a function of the
 inputs alone.
 
-By construction the output holds at most one detection per (frame, cluster):
-C2 is evaluated on every occupied frame, so no merge can create a collision.
+Stage 3 -- duplicate-frame resolution, after the merger, in-scope clusters
+only (referee trajectories were never touched and, by the tracker invariant,
+hold one detection per frame already):
+
+    3a  per trajectory, any frame holding more than one detection keeps the
+        clean one when present (a second clean in the same frame is an anomaly
+        -- counted, first kept, rest held), otherwise the multi-player
+        detection closest to the trajectory's clean-first centroid; the rest
+        go to a holding set.  Each trajectory's centroid is then recomputed
+        over ALL its remaining detections, single and multi (this stage's
+        placement metric only -- merger centroids stay clean-only).
+    3b  held detections are processed in ascending distance to their nearest
+        admissible trajectory (an in-scope trajectory whose frame is
+        unoccupied): each is assigned there and the slot marked occupied;
+        centroids stay fixed during 3b; a detection with no admissible
+        trajectory is unassigned (it loses its trajectory id).
+
+Output invariant: at most one detection per (frame, cluster) over ALL
+detections -- clean disjointness guarantees it for clean rows, Stage 3
+enforces it for the rest.
 """
 import math
 
@@ -150,8 +171,8 @@ class _Cluster:
     """Mutable merge state of one (possibly merged) trajectory."""
 
     __slots__ = ("tids", "rows", "sum_clean", "n_clean", "sum_any", "n_any",
-                 "frames", "team", "number", "cand", "scope", "first_row",
-                 "last_row", "banned")
+                 "clean_frames", "team", "number", "cand", "scope",
+                 "first_row", "last_row", "banned")
 
     def __init__(self, tid, rows, E, single, frames, info):
         self.tids = [int(tid)]
@@ -165,9 +186,12 @@ class _Cluster:
             if nz.any() else np.zeros(E.shape[1], dtype=np.float64)
         self.n_any = int(nz.sum())
         fr = np.asarray(frames, dtype=np.int64)[self.rows]
-        self.frames = set(int(x) for x in fr)
-        self.first_row = int(self.rows[int(np.argmin(fr))])
-        self.last_row = int(self.rows[int(np.argmax(fr))])
+        sr = np.asarray(single, dtype=bool)[self.rows]
+        self.clean_frames = set(int(x) for x in fr[sr])
+        anchor = self.rows[sr] if sr.any() else self.rows
+        afr = np.asarray(frames, dtype=np.int64)[anchor]
+        self.first_row = int(anchor[int(np.argmin(afr))])
+        self.last_row = int(anchor[int(np.argmax(afr))])
         self.team = info.get("team") or None
         number = info.get("number")
         self.number = str(number) if number not in (None, "", "-1") else None
@@ -199,7 +223,7 @@ class _Cluster:
         self.n_clean += other.n_clean
         self.sum_any += other.sum_any
         self.n_any += other.n_any
-        self.frames |= other.frames
+        self.clean_frames |= other.clean_frames
         if int(frames[other.first_row]) < int(frames[self.first_row]):
             self.first_row = other.first_row
         if int(frames[other.last_row]) > int(frames[self.last_row]):
@@ -278,7 +302,7 @@ def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
         # descending JOINT pooled maxconf; key pair keeps equal scores deterministic
         sc, ka, kb = max(pairs, key=lambda p: (p[0], -p[1], -p[2]))
         a, b = clusters[ka], clusters[kb]
-        if a.frames & b.frames:
+        if a.clean_frames & b.clean_frames:
             _resolve_conflict(a, b, sc, report)
             continue
         entry = dict(phase="2a", pair=[ka, kb], number=a.number,
@@ -336,7 +360,7 @@ def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
     def compat(a, b):
         if not (a.scope and b.scope):
             return False
-        if a.frames & b.frames:
+        if a.clean_frames & b.clean_frames:
             return False
         if not _labels_ok(a, b):
             return False
@@ -375,6 +399,97 @@ def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
                 other = clusters[keys[m]]
                 v = _dist(a, other) if compat(a, other) else np.inf
                 D[i, m] = D[m, i] = v
+
+
+# ------------------------------------------------------------------ stage 3
+
+def _stage3(clusters, E, single, frames, new_tid, report):
+    """Duplicate-frame resolution (3a + 3b) over the in-scope clusters.
+    Mutates ``new_tid`` in place: held detections keep their cluster only if
+    re-placed there is impossible by construction, move to another in-scope
+    cluster with a free slot, or become unassigned (-1). Returns the stage-3
+    report dict. Centroids used: 3a keeps/holds against the cluster's
+    clean-first centroid; 3b places against centroids recomputed over ALL
+    remaining detections, fixed for the whole pass."""
+    E = np.asarray(E, dtype=np.float32)
+    single = np.asarray(single, dtype=bool)
+    frames = np.asarray(frames, dtype=np.int64)
+    in_scope = {k: c for k, c in clusters.items() if c.scope}
+
+    held = []
+    n_coll = 0
+    clean_anomaly = 0
+    kept_rows = {}                       # key -> list of remaining row indices
+    for key, c in in_scope.items():
+        by_frame = {}
+        for r in c.rows:
+            by_frame.setdefault(int(frames[r]), []).append(int(r))
+        mu = c.centroid()
+        remaining = []
+        for f in sorted(by_frame):
+            rr = sorted(by_frame[f])
+            if len(rr) == 1:
+                remaining.append(rr[0])
+                continue
+            n_coll += 1
+            cleans = [r for r in rr if single[r]]
+            if cleans:
+                keep = cleans[0]
+                clean_anomaly += len(cleans) - 1
+            elif mu is None:
+                keep = rr[0]
+            else:
+                keep = min(rr, key=lambda r: (1.0 - float(E[r] @ mu), r))
+            remaining.append(keep)
+            held.extend(r for r in rr if r != keep)
+        kept_rows[key] = remaining
+
+    # centroid over ALL remaining detections (single and multi), 3b's metric
+    mu_all = {}
+    occupied = {}
+    for key, rows in kept_rows.items():
+        rows = np.asarray(rows, dtype=np.int64)
+        occupied[key] = set(int(frames[r]) for r in rows)
+        nz = np.linalg.norm(E[rows], axis=1) > 1e-6
+        mu_all[key] = E[rows[nz]].mean(axis=0) if nz.any() else None
+
+    placed = 0
+    unassigned = []
+    pending = sorted(held)
+    while pending:
+        best = None                      # (d, frame, row, key)
+        dead = []
+        for r in pending:
+            f = int(frames[r])
+            cand = None
+            for key in sorted(occupied):
+                if f in occupied[key]:
+                    continue
+                mu = mu_all[key]
+                d = 1.0 if mu is None else 1.0 - float(E[r] @ mu)
+                if cand is None or (d, key) < (cand[0], cand[3]):
+                    cand = (d, f, r, key)
+            if cand is None:
+                dead.append(r)
+            elif best is None or (cand[0], cand[1], cand[2]) < (best[0], best[1], best[2]):
+                best = cand
+        for r in dead:                   # occupancy only grows: never admissible again
+            pending.remove(r)
+            new_tid[r] = -1
+            unassigned.append(int(r))
+        if best is None:
+            break
+        d, f, r, key = best
+        pending.remove(r)
+        new_tid[r] = key
+        occupied[key].add(f)
+        placed += 1
+
+    report["stage3"] = dict(collided_frames=n_coll, held=len(held),
+                            clean_anomaly=clean_anomaly, placed=placed,
+                            unassigned=len(unassigned),
+                            unassigned_rows=unassigned)
+    return report["stage3"]
 
 
 # ------------------------------------------------------------------ driver
@@ -433,10 +548,15 @@ def refine_video(E, single, frames, boxes, tids, tracks, img_w,
              report)
     report["clusters_out"] = len(clusters)
 
-    new_tid = np.full(n, -1, dtype=np.int64)
+    new_tid = np.full(n, -2, dtype=np.int64)
     resolved = {}
     for key, c in clusters.items():
         new_tid[c.rows] = key
+    if (new_tid == -2).any():
+        raise RuntimeError("a tracked row was left without a cluster; the "
+                           "bookkeeping is broken")
+    _stage3(clusters, E, single, frames, new_tid, report)
+    for key, c in clusters.items():
         total_votes = sum(v[2] for v in c.cand.values())
         number = c.number
         conf = (c.cand[number][2] / total_votes
@@ -445,7 +565,16 @@ def refine_video(E, single, frames, boxes, tids, tracks, img_w,
             tids=sorted(c.tids), team=c.team, number=number,
             confidence=float(conf),
             maxconf=float(score_of(c.cand, number)) if number else 0.0)
-    if (new_tid < 0).any():
-        raise RuntimeError("a tracked row was left without a cluster; the "
-                           "bookkeeping is broken")
+    # Output invariant: one detection per (frame, cluster) over ALL detections.
+    seen = set()
+    for r in range(n):
+        t = int(new_tid[r])
+        if t < 0:
+            continue
+        key = (int(frames[r]), t)
+        if key in seen:
+            raise RuntimeError(f"frame collision after stage 3 at frame "
+                               f"{key[0]}, cluster {key[1]}; the resolution "
+                               f"is broken")
+        seen.add(key)
     return new_tid, resolved, report
