@@ -37,7 +37,9 @@ which is why the stage consumes the stats, not precomputed scores.
 
 Phase 2a -- same-team, same-number.  All pairs of in-scope clusters with equal
 team (both known) and equal number (both known) are processed in descending
-order of the pair score ``score_F(n) + score_G(n)``:
+order of the pair's JOINT pooled maxconf -- the maxconf the merged cluster
+would carry, recomputed from the pooled (clean-detection) statistics as if
+merged: ``exp(max(mx_F, mx_G)) * (conf_sum_F + conf_sum_G)``:
 
   * frame sets disjoint AND re-enter consistent AND distance <= tau -> merge;
   * frame sets disjoint but re-enter or tau fails -> the pair is set aside
@@ -97,6 +99,19 @@ def score_of(cand, label):
     {label: [mx, conf_sum, votes]}; 0.0 for an unseen label."""
     s = cand.get(label)
     return math.exp(s[0]) * s[1] if s else 0.0
+
+
+def pair_maxconf(ca, cb, label):
+    """Joint pooled maxconf of ``label`` over two stats dicts, as if merged:
+    ``exp(max(mx_a, mx_b)) * (conf_sum_a + conf_sum_b)`` -- identical to
+    ``score_of(combine_cand(ca, cb), label)`` without building the merge.
+    0.0 when neither side holds the label."""
+    a, b = ca.get(label), cb.get(label)
+    if a is None and b is None:
+        return 0.0
+    mx = max(a[0] if a else float("-inf"), b[0] if b else float("-inf"))
+    cs = (a[1] if a else 0.0) + (b[1] if b else 0.0)
+    return math.exp(mx) * cs
 
 
 def combine_cand(a, b):
@@ -256,18 +271,18 @@ def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
                     continue
                 if (ka, kb) in aside:
                     continue
-                sc = score_of(a.cand, a.number) + score_of(b.cand, b.number)
+                sc = pair_maxconf(a.cand, b.cand, a.number)
                 pairs.append((sc, ka, kb))
         if not pairs:
             return
-        # descending pair maxconf; the key pair keeps equal scores deterministic
+        # descending JOINT pooled maxconf; key pair keeps equal scores deterministic
         sc, ka, kb = max(pairs, key=lambda p: (p[0], -p[1], -p[2]))
         a, b = clusters[ka], clusters[kb]
         if a.frames & b.frames:
             _resolve_conflict(a, b, sc, report)
             continue
         entry = dict(phase="2a", pair=[ka, kb], number=a.number,
-                     pair_score=round(sc, 6))
+                     pair_maxconf=round(sc, 6))
         d = _dist(a, b)
         entry["distance"] = None if not np.isfinite(d) else round(d, 4)
         ok_re = (not use_reenter) or _reenter_ok(a, b, frames, boxes, img_w,
@@ -283,7 +298,7 @@ def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
             aside.add((ka, kb))
 
 
-def _resolve_conflict(a, b, pair_score, report):
+def _resolve_conflict(a, b, pair_mc, report):
     """Two overlapping clusters claim one number: the lower maxconf side walks
     to its best-ranked candidate it has not lost a conflict on."""
     n = a.number
@@ -304,7 +319,7 @@ def _resolve_conflict(a, b, pair_score, report):
         phase="2a", number=n, pair=[a.key, b.key],
         winner=winner.key, winner_score=round(score_of(winner.cand, n), 6),
         loser=loser.key, loser_score=round(min(sa, sb), 6),
-        reassigned_to=new, pair_score=round(pair_score, 6)))
+        reassigned_to=new, pair_maxconf=round(pair_mc, 6)))
 
 
 # ------------------------------------------------------------------ phase 2b

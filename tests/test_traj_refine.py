@@ -10,11 +10,12 @@ import numpy as np
 
 try:
     from sn_gamestate.refine.traj_refine import (
-        DIGITS_1_99, combine_cand, edge_side, ranked_labels, refine_video,
-        score_of)
+        DIGITS_1_99, combine_cand, edge_side, pair_maxconf, ranked_labels,
+        refine_video, score_of)
 except ImportError:                      # sandbox layout
     from traj_refine import (DIGITS_1_99, combine_cand, edge_side,
-                             ranked_labels, refine_video, score_of)
+                             pair_maxconf, ranked_labels, refine_video,
+                             score_of)
 
 W = 1920.0
 D = 8
@@ -84,6 +85,13 @@ def test_helpers():
     assert score_of(m, "77") == 0.0
     assert ranked_labels({"3": [math.log(.5), 1.0, 2],
                           "8": [math.log(.5), 1.0, 2]})[0] == "8"
+    # pair_maxconf == score_of on the combined stats, for every holding pattern
+    ca = {"7": [math.log(0.9), 1.0, 1]}
+    cb = {"7": [math.log(0.1), 20.0, 20], "9": [math.log(0.5), 0.5, 1]}
+    assert abs(pair_maxconf(ca, cb, "7") - score_of(combine_cand(ca, cb), "7")) < 1e-12
+    assert abs(pair_maxconf(ca, cb, "9") - score_of(combine_cand(ca, cb), "9")) < 1e-12
+    assert pair_maxconf(ca, cb, "42") == 0.0
+    assert abs(pair_maxconf(ca, {}, "7") - score_of(ca, "7")) < 1e-12
     assert "0" not in DIGITS_1_99 and "1" in DIGITS_1_99 and "99" in DIGITS_1_99
 
 
@@ -203,7 +211,7 @@ def test_2a_double_conflict_walks_banned_list():
     assert len(rep["conflicts"]) == 2
 
 
-def test_2a_ordering_by_pair_score():
+def test_2a_ordering_merge_changes_later_pair():
     # 1-2 (score .9-family) and 1-3 (weaker) both claim "7" against 1;
     # the STRONGER pair merges first, then 1's frames include t2's, which
     # overlap t3's -> the weaker pair becomes a conflict, not a merge.
@@ -218,6 +226,30 @@ def test_2a_ordering_by_pair_score():
     assert res[3]["number"] == "5"
     assert rep["merges"][0]["pair"] == [1, 2]
     assert rep["conflicts"][0]["pair"] == [1, 3]
+
+
+def test_2a_ordering_is_joint_maxconf_not_sum():
+    # Pair X (1,2): equal mx -> joint == sum == 3.2.
+    # Pair Y (3,4): mx .9 with cs 1  +  mx .1 with cs 20:
+    #   sum of separate scores = 0.9 + 2.0 = 2.9  (< X)
+    #   joint = exp(max mx) * (cs1+cs2) = .9 * 21 = 18.9  (> X)
+    # Under the joint rule Y merges FIRST; under the old sum rule X would.
+    t1 = rows_for(1, 0, range(0, 4))
+    t2 = rows_for(2, 0, range(10, 14))
+    t3 = rows_for(3, 1, range(0, 4))
+    t4 = rows_for(4, 1, range(10, 14))
+    tracks = {1: track("left", "7", [["7", math.log(.8), 2.0, 2]]),
+              2: track("left", "7", [["7", math.log(.8), 2.0, 2]]),
+              3: track("left", "9", [["9", math.log(.9), 1.0, 1]]),
+              4: track("left", "9", [["9", math.log(.1), 20.0, 20]])}
+    new_tid, res, rep = run([t1, t2, t3, t4], tracks)
+    assert set(new_tid.tolist()) == {1, 3}
+    order = [m["pair"] for m in rep["merges"]]
+    assert order == [[3, 4], [1, 2]], order
+    assert abs(rep["merges"][0]["pair_maxconf"] - 0.9 * 21.0) < 1e-6
+    assert abs(rep["merges"][1]["pair_maxconf"] - 3.2) < 1e-6
+    # merged maxconf recomputed from the combined stats, not from old scores
+    assert abs(res[3]["maxconf"] - 0.9 * 21.0) < 1e-6
 
 
 # ------------------------------------------------------------------ 2b --------
