@@ -446,6 +446,21 @@ synthetic kits only).
     NOT reportable numbers for expectation-setting only: GS-HOTA 62.111,
     DetA 53.28, AssA 72.42, IDF1 70.36, LocA 91.47 (calibration draw of that
     session applies, item 19).
+23. NEW 2026-09-04 (run 10, batch 7+8 code): **RUN INTEGRITY OK — 13 checks, 0 FAIL,
+    0 WARN** — the cluster-first architecture's first reportable baseline:
+    **GS-HOTA 53.148** (DetA 43.87, AssA 64.40, IDF1 62.77, MOTA 28.17, IDSW 11,
+    MT 9, 29 predicted vs 26 GT identities). Every tracking intermediate is
+    identical to run 9 (sidecar-verified: 52→66→29, clusters [22, 33], 27/59
+    numbered, stage 3 160/160/0, same roles/sides); the metric difference is the
+    calibration draw — run 10's was LOW (min accepted score 0.301, mean 0.588,
+    586/749 frames ≥ 0.6). The item-19 spread now spans ~9 GS-HOTA points over
+    three sessions with identical tracking (run 8: 55.7, run 9: 62.1, run 10:
+    53.1), which makes the calibration freeze-vs-shared-cache decision the
+    blocking step before any tuning or comparison. Run 10's session also
+    demonstrated the output-persistence gap: everything lived under
+    /kaggle/working with the repo/venv/dataset, far beyond Kaggle's committed-
+    output limits, so nothing persisted — fixed in batch 9 (notebook
+    restructure).
 
 
 ## 8. Changes made on 2026-09-02, 2026-09-03 and 2026-09-04
@@ -683,23 +698,33 @@ run 9's exact pattern (merged-cluster unification + 3b adoption on pre-refine id
 FAIL on the live column, no FAIL on the snapshot, genuine snapshot variance still
 FAILs); installed copy byte-identical to the harness-verified sandbox copy.
 
-## 9. Plan of record — 2026-09-04, after run 9 and the batch-8 fix
+Batch 9 (2026-09-04, after run 10; one file, `docs/kaggle_one_sequence_test.ipynb`):
+the notebook is restructured for artifact persistence — the repo, venvs, dataset,
+caches and run outputs ALL move to `/kaggle/tmp` (they die with the session), and a
+new final export cell copies ONLY the artifacts worth keeping to `/kaggle/working`:
+`eval_results/` (metrics), `audit/` (verdicts + every stage sidecar), `calibration/`
+(the BroadTrack JSON — freeze candidates, §7 items 19/23), `states/*.pklz`,
+`video/` (the visualization video the run already renders, ~7.5 min/sequence) and
+`jn_cache.zip` — so a committed run (Save & Run All) persists them in the notebook
+Output. Verified offline: JSON validity, 26 cells, `bash -n` on every bash cell, and
+the export cell executed end-to-end against a synthetic run layout (all seven
+artifact groups land, video detection warns when absent); the installed notebook is
+cell-for-cell identical to the verified sandbox copy.
 
-Run 9 (§7 item 22) proved the cluster-first architecture live — every stage behaved
-as designed, with encouraging provisional numbers (GS-HOTA 62.111 in-run) — but was
-refused on a single false FAIL in the team_embed check, fixed in batch 8. The
-calibration methodology constraint stands (§7 item 19): cross-session single-run
-comparisons are invalid; freeze a calibration (persist `broadtrack_calib/<seq>.json`
-as a Kaggle dataset; `use_cached_json` consumes it) or compare within-session on a
-shared cache. Current steps: **(1) push batches 7+8 together** — no retired files,
-no `git rm`; **(2) rerun the notebook unchanged** — a fresh session recomputes the
-jersey cache and calibration; expect the run-9 stage behavior (§7 item 22),
-`cluster_column_audited: team_cluster_prerefine` in the team_embed check, 13 PASS,
-RUN INTEGRITY OK; that run's metrics become the cluster-first architecture's first
-reportable baseline (run-9 values are the expected ballpark, subject to the
-calibration draw). **(3) Then decide the calibration freeze vs shared-cache question
-before any tuning or comparison.** After the first accepted configuration: pin
-`team_sha256` (§7 item 3), replace the SATRN digest prefix (§7 item 4), and tune on
-`valid` — `traj_refine` tau/edge_margin (§7 item 7; tau 0.60 remains the pipeline's
-only merge threshold, untuned) and the role_team geometry thresholds (§3), carried
-from ground-truth-tracklet tuning and untuned on this pipeline's trajectories.
+## 9. Plan of record — 2026-09-04, after run 10 (first clean cluster-first baseline)
+
+Run 10 (§7 item 23) delivered the cluster-first architecture's first integrity-clean,
+reportable baseline: GS-HOTA 53.148 on SNGS-116 — with the crucial caveat that the
+three sessions since the restructuring scored 55.7 / 62.1 / 53.1 on IDENTICAL
+tracking, purely from the calibration draw. Current steps: **(1) push batch 9** (the
+notebook restructure; batches 7+8 push together with it if not already pushed);
+**(2) DECIDE THE CALIBRATION METHODOLOGY — now the blocking step**: freeze a good
+calibration (a committed run persists `calibration/<seq>.json`; upload one as a
+Kaggle dataset and mount it — `use_cached_json: true` consumes it) or compare only
+within-session on a shared cache; until then no cross-session number means anything.
+**(3) Run committed (Save & Run All)** so the export cell persists metrics, audit,
+calibration, state, video and the jersey cache. After the first accepted
+configuration: pin `team_sha256` (§7 item 3), replace the SATRN digest prefix (§7
+item 4), and tune on `valid` — `traj_refine` tau/edge_margin (§7 item 7) and the
+role_team geometry thresholds (§3), carried from ground-truth-tracklet tuning and
+untuned on this pipeline's trajectories.
