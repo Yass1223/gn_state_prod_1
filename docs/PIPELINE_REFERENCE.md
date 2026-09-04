@@ -110,7 +110,7 @@ must be launched from the repository root; outputs go to `outputs/sn-gamestate/<
 | `jersey_number_detect` | `sn_gamestate.jersey.jn_gsr_api.JNGsrTrackletRecognizer` | subprocess workers in the 3.10 venv; since batch 7 eligibility = at least one single crop, NO role filter (roles do not exist yet; the legibility filter is what discards referee crops); `single_crops_only: true`; legibility > 0.72 → DBNet++ ROI → PARSeq + SATRN → `vote_pool` (the only rule); stride 5; fp16; GPU sharding auto via nvidia-smi (2 workers on Kaggle 2×T4); content-hash cache `jn_cache/`. Since 2026-09-03 (blob **schema 2**): two ADDITIVE columns for `traj_refine` — `jersey_number_candidates` (every pooled label of the two recognisers as `[label, mx, conf_sum, votes]`, ranked by the maxconf score exp(mx)·conf_sum; stats, not scores, so merged tracklets recombine exactly: mx=max, conf_sum/votes add) and `jersey_number_maxconf` (assigned number's score). The schema is folded into the cache key (old caches miss and recompute once) and checked on every shard and cached blob; the assigned number stays `vote_pool`, byte-identical. The batch-7 eligibility change alters the manifest content, so EVERY sequence's cache key changes and the entire cache recomputes once (referee fragments now enter the workers) |
 | `traj_refine` | `sn_gamestate.refine.traj_refine_api.TrajRefine` | NEW 2026-09-03, extended 2026-09-04 twice (split-only conformance, then batch-7 cluster labels). The pipeline's ONE merge (Stage 2) plus stage-3 duplicate-frame resolution, between jersey and role_team. Labels per fragment: the TEAM CLUSTER id (`team_cluster`, NaN = unclustered — imposes no merge condition) and the jersey number with its pooled candidate stats; EVERY fragment is in scope (no roles exist yet). Phase 2a merges same-number pairs with non-contradicting clusters, in descending JOINT pooled maxconf (exp(max mx)·Σconf_sum over the pair's clean-detection stats), when CLEAN frame sets are disjoint ∧ re-enter consistent ∧ distance ≤ tau; a pair claiming one number at the same time (clean-frame overlap) is a conflict — the lower-maxconf side walks to its best candidate not previously lost (banned set; cascades; "-1"/exhaustion → unnumbered). Phase 2b merges agglomeratively (average linkage) under clean-frames-disjoint ∧ re-enter ∧ cluster agreement ∧ number agreement — each label condition applying only when both sides know it; two same-cluster fragments with two DIFFERENT known numbers never merge (two different players); an unclustered numbered fragment merges on same number + distance; an unclustered unnumbered fragment merges on distance alone. Multi-player detections are ignored until stage 3. Stage 3, after the merger: 3a keeps one detection per (frame, trajectory) — clean wins (a second clean is a counted anomaly), else the multi nearest the clean-first centroid — and holds the rest; 3b places held detections in ascending distance into the nearest trajectory with that frame free, with DYNAMIC centroids — the receiving trajectory's all-detection centroid is recomputed after EVERY assignment — and unassigns the rest (`track_id` NaN, the ONLY way any refinement stage drops a row; no distance cap by specification). Same OSNet-AIN pin as track/tracklet_split (audit-enforced; tau 0.60 untuned for this stage; edge_margin 0.02 untuned). A merged cluster unifies `team_cluster` (the known id, or NaN); rows adopted in 3b take the target cluster's labels. Snapshots written unconditionally: `track_id_prerefine`, `jersey_number_detection_prerefine`, `jersey_number_confidence_prerefine`, `team_cluster_prerefine` (role/team snapshots are gone with the columns — roles/sides are assigned AFTER this stage); `enabled: false` = snapshots + sidecar only (the A/B switch). Output invariant: one detection per (image_id, track_id) over ALL detections; tracked rows out = in − unassigned. Sidecar `audit/traj_refine/` (incl. `stage3` block, `rows_unassigned`, per-cluster `team_cluster`); algorithm in `refine/traj_refine.py` (pure numpy, 26 unit tests in `tests/test_traj_refine.py`) |
 | `tracklet_agg` | `tracklab.wrappers.MajorityVoteTracklet` | majority vote over `[jersey_number]` only (role/team are per-trajectory from the post-refine role_team) |
-| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs tracklet_split checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL. Batch-7 basis map (the snapshot chain of the new order): `track_id_pregate` = TRACKER ids (basis for the track, crop_filter and calibration checks); `track_id_presplit` = the gate's output (basis for the gate's id comparison); `track_id_prerefine` = FRAGMENT ids as the splitter left them (basis for the tracklet_split, team_embed and jersey checks); final `track_id` = trajectories (basis for the role_team, traj_refine-output and tracklet_agg checks). `_check_team_embed` validates the clustering: cluster_method/outlier_k ran == configured, sizes sum to clustered, per-fragment `team_cluster` constancy and {0,1} values recomputed from the columns, clustered count == sidecar, `team_cluster_nearest` on every embedded fragment, missing embeddings == `fragments_no_single`. `_check_role_team` audits the FINAL trajectories directly (role_team is the last labelling stage — the batch-6 snapshot machinery is retired with the snapshots themselves): roles/sides valid and constant, referees sideless, both teams present, ≤ 1 main_2.14 referee, ≤ 2 assistants, keeper caps, fallback counts consistent with the per-trajectory reasons (half fallback ⇒ WARN), params want ⊆ ran, sidecar covers every trajectory. `_check_jersey` eligibility = single-crop presence (no role filter). The `traj_refine` check does row accounting (rows losing an id == sidecar `rows_unassigned`, no row may gain one, tracked_after == tracked_before − unassigned) with the pin-equality key `ain_sha256_tracklet_split` and number/`team_cluster` constancy per final track |
+| `audit` | `sn_gamestate.audit.RunAudit` | read-only last stage; per-sequence, per-component PASS/WARN/FAIL to `audit/<seq>.json`; cross-checks every sidecar against the composed config (including track vs tracklet_split checkpoint-pin equality); `scripts/verify_run_integrity.py` exits non-zero on any FAIL. Batch-7 basis map (the snapshot chain of the new order): `track_id_pregate` = TRACKER ids (basis for the track, crop_filter and calibration checks); `track_id_presplit` = the gate's output (basis for the gate's id comparison); `track_id_prerefine` = FRAGMENT ids as the splitter left them (basis for the tracklet_split, team_embed and jersey checks); final `track_id` = trajectories (basis for the role_team, traj_refine-output and tracklet_agg checks). `_check_team_embed` validates the clustering: cluster_method/outlier_k ran == configured, sizes sum to clustered, per-fragment cluster constancy and {0,1} values recomputed from the columns — on the pre-refine basis the cluster column is read from the `team_cluster_prerefine` SNAPSHOT when present, since traj_refine legitimately rewrites the live column (run-9 false-FAIL fix, batch 8) — clustered count == sidecar, `team_cluster_nearest` on every embedded fragment, missing embeddings == `fragments_no_single`. `_check_role_team` audits the FINAL trajectories directly (role_team is the last labelling stage — the batch-6 snapshot machinery is retired with the snapshots themselves): roles/sides valid and constant, referees sideless, both teams present, ≤ 1 main_2.14 referee, ≤ 2 assistants, keeper caps, fallback counts consistent with the per-trajectory reasons (half fallback ⇒ WARN), params want ⊆ ran, sidecar covers every trajectory. `_check_jersey` eligibility = single-crop presence (no role filter). The `traj_refine` check does row accounting (rows losing an id == sidecar `rows_unassigned`, no row may gain one, tracked_after == tracked_before − unassigned) with the pin-equality key `ain_sha256_tracklet_split` and number/`team_cluster` constancy per final track |
 
 Not in the pipeline **[verified]**: no `pitch` stage (BroadTrack runs NBJW keypoints and
 TVCalib lines internally); no `reid`/prtreid stage; `interpolation` (dti.yaml) exists as a
@@ -429,6 +429,23 @@ synthetic kits only).
     A documented property of `kmeans2_threshold`, not a defect; alternative
     `cluster_method` variants (e.g. k=3, outlier pre-filter) can be added behind the
     config switch if real sequences expose it.
+22. NEW 2026-09-04 (run 9, the first cluster-first run): the pipeline executed
+    end-to-end and every stage behaved as designed — splitter 52→66 fragments;
+    team clustering [22, 33] with 11 unclustered (7 no-single + 4 threshold);
+    jersey 27/59 numbered (59 = 66 − 7, the new eligibility exactly);
+    traj_refine 66→29 (9 2a + 28 2b, 1 conflict resolved; stage 3: 160 held,
+    160 placed, 0 unassigned); role_team 25 players + 2 goalkeepers + 2 referees
+    with the main referee found by (2.14), left cluster via the quantile cue
+    (keeper cue abstained with 2 GKs, by design), 0 fallbacks; 29 predicted vs
+    26 GT identities. The run was REFUSED (12 PASS / 1 FAIL): a false FAIL in
+    `_check_team_embed` — the check read the live `team_cluster` on the
+    pre-refine basis, but traj_refine rewrites it (merged-cluster unification
+    → 57 clustered vs the sidecar's 55; 3b row adoption → "varies inside 5
+    fragments") — the run-7 mechanism recurring for the cluster column. Fixed
+    in batch 8 (snapshot preference; harness-verified). Provisional, refused,
+    NOT reportable numbers for expectation-setting only: GS-HOTA 62.111,
+    DetA 53.28, AssA 72.42, IDF1 70.36, LocA 91.47 (calibration draw of that
+    session applies, item 19).
 
 
 ## 8. Changes made on 2026-09-02, 2026-09-03 and 2026-09-04
@@ -658,30 +675,31 @@ YAML parses with a pipeline-order assertion; no live run yet):
 Nothing was retired in batch 7: `role_team_api.py` was replaced in place, all module
 paths and Hydra `_target_`s are unchanged, and no `git rm` is needed.
 
-## 9. Plan of record — 2026-09-04, after run 8 and the batch-7 restructuring
+Batch 8 (2026-09-04, after run 9; one file): `sn_gamestate/audit/run_audit_api.py` —
+`_check_team_embed` now audits the cluster column from the `team_cluster_prerefine`
+snapshot when present (live-column fallback for older states), fixing the run-9
+false FAIL (§7 item 22). Verified by a dedicated offline harness that reproduces
+run 9's exact pattern (merged-cluster unification + 3b adoption on pre-refine ids:
+FAIL on the live column, no FAIL on the snapshot, genuine snapshot variance still
+FAILs); installed copy byte-identical to the harness-verified sandbox copy.
 
-Run 8 closed the split-only chapter with a clean integrity chain (13 PASS, RUN
-INTEGRITY OK) and, together with run 7, exposed the calibration nondeterminism that
-reframes all metric methodology (§7 items 18–19): single-run cross-session
-comparisons are invalid, so the previously planned snft-vs-HM detector A/B was
-DROPPED from the plan. The cluster-first restructuring (batch 7) is installed and
-offline-verified; no baseline exists for it yet (§7 item 15: third architecture
-state). Current steps: **(1) push batch 7** — no retired files, no `git rm`;
-**(2) one Kaggle run of the cluster-first pipeline on SNGS-116** — preflight must
-execute `tests/test_audit.py` and `tests/test_stages.py` (adapted by inspection,
-never executed under torch), plus the standing suites (26 refine + 12 splitter
-tests); expect the jersey stage to recompute its ENTIRE cache (new eligibility
-changes every key; referee fragments enter the workers), the team_embed log line
-`clusters [a, b], N unclustered (kmeans2_threshold, k 3.25)`, the post-refine
-role_team log (main referee found/none, left cluster, fallback counts), 13 audit
-checks, and RUN INTEGRITY OK; that run's metrics become the cluster-first
-architecture's first data point — with the §7-item-19 caveat that its absolute
-GS-HOTA carries the calibration draw of its session. **(3) Decide the calibration
-methodology before any tuning or comparison**: either freeze a calibration
-(persist `broadtrack_calib/<seq>.json` as a Kaggle dataset; `use_cached_json` already
-consumes it) or run all comparisons within-session on a shared cache. After the
-first accepted configuration: pin `team_sha256` (§7 item 3), replace the SATRN digest
-prefix (§7 item 4), and tune on `valid` — `traj_refine` tau/edge_margin (§7 item 7;
-tau 0.60 remains the pipeline's only merge threshold, untuned) and the role_team
-geometry thresholds (§3), which are carried from ground-truth-tracklet tuning and
-untuned on this pipeline's trajectories.
+## 9. Plan of record — 2026-09-04, after run 9 and the batch-8 fix
+
+Run 9 (§7 item 22) proved the cluster-first architecture live — every stage behaved
+as designed, with encouraging provisional numbers (GS-HOTA 62.111 in-run) — but was
+refused on a single false FAIL in the team_embed check, fixed in batch 8. The
+calibration methodology constraint stands (§7 item 19): cross-session single-run
+comparisons are invalid; freeze a calibration (persist `broadtrack_calib/<seq>.json`
+as a Kaggle dataset; `use_cached_json` consumes it) or compare within-session on a
+shared cache. Current steps: **(1) push batches 7+8 together** — no retired files,
+no `git rm`; **(2) rerun the notebook unchanged** — a fresh session recomputes the
+jersey cache and calibration; expect the run-9 stage behavior (§7 item 22),
+`cluster_column_audited: team_cluster_prerefine` in the team_embed check, 13 PASS,
+RUN INTEGRITY OK; that run's metrics become the cluster-first architecture's first
+reportable baseline (run-9 values are the expected ballpark, subject to the
+calibration draw). **(3) Then decide the calibration freeze vs shared-cache question
+before any tuning or comparison.** After the first accepted configuration: pin
+`team_sha256` (§7 item 3), replace the SATRN digest prefix (§7 item 4), and tune on
+`valid` — `traj_refine` tau/edge_margin (§7 item 7; tau 0.60 remains the pipeline's
+only merge threshold, untuned) and the role_team geometry thresholds (§3), carried
+from ground-truth-tracklet tuning and untuned on this pipeline's trajectories.

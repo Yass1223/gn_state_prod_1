@@ -1237,14 +1237,24 @@ class RunAudit(VideoLevelModule):
         sizes = clus.get("sizes") or [0, 0]
         if sum(int(s) for s in sizes) != n_clustered_side:
             c.set(FAIL, f"cluster sizes {sizes} do not sum to clustered ({n_clustered_side})")
-        # recompute from the columns, on the fragment ids the stage saw
+        # recompute from the columns, on the fragment ids the stage saw.
+        # traj_refine legitimately rewrites team_cluster afterwards (merged
+        # clusters unify it; 3b-adopted rows take the target's), so on the
+        # pre-refine fragment basis this stage must be audited against its
+        # SNAPSHOT, written unconditionally by the refine stage (run-9 false
+        # FAIL: "varies inside 5 fragments; 57 vs 55"). team_embedding and
+        # team_cluster_nearest are never rewritten and need no snapshot.
+        cl_col = ("team_cluster_prerefine"
+                  if "team_cluster_prerefine" in tracked.columns
+                  else "team_cluster")
+        c.observed["cluster_column_audited"] = cl_col
         bad_const = 0
         clustered_now = 0
         vals = set()
         nearest_missing = 0
         for tid, grp in tracked.groupby("track_id"):
-            cl = grp["team_cluster"].dropna()
-            if grp["team_cluster"].nunique(dropna=True) > 1:
+            cl = grp[cl_col].dropna()
+            if grp[cl_col].nunique(dropna=True) > 1:
                 bad_const += 1
             if len(cl):
                 clustered_now += 1
