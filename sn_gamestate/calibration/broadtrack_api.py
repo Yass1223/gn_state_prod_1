@@ -203,6 +203,10 @@ class BroadTrackCalibration(VideoLevelModule):
         # Frames whose binary score is below min_score are treated as uncalibrated
         # (see the module docstring: 0.3 is the binary's own tracking-lost threshold).
         self.min_score = float(getattr(cfg, "min_score", 0.3))
+        # Best-of-N draw selection (the binary is nondeterministic across runs;
+        # the observed draw spread moved GS-HOTA by ~9 points on SNGS-116).
+        # 1 = the old single-run behavior, byte-for-byte.
+        self.calib_attempts = int(getattr(cfg, "calib_attempts", 1))
         self.use_prev_parameters = bool(getattr(cfg, "use_prev_parameters", True))
         # Longest run of consecutive frames allowed to reuse the last accepted camera;
         # 0 = unlimited. Beyond the cap the frame gets no parameters and its
@@ -354,6 +358,69 @@ class BroadTrackCalibration(VideoLevelModule):
             return None
         return tripod
 
+    # ------------------------------------------------- best-of-N selection
+    def _attempt_quality(self, json_path):
+        """Label-free quality of one calibration attempt: the mean of the
+        binary's own per-frame line-IoU scores over ACCEPTED frames
+        (score >= min_score), acceptance count as tiebreak. Across runs 7-10
+        this internal score predicted GS-HOTA monotonically (0.494 -> 62.4,
+        0.370 -> 55.7, 0.301 -> 53.1); no ground truth is involved, so the
+        selection is valid on the test split. Returns
+        (mean_accepted, n_accepted, n_frames) or None if unreadable."""
+        try:
+            calibs = json.loads(Path(json_path).read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        sc = [float(v.get("score", 0.0)) for v in calibs.values()]
+        acc = [s for s in sc if s >= self.min_score]
+        if not acc:
+            return (0.0, 0, len(sc))
+        return (sum(acc) / len(acc), len(acc), len(sc))
+
+    def _run_binary_best_of(self, run_dir, out_json, tripod, seq_name):
+        """Run the binary ``calib_attempts`` times, keep the attempt with the
+        best internal quality as ``<seq>.json``, delete the losers, and write
+        ``<seq>.selection.json`` (per-attempt stats + winner) next to it.
+        With ``calib_attempts: 1`` this is exactly the old single run."""
+        n = max(1, self.calib_attempts)
+        if n == 1:
+            return self._run_binary(run_dir, out_json, tripod)
+        results = []
+        for k in range(n):
+            cand = out_json.with_name(f"{out_json.stem}.attempt{k}.json")
+            if cand.is_file():
+                cand.unlink()
+            if not self._run_binary(run_dir, cand, tripod):
+                log.warning(f"[BroadTrack] {seq_name}: attempt {k + 1}/{n} produced "
+                            f"no JSON; continuing")
+                continue
+            q = self._attempt_quality(cand)
+            if q is None:
+                log.warning(f"[BroadTrack] {seq_name}: attempt {k + 1}/{n} unreadable")
+                continue
+            results.append((q[0], q[1], k, cand, q[2]))
+            log.info(f"[BroadTrack] {seq_name}: attempt {k + 1}/{n} mean accepted "
+                     f"score {q[0]:.3f} over {q[1]}/{q[2]} frames")
+        if not results:
+            return False
+        results.sort(key=lambda r: (r[0], r[1]), reverse=True)   # stable: ties -> earlier attempt
+        best = results[0]
+        best[3].replace(out_json)
+        for r in results[1:]:
+            try:
+                r[3].unlink()
+            except OSError:
+                pass
+        sel = dict(sequence=seq_name, attempts=n, selection="mean_accepted_score",
+                   min_score=self.min_score, winner=int(best[2]),
+                   per_attempt=[dict(attempt=int(r[2]), mean_accepted=round(r[0], 6),
+                                     accepted=int(r[1]), frames=int(r[4]))
+                                for r in sorted(results, key=lambda r: r[2])])
+        (out_json.parent / f"{seq_name}.selection.json").write_text(json.dumps(sel, indent=2))
+        log.info(f"[BroadTrack] {seq_name}: kept attempt {best[2] + 1} of {n} "
+                 f"(mean accepted score {best[0]:.3f}); selection sidecar written")
+        return True
+
     # ---------------------------------------------------------------- main
     def process(self, detections: pd.DataFrame, metadatas: pd.DataFrame):
         # NOTE (engine contract): must return a DataFrame (detections) only; the image
@@ -378,7 +445,7 @@ class BroadTrackCalibration(VideoLevelModule):
                 return self._empty_outputs(detections, metadatas)
             run_dir = self._prepare_frames_dir(frames_dir, detections, metadatas)
             tripod = self._tripod_file(seq_name, run_dir)
-            if not self._run_binary(run_dir, out_json, tripod):
+            if not self._run_binary_best_of(run_dir, out_json, tripod, seq_name):
                 return self._empty_outputs(detections, metadatas)
 
         try:

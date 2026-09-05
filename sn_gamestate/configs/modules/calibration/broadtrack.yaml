@@ -26,6 +26,17 @@ cfg:
   # This is what makes sharded 2xT4 / 4xT4 runs cheap; same idea as state.save_file.
   calib_dir: ${project_dir}/broadtrack_calib
   use_cached_json: true
+  # Best-of-N draw selection. The binary is nondeterministic across runs and the
+  # draw quality moved GS-HOTA by ~9 points on SNGS-116 (runs 7-10: min accepted
+  # score 0.494 -> 62.4, 0.370 -> 55.7, 0.301 -> 53.1). On a cache miss the stage
+  # runs the binary calib_attempts times and keeps the attempt with the highest
+  # MEAN LINE-IoU OVER ACCEPTED FRAMES (score >= min_score; acceptance count as
+  # tiebreak) -- the binary's own label-free confidence, so the selection is valid
+  # on the test split. Losers are deleted; <seq>.selection.json records per-attempt
+  # stats and the winner. 1 = the old single-run behavior. A cached JSON
+  # (use_cached_json + a mounted frozen calibration) short-circuits the attempts
+  # entirely -- freeze a good draw for full cross-session determinism.
+  calib_attempts: 3
   timeout: 7200          # seconds per sequence
 
   # --- camera position prior (metres, sn-calibration world frame) ---

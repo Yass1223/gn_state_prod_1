@@ -461,6 +461,26 @@ synthetic kits only).
     /kaggle/working with the repo/venv/dataset, far beyond Kaggle's committed-
     output limits, so nothing persisted — fixed in batch 9 (notebook
     restructure).
+24. NEW 2026-09-04 (batch 10): the calibration lottery is FIXED, in two layers.
+    (a) BEST-OF-N DRAW SELECTION in the calibration stage: on a cache miss the
+    BroadTrack binary now runs `calib_attempts` times (default 3) and the stage
+    keeps the attempt with the highest mean line-IoU over accepted frames
+    (score >= min_score, acceptance count as tiebreak) — the binary's OWN
+    label-free confidence, which predicted GS-HOTA monotonically across runs
+    7–10 (0.494 → 62.4, 0.370 → 55.7, 0.301 → 53.1), so the selection is valid
+    on the test split; losers are deleted and `<seq>.selection.json` records
+    per-attempt stats and the winner (exported by the batch-9 cell).
+    `calib_attempts: 1` reproduces the old single-run behavior byte-for-byte.
+    This cuts off the left tail that produced runs 8 and 10. (b) FREEZE: the
+    notebook's `CALIB_DATASET` variable mounts a Kaggle dataset of
+    `broadtrack_calib/*.json` files; they are copied into place before the run
+    and `use_cached_json` short-circuits the binary entirely — calibration
+    becomes bit-identical across sessions. Workflow: one committed best-of-3
+    run generates and persists a high-quality JSON; upload it as a dataset;
+    set `CALIB_DATASET`; the ~9-point lottery is first mitigated (a), then
+    eliminated (b). Residual [unverified]: the root cause of the binary's
+    nondeterminism (not instrumented; the fix removes its effect, not its
+    source), and best-of-3's realized draw-quality gain on live sessions.
 
 
 ## 8. Changes made on 2026-09-02, 2026-09-03 and 2026-09-04
@@ -711,20 +731,33 @@ the export cell executed end-to-end against a synthetic run layout (all seven
 artifact groups land, video detection warns when absent); the installed notebook is
 cell-for-cell identical to the verified sandbox copy.
 
-## 9. Plan of record — 2026-09-04, after run 10 (first clean cluster-first baseline)
+Batch 10 (2026-09-04, the calibration fix; §7 item 24): `sn_gamestate/calibration/
+broadtrack_api.py` — `_run_binary_best_of` + `_attempt_quality` (best-of-N with
+mean-accepted-score selection, selection sidecar, `calib_attempts: 1` == old
+behavior); `configs/modules/calibration/broadtrack.yaml` — `calib_attempts: 3` with
+the selection rule and its run-7–10 evidence documented;
+`docs/kaggle_one_sequence_test.ipynb` — `CALIB_DATASET` configuration variable and
+the frozen-calibration mount hook in the run cell. Verified offline: a four-case
+harness with a stubbed binary (best-of-3 keeps the highest mean-accepted attempt and
+deletes losers with an exact selection sidecar; attempts=1 makes a single call and
+no sidecar; a failed attempt is tolerated; all-fail returns False); installed api
+byte-identical to the harness-verified copy; notebook JSON valid, hook cells pass
+bash -n / py-compile.
 
-Run 10 (§7 item 23) delivered the cluster-first architecture's first integrity-clean,
-reportable baseline: GS-HOTA 53.148 on SNGS-116 — with the crucial caveat that the
-three sessions since the restructuring scored 55.7 / 62.1 / 53.1 on IDENTICAL
-tracking, purely from the calibration draw. Current steps: **(1) push batch 9** (the
-notebook restructure; batches 7+8 push together with it if not already pushed);
-**(2) DECIDE THE CALIBRATION METHODOLOGY — now the blocking step**: freeze a good
-calibration (a committed run persists `calibration/<seq>.json`; upload one as a
-Kaggle dataset and mount it — `use_cached_json: true` consumes it) or compare only
-within-session on a shared cache; until then no cross-session number means anything.
-**(3) Run committed (Save & Run All)** so the export cell persists metrics, audit,
-calibration, state, video and the jersey cache. After the first accepted
-configuration: pin `team_sha256` (§7 item 3), replace the SATRN digest prefix (§7
-item 4), and tune on `valid` — `traj_refine` tau/edge_margin (§7 item 7) and the
-role_team geometry thresholds (§3), carried from ground-truth-tracklet tuning and
-untuned on this pipeline's trajectories.
+## 9. Plan of record — 2026-09-04, after batch 10 (the calibration fix)
+
+Run 10 delivered the first integrity-clean cluster-first baseline (GS-HOTA 53.148,
+§7 item 23) and exposed the ~9-point calibration lottery; batch 10 fixes it (§7 item
+24): best-of-3 draw selection on cache miss, plus the `CALIB_DATASET` freeze hook.
+Current steps: **(1) push batches 7–10** (nothing retired, plain add/commit/push);
+**(2) one committed run (Save & Run All), `CALIB_DATASET` empty** — best-of-3
+generates the calibration; expect three `[BroadTrack] ... attempt k/3 mean accepted
+score ...` lines, the `kept attempt` line, `calibration/SNGS-116.json` +
+`SNGS-116.selection.json` in the Output, 13 PASS, RUN INTEGRITY OK; its metrics are
+the first baseline under selected calibration. **(3) Upload the persisted
+`calibration/` JSON as a private Kaggle dataset and set `CALIB_DATASET`** — every
+subsequent run is then bit-identical in calibration, and cross-session numbers
+become directly comparable. After that: pin `team_sha256` (§7 item 3), replace the
+SATRN digest prefix (§7 item 4), and tune on `valid` — `traj_refine`
+tau/edge_margin (§7 item 7) and the role_team geometry thresholds (§3), carried
+from ground-truth-tracklet tuning and untuned on this pipeline's trajectories.
