@@ -2,9 +2,9 @@
 #
 # ONE entry config, ONE path through the pipeline. No alternative backends.
 #
-#   bbox_detector  YOLO11-L "HM" fine-tune (HF YOLOv11L_HM)    -> bbox_ltwh, bbox_conf
-#                  (default; the earlier fine-tune yolov11_sn_best is the alternative via
-#                   the defaults group: `modules/bbox_detector=yolo_ultralytics_snft`
+#   bbox_detector  YOLO11-L fine-tune yolov11_sn_best (HF sn-gamestate-weights) -> bbox_ltwh, bbox_conf
+#                  (default; the "HM" fine-tune YOLOv11L_HM is the alternative via
+#                   the defaults group: `modules/bbox_detector=yolo_ultralytics_snft_hm`
 #                   — same operating point, different weights; see either detector config
 #                   for cache notes)
 #   track          BoT-SORT · SOF + OSNet-AIN (boxmot)        -> track_id
@@ -47,7 +47,7 @@
 #   python scripts/verify_broadtrack_conversion.py -c <calib.json> -f <frames dir>
 # Run:
 #   tracklab -cn soccernet
-#   tracklab -cn soccernet modules/bbox_detector=yolo_ultralytics_snft   # earlier detector
+#   tracklab -cn soccernet modules/bbox_detector=yolo_ultralytics_snft_hm   # "HM" detector
 # Reference metrics (saved separately from the pipeline eval):
 #   python scripts/reference_metrics.py --state states/sn-gamestate.pklz \
 #       --dataset-path data/SoccerNetGS --eval-set test --out reference_metrics
@@ -60,7 +60,7 @@ defaults:
   - eval: gs_hota
   - engine: offline
   - visualization: gamestate
-  - modules/bbox_detector: yolo_ultralytics_snft_hm
+  - modules/bbox_detector: yolo_ultralytics_snft
   - modules/track: botsort_ain
   - modules/crop_filter: overlap_tracked
   - modules/tracklet_split: tracklet_split
