@@ -62,10 +62,10 @@ def track(team=None, number=None, c=None, scope=True):
     return dict(cluster=CLU.get(team, team), number=number, cand=c or [], scope=scope)
 
 
-def run(trajs, tracks, tau=0.6, use_reenter=True, edge_margin=0.02, img_w=W):
+def run(trajs, tracks, tau=0.6, use_reenter=True, img_w=W):
     E, single, frames, boxes, tids = build(*trajs)
     return refine_video(E, single, frames, boxes, tids, tracks, img_w,
-                        tau, use_reenter, edge_margin)
+                        tau, use_reenter)
 
 
 def check_invariants(frames_arr, new_tid):
@@ -80,10 +80,10 @@ def check_invariants(frames_arr, new_tid):
 # ---------------------------------------------------------------- helpers ----
 
 def test_helpers():
-    assert edge_side([0, 0, 40, 80], W, 38.4) == "left"
-    assert edge_side([W - 30, 0, 40, 80], W, 38.4) == "right"
-    assert edge_side([900, 0, 40, 80], W, 38.4) is None
-    assert edge_side([0, 0, W, 80], W, 38.4) is None          # both edges
+    assert edge_side([0, 0, 40, 80], W) == "left"
+    assert edge_side([W - 30, 0, 40, 80], W) == "right"
+    assert edge_side([900, 0, 40, 80], W) == "left"           # center 920 < W/2
+    assert edge_side([W - 900, 0, 800, 80], W) == "right"     # center past W/2
     a = {"7": [math.log(0.9), 1.8, 2]}
     b = {"7": [math.log(0.5), 0.5, 1], "9": [math.log(0.8), 0.8, 1]}
     m = combine_cand(a, b)
@@ -144,11 +144,18 @@ def test_2a_reenter_blocks_and_vacuous():
     t2 = rows_for(2, 0, range(10, 16), x=2.0)
     new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
-    # earlier ends mid-image (occlusion) -> vacuous -> merge
+    # whole-width rule: a mid-image exit still carries a side -- exit LEFT
+    # (center 920 < W/2) vs entry RIGHT -> BLOCKED (no margin, no vacuity)
     t1 = rows_for(1, 0, range(0, 6), x=900.0)
     t2 = rows_for(2, 0, range(10, 16), x=W - 42.0)
     new, res, rep = run([t1, t2], tracks)
+    assert set(new.tolist()) == {1, 2}
+    assert rep["rejected_2a"][0]["rejected"] == "reenter"
+    # mid-image exit and entry on the SAME half -> merge
+    t2 = rows_for(2, 0, range(10, 16), x=700.0)
+    new, res, rep = run([t1, t2], tracks)
     assert set(new.tolist()) == {1}
+    t2 = rows_for(2, 0, range(10, 16), x=W - 42.0)
     # re-enter off -> geometry ignored
     t1 = rows_for(1, 0, range(0, 6), x=2.0)
     t2 = rows_for(2, 0, range(10, 16), x=W - 42.0)

@@ -119,7 +119,6 @@ cfg:
     enabled: ${modules.traj_refine.cfg.enabled}
     tau: ${modules.traj_refine.cfg.tau}
     use_reenter: ${modules.traj_refine.cfg.use_reenter}
-    edge_margin: ${modules.traj_refine.cfg.edge_margin}
     ain_sha256: ${modules.traj_refine.cfg.ain_sha256}
     ain_sha256_tracklet_split: ${modules.tracklet_split.cfg.ain_sha256}
 

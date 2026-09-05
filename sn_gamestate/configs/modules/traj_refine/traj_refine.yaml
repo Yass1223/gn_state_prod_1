@@ -52,12 +52,10 @@ cfg:
   # this stage on any validation split yet.
   tau: 0.60
 
-  # Re-enter condition (C3): when one trajectory ends before the other begins
-  # and both boundary boxes touch a lateral image edge, the sides must match.
-  # edge_margin is the touch tolerance as a fraction of the image width
-  # (0.02 = ~38 px at 1920); not tuned on any validation split yet.
+  # Re-enter condition (C3): when one trajectory ends before the other begins,
+  # the frame HALF (whole-frame-width rule, no margin) of the earlier
+  # trajectory's last box and the later trajectory's first box must match.
   use_reenter: true
-  edge_margin: 0.02
 
   # Scope: EVERY fragment. Roles do not exist at this point (role_team runs
   # after this stage), so there is no exemption; the merge conditions are the

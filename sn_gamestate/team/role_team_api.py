@@ -4,8 +4,10 @@ Runs AFTER ``traj_refine``, on the pipeline's final trajectories -- the whole
 point of its position: roles and sides are decided once, where the temporal and
 positional evidence is strongest, and never gate the merge. Inputs per
 trajectory: the team CLUSTER id assigned by ``team_embed`` and propagated by
-``traj_refine`` (NaN = unclustered), the nearest-centroid fallback id
-(``team_cluster_nearest``), and pitch positions (``bbox_pitch``) sampled on the
+``traj_refine``; since batch 11 the TEAM CLUSTERING IS RECOMPUTED HERE, on the
+final trajectories (kmeans2_threshold over per-trajectory descriptors), and the
+recomputed ``team_cluster`` / ``team_cluster_nearest`` overwrite the columns
+(constant per final trajectory). Pitch positions (``bbox_pitch``) sampled on the
 stride grid. In this architecture "appearance outlier" MEANS "unclustered" --
 the clustering already made that call.
 
@@ -64,7 +66,8 @@ log = logging.getLogger(__name__)
 
 TEAM_NAMES = {0: "left", 1: "right"}
 DEFAULTS = dict(tau_n=6, tau_a=0.72, tau_a_sy=6.0, tau_m=0.15,
-                confirm="outlier", side_rule="vote", band=0.9, gk_depth_m=4.0)
+                confirm="outlier", side_rule="vote", band=0.9, gk_depth_m=4.0,
+                cluster_method="kmeans2_threshold", outlier_k=3.25)
 
 
 def _pitch_xy(bp):
@@ -115,9 +118,8 @@ def _cues(mxp, lab, myp=None, gk=None):
 
 
 class RoleTeamAssignment(VideoLevelModule):
-    input_columns = ["track_id", "image_id", "bbox_pitch", "team_cluster",
-                     "team_cluster_nearest"]
-    output_columns = ["role", "team"]
+    input_columns = ["track_id", "image_id", "bbox_pitch", "team_embedding"]
+    output_columns = ["role", "team", "team_cluster", "team_cluster_nearest"]
 
     def __init__(self, cfg, device=None, tracking_dataset=None, **kwargs):
         super().__init__()
@@ -158,8 +160,13 @@ class RoleTeamAssignment(VideoLevelModule):
             xy = np.array([_pitch_xy(b) for b in pos["bbox_pitch"]], dtype=float).reshape(-1, 2)
             px, py = xy[:, 0], xy[:, 1]
             px, py = px[np.isfinite(px)], py[np.isfinite(py)]
-            cl = grp["team_cluster"].dropna()
-            near = grp["team_cluster_nearest"].dropna()
+            es = [e for e in grp["team_embedding"]
+                  if isinstance(e, np.ndarray) and e.size]
+            if es:
+                z = np.median(np.asarray(es, dtype=np.float32), axis=0)
+                z = z / (np.linalg.norm(z) + 1e-9)
+            else:
+                z = None
             T.append(dict(
                 tid=float(tid), n=int(len(pos_rows)),
                 mx=px.mean() if len(px) else np.nan,
@@ -169,10 +176,41 @@ class RoleTeamAssignment(VideoLevelModule):
                 sy=py.std() if len(py) >= 3 else np.nan,
                 ymax=py.max() if len(py) else np.nan,
                 ymin=py.min() if len(py) else np.nan,
-                cluster=float(cl.mode().iloc[0]) if len(cl) else None,
-                nearest=float(near.mode().iloc[0]) if len(near) else None))
+                emb=z, cluster=None, nearest=None))
         record["trajectories"] = len(T)
         n = len(T)
+        # --- 1b. TEAM CLUSTERING, recomputed on the FINAL trajectories -----
+        # (batch 11): descriptor = L2-normalised median of the trajectory's
+        # embedded crops (all fragments merged in), 2-means + the robust MAD
+        # threshold -- the same kmeans2_threshold rule as team_embed, now on
+        # whole trajectories. team_embed's fragment-level clustering keeps
+        # feeding traj_refine; the labels HERE are the ones roles/sides use
+        # and the ones written to the output columns.
+        have = [j for j in range(n) if T[j]["emb"] is not None]
+        k_out = float(self.params["outlier_k"])
+        clus = dict(method=str(self.params["cluster_method"]), outlier_k=k_out,
+                    trajectories=n, embedded=len(have),
+                    no_embedding=n - len(have), clustered=0,
+                    unclustered_threshold=0, s_ok=None, m=None, s=None,
+                    sizes=[0, 0])
+        if len(have) >= 2:
+            E = np.stack([T[j]["emb"] for j in have]).astype(np.float32)
+            km = rules.kmeans2(E)
+            d_all = np.linalg.norm(E[:, None] - km.cluster_centers_[None], axis=2)
+            d = d_all.min(1)
+            lab = d_all.argmin(1)
+            m_c = float(np.median(d))
+            s_c = float(np.median(np.abs(d - m_c)))
+            s_ok = s_c >= 0.05 * m_c
+            outl = (d > m_c + k_out * s_c) if s_ok else np.zeros(len(d), bool)
+            for i, j in enumerate(have):
+                T[j]["nearest"] = float(lab[i])
+                T[j]["cluster"] = None if outl[i] else float(lab[i])
+            clus.update(clustered=int((~outl).sum()),
+                        unclustered_threshold=int(outl.sum()),
+                        s_ok=bool(s_ok), m=round(m_c, 6), s=round(s_c, 6),
+                        sizes=[int(((lab == c) & ~outl).sum()) for c in (0, 1)])
+        record["cluster"] = clus
         mx = np.array([t["mx"] for t in T])
         my = np.array([t["my"] for t in T])
         sy = np.array([t["sy"] for t in T])
@@ -293,10 +331,16 @@ class RoleTeamAssignment(VideoLevelModule):
             team[j] = "left" if int(cl) == left else "right"
 
         # --- apply + sidecar ------------------------------------------------
+        out["team_cluster"] = np.nan
+        out["team_cluster_nearest"] = np.nan
         for j, t in enumerate(T):
             sel = out["track_id"] == t["tid"]
             out.loc[sel, "role"] = role[j]
             out.loc[sel, "team"] = team[j]
+            if t["cluster"] is not None:
+                out.loc[sel, "team_cluster"] = t["cluster"]
+            if t["nearest"] is not None:
+                out.loc[sel, "team_cluster_nearest"] = t["nearest"]
             record["per_trajectory"].append(dict(
                 track_id=t["tid"], role=str(role[j]), why=str(why[j]),
                 team=team[j], cluster=t["cluster"], nearest=t["nearest"],

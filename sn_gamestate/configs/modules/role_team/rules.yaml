@@ -1,9 +1,13 @@
 # Role (player / goalkeeper / referee) and team SIDE (left / right) per FINAL
-# trajectory. Runs AFTER traj_refine -- the whole point of the position: roles
-# and sides are decided once, on complete trajectories with full temporal and
-# positional evidence, and never gate the merge. "Appearance outlier" in this
-# architecture MEANS "unclustered by team_embed"; there is no separate
-# distance/DBSCAN outlier machinery here any more.
+# trajectory. Runs AFTER traj_refine. Since batch 11 the TEAM CLUSTERING IS
+# RECOMPUTED HERE, on the final trajectories: per-trajectory descriptor =
+# L2-normalised median of the trajectory's embedded crops (all merged fragments
+# contribute), then the same kmeans2_threshold rule as team_embed (2-means +
+# robust MAD threshold, outlier_k) -- more crops per descriptor than at fragment
+# level, so cleaner separation and a cleaner outlier signal. The recomputed
+# team_cluster / team_cluster_nearest OVERWRITE the columns (constant per final
+# trajectory); team_embed's fragment-level clustering keeps feeding traj_refine.
+# "Appearance outlier" (= unclustered) refers to THIS clustering.
 #
 # Rules (sn_gamestate/team/role_team_api.py): assistants by the touchline
 # geometry (one per side); goalkeepers by penalty-area depth (one per half, an
@@ -33,3 +37,5 @@ cfg:
     side_rule: keeper     # keeper | vote (others fall back to vote)
     band: 0.9             # the symmetric 90% band of rule 2.14
     gk_depth_m: 4.0       # second-keeper confirmation depth window (m)
+    cluster_method: kmeans2_threshold  # batch 11: recomputed on final trajectories
+    outlier_k: 3.25       # MAD multiplier of the recomputed clustering

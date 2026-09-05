@@ -110,13 +110,9 @@ class TrajRefine(VideoLevelModule):
         self.enabled = bool(getattr(cfg, "enabled", True))
         self.tau = float(cfg.tau)
         self.use_reenter = bool(getattr(cfg, "use_reenter", True))
-        self.edge_margin = float(getattr(cfg, "edge_margin", 0.02))
         self.batch_size = int(getattr(cfg, "batch_size", 64))
         if not (0.0 <= self.tau <= 2.0):
             raise ValueError(f"[traj_refine] tau must be in [0, 2], got {self.tau}")
-        if not (0.0 <= self.edge_margin < 0.5):
-            raise ValueError(f"[traj_refine] edge_margin must be in [0, 0.5), "
-                             f"got {self.edge_margin}")
         self.audit_dir = Path(str(cfg.audit_dir)) if getattr(cfg, "audit_dir", None) else None
         if self.audit_dir:
             self.audit_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +121,7 @@ class TrajRefine(VideoLevelModule):
         # so a disabled stage costs nothing.
         self._embedder = None
         log.info(f"[traj_refine] enabled {self.enabled}, tau {self.tau}, "
-                 f"use_reenter {self.use_reenter}, edge_margin {self.edge_margin}; "
+                 f"use_reenter {self.use_reenter} (whole-frame-width sides); "
                  f"labels = team cluster + jersey number (roles/sides are assigned "
                  f"after this stage)")
 
@@ -235,8 +231,7 @@ class TrajRefine(VideoLevelModule):
 
         record = dict(sequence=seq, ran=False,
                       settings=dict(enabled=self.enabled, tau=self.tau,
-                                    use_reenter=self.use_reenter,
-                                    edge_margin=self.edge_margin),
+                                    use_reenter=self.use_reenter),
                       embedder=None,
                       inputs=dict(detections=int(len(detections)), tracked=0,
                                   tracklets=0),
@@ -287,7 +282,7 @@ class TrajRefine(VideoLevelModule):
 
         new_tid, resolved, rep = tr.refine_video(
             feats, single, frames, boxes, work["_tid"].to_numpy(), tracks,
-            img_w, self.tau, self.use_reenter, self.edge_margin)
+            img_w, self.tau, self.use_reenter)
         record["ran"] = True
 
         # ----------------------------------------------------------- apply --

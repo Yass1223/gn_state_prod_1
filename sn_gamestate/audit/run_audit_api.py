@@ -1010,7 +1010,7 @@ class RunAudit(VideoLevelModule):
             c.set(FAIL, "enabled not declared (config) or not recorded (sidecar)")
         elif bool(want_enabled) != bool(ran_enabled):
             c.set(FAIL, f"enabled that ran ({ran_enabled}) != configured ({want_enabled})")
-        for key in ("tau", "edge_margin"):
+        for key in ("tau",):
             want, got = exp.get(key), st.get(key)
             if want is None or got is None:
                 c.set(FAIL, f"{key} not declared (config) or not recorded (sidecar)")

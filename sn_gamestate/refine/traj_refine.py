@@ -62,10 +62,10 @@ vectors over clean detections).  Compatible(F, G) holds iff ALL of:
     C2  time overlap: the CLEAN frame sets are disjoint (multi-player
         detections are ignored until Stage 3, so they take no part in this
         test; collisions among them are expected and resolved there);
-    C3  re-enter: when one cluster ends before the other begins and BOTH the
-        earlier cluster's last box and the later cluster's first box touch a
-        lateral image edge (within ``edge_margin`` * width), the two sides
-        must be equal; in every other case the condition is vacuous;
+    C3  re-enter: when one cluster ends before the other begins, the frame
+        HALF (whole-width rule, no margin) of the earlier cluster's last box
+        and of the later cluster's first box must be equal; the condition is
+        vacuous only for interleaved intervals or unknown image width;
     C4  labels, vacuous-when-unknown: teams must agree when both are known,
         numbers must agree when both are known.  This yields the five cases:
         team+number vs team+number (same team, same number), team and no
@@ -156,15 +156,11 @@ def ranked_labels(cand):
                   reverse=True)
 
 
-def edge_side(box, img_w, margin_px):
-    """'left' / 'right' when the box touches exactly one lateral image edge
-    within ``margin_px``; None when it touches neither or both (ambiguous)."""
+def edge_side(box, img_w):
+    """'left' / 'right' by which HALF of the frame the box center lies in
+    (whole-frame-width rule; no margin -- a side is always defined)."""
     l, _, w, _ = (float(v) for v in box)
-    left = l <= margin_px
-    right = l + w >= img_w - margin_px
-    if left == right:
-        return None
-    return "left" if left else "right"
+    return "left" if (l + w / 2.0) < img_w / 2.0 else "right"
 
 
 class _Cluster:
@@ -244,9 +240,10 @@ def _dist(a, b):
     return 1.0 - float(ca @ cb)
 
 
-def _reenter_ok(a, b, frames, boxes, img_w, margin_frac, record=None):
-    """C3. Vacuous unless one cluster ends strictly before the other begins and
-    both boundary boxes touch a lateral edge; then the sides must be equal."""
+def _reenter_ok(a, b, frames, boxes, img_w, record=None):
+    """C3. Vacuous unless one cluster ends strictly before the other begins;
+    then the exit and entry sides (frame HALVES, whole-width rule) must be
+    equal."""
     if img_w is None:
         return True
     fa, la = a.first_last(frames)
@@ -257,13 +254,10 @@ def _reenter_ok(a, b, frames, boxes, img_w, margin_frac, record=None):
         earlier, later = b, a
     else:
         return True                     # interleaved intervals: vacuous
-    margin_px = float(margin_frac) * float(img_w)
-    exit_side = edge_side(boxes[earlier.last_row], img_w, margin_px)
-    entry_side = edge_side(boxes[later.first_row], img_w, margin_px)
+    exit_side = edge_side(boxes[earlier.last_row], img_w)
+    entry_side = edge_side(boxes[later.first_row], img_w)
     if record is not None:
         record.update(exit_side=exit_side, entry_side=entry_side)
-    if exit_side is None or entry_side is None:
-        return True
     return exit_side == entry_side
 
 
@@ -282,7 +276,7 @@ def _labels_ok(a, b):
 
 # ------------------------------------------------------------------ phase 2a
 
-def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
+def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter,
              report):
     """Same-team same-number merges and overlap conflict resolution.
     Mutates ``clusters`` (dict key -> cluster). See the module docstring."""
@@ -318,7 +312,7 @@ def _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
         d = _dist(a, b)
         entry["distance"] = None if not np.isfinite(d) else round(d, 4)
         ok_re = (not use_reenter) or _reenter_ok(a, b, frames, boxes, img_w,
-                                                 edge_margin, entry)
+                                                 entry)
         if ok_re and d <= tau:
             a.absorb(b, frames)
             del clusters[kb]
@@ -356,7 +350,7 @@ def _resolve_conflict(a, b, pair_mc, report):
 
 # ------------------------------------------------------------------ phase 2b
 
-def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
+def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter,
              report):
     """Agglomerative average-linkage merging under C2 + C3 + C4 and tau.
     Mutates ``clusters``."""
@@ -372,8 +366,7 @@ def _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
             return False
         if not _labels_ok(a, b):
             return False
-        if use_reenter and not _reenter_ok(a, b, frames, boxes, img_w,
-                                           edge_margin):
+        if use_reenter and not _reenter_ok(a, b, frames, boxes, img_w):
             return False
         return True
 
@@ -513,7 +506,7 @@ def _stage3(clusters, E, single, frames, new_tid, report):
 # ------------------------------------------------------------------ driver
 
 def refine_video(E, single, frames, boxes, tids, tracks, img_w,
-                 tau, use_reenter=True, edge_margin=0.02):
+                 tau, use_reenter=True):
     """Whole method for one video.
 
     Returns ``(new_tid_of_row, resolved, report)``:
@@ -540,9 +533,6 @@ def refine_video(E, single, frames, boxes, tids, tracks, img_w,
     tau = float(tau)
     if not (0.0 <= tau <= 2.0):
         raise ValueError(f"tau must be in [0, 2], got {tau}")
-    edge_margin = float(edge_margin)
-    if not (0.0 <= edge_margin < 0.5):
-        raise ValueError(f"edge_margin must be in [0, 0.5), got {edge_margin}")
 
     report = dict(merges=[], conflicts=[], rejected_2a=[],
                   clusters_in=0, clusters_out=0, out_of_scope=0,
@@ -559,10 +549,10 @@ def refine_video(E, single, frames, boxes, tids, tracks, img_w,
             report["no_centroid"].append(int(tid))
     report["clusters_in"] = len(clusters)
 
-    _phase2a(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
+    _phase2a(clusters, frames, boxes, img_w, tau, use_reenter,
              report)
     report["clusters_after_2a"] = len(clusters)
-    _phase2b(clusters, frames, boxes, img_w, tau, use_reenter, edge_margin,
+    _phase2b(clusters, frames, boxes, img_w, tau, use_reenter,
              report)
     report["clusters_out"] = len(clusters)
 
