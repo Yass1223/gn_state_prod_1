@@ -21,8 +21,8 @@ Per sequence:
    accepted when unclustered (``confirm: outlier``) or by margin (tau_m).
 3. GOALKEEPERS: one per half -- the deepest eligible trajectory with
    q75(|x|) >= PEN_X and |mean y| <= PEN_Y, accepted when unclustered or by
-   margin; an unclustered second candidate within 4 m of the same depth is
-   confirmed too.
+   margin. At most one goalkeeper per half; other same-half candidates are
+   rejected.
 4. MAIN referee (one per sequence): among the remaining UNCLUSTERED
    trajectories, the candidates whose sampled y-range stays inside the band
    the trajectory means span, symmetrically (2.14):
@@ -66,7 +66,7 @@ log = logging.getLogger(__name__)
 
 TEAM_NAMES = {0: "left", 1: "right"}
 DEFAULTS = dict(tau_n=6, tau_a=0.72, tau_a_sy=6.0, tau_m=0.15,
-                confirm="outlier", side_rule="vote", band=0.9, gk_depth_m=4.0,
+                confirm="outlier", side_rule="vote", band=0.9,
                 cluster_method="kmeans2_threshold", outlier_k=3.25)
 
 
@@ -259,11 +259,7 @@ class RoleTeamAssignment(VideoLevelModule):
             for j in side:
                 if j == best:
                     continue
-                if (unclustered[j] and role[best] == "goalkeeper"
-                        and abs(mx[j]) >= abs(mx[best]) - P["gk_depth_m"]):
-                    role[j], why[j] = "goalkeeper", "gk_confirmed"
-                else:
-                    why[j] = "gk_rejected"
+                why[j] = "gk_rejected"
 
         # --- 4. MAIN referee: unclustered + inside the symmetric band (2.14)
         #        + nearest to the assistants -------------------------------

@@ -10,8 +10,8 @@
 # "Appearance outlier" (= unclustered) refers to THIS clustering.
 #
 # Rules (sn_gamestate/team/role_team_api.py): assistants by the touchline
-# geometry (one per side); goalkeepers by penalty-area depth (one per half, an
-# unclustered near-equal-depth second candidate confirmed); the MAIN referee =
+# geometry (one per side); goalkeepers by penalty-area depth (one per half); the
+# MAIN referee =
 # among the remaining unclustered trajectories, those whose sampled y-range
 # stays inside the symmetric 90% band of the trajectory means (rule 2.14:
 # max(y_ref) <= band * max_i(mean_y_i) and min(y_ref) >= band * min_i(mean_y_i)),
@@ -22,8 +22,8 @@
 # its mean-x half.
 #
 # Geometry thresholds carried over from the notebook's tuned operating point
-# (tau_n/tau_a/tau_a_sy/tau_m/confirm/side_rule); band and gk_depth_m are this
-# stage's own. UNTUNED on this pipeline's trajectories: sweep on valid later.
+# (tau_n/tau_a/tau_a_sy/tau_m/confirm/side_rule); band is this stage's own.
+# UNTUNED on this pipeline's trajectories: sweep on valid later.
 _target_: sn_gamestate.team.RoleTeamAssignment
 cfg:
   pos_stride: 5
@@ -36,6 +36,5 @@ cfg:
     confirm: outlier      # outlier (= unclustered) | geometry
     side_rule: keeper     # keeper | vote (others fall back to vote)
     band: 0.9             # the symmetric 90% band of rule 2.14
-    gk_depth_m: 4.0       # second-keeper confirmation depth window (m)
     cluster_method: kmeans2_threshold  # batch 11: recomputed on final trajectories
     outlier_k: 3.25       # MAD multiplier of the recomputed clustering
